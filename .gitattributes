@@ -1,0 +1,270 @@
+# Enforce consistent line endings across all machines.
+# `.gitattributes` overrides local `core.autocrlf`, so these settings apply
+# regardless of local Git configuration. See:
+# https://git-scm.com/docs/gitattributes
+
+# Default to text normalization with LF in the index and checkout.
+* text=auto eol=lf
+
+# Windows command scripts are the narrow CRLF exception: `cmd.exe` can misbehave
+# with LF-only batch labels / `goto`.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Common binary assets and archives.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.bmp binary
+*.webp binary
+*.avif binary
+*.tif binary
+*.tiff binary
+*.mp3 binary
+*.mp4 binary
+*.mov binary
+*.wav binary
+*.flac binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.eot binary
+*.zip binary
+*.tar binary
+*.gz binary
+*.xz binary
+*.7z binary
+*.pdf binary
+*.jar binary
+*.class binary
+*.keystore binary
+*.jks binary
+*.bin binary
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary
+*.a binary
+*.lib binary
+*.pdb binary
+*.swf binary
+*.xlsb binary
+
+# Apple / Swift binary artifacts.
+*.xcuserstate binary
+*.mobileprovision binary
+*.provisionprofile binary
+*.cer binary
+*.p12 binary
+*.framework binary
+*.framework/** binary
+*.xcframework binary
+*.xcframework/** binary
+*.aab binary
+*.ipa binary
+*.app binary
+*.app/** binary
+
+# .NET / Windows binary artifacts.
+*.nupkg binary
+*.snupkg binary
+*.pfx binary
+*.snk binary
+
+# Native debug and build outputs.
+*.o binary
+*.obj binary
+*.dwo binary
+*.dSYM binary
+*.dSYM/** binary
+*.wasm binary
+
+# Documentation, data, generated text, and repository metadata.
+*.md text eol=lf
+*.txt text eol=lf
+*.rst text eol=lf
+*.json text eol=lf
+*.jsonc text eol=lf
+*.json5 text eol=lf
+*.jsonl text eol=lf
+*.xml text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.toml text eol=lf
+*.svg text eol=lf
+*.snap text eol=lf
+*.info text eol=lf
+*.lock text eol=lf
+*.stderr text eol=lf
+*.stdout text eol=lf
+*.patch text eol=lf
+*.diff text eol=lf
+*.csv text eol=lf
+*.tsv text eol=lf
+LICENSE text eol=lf
+justfile text eol=lf
+Justfile text eol=lf
+.gitattributes text eol=lf
+.gitignore text eol=lf
+.editorconfig text eol=lf
+
+# Environment and generic configuration files.
+.env text eol=lf
+.env.* text eol=lf
+*.env text eol=lf
+*.ini text eol=lf
+*.cfg text eol=lf
+*.conf text eol=lf
+*.config text eol=lf
+*.properties text eol=lf
+
+# Shell and scripting languages.
+*.sh text eol=lf
+*.bash text eol=lf
+*.zsh text eol=lf
+*.fish text eol=lf
+*.ps1 text eol=lf
+*.psm1 text eol=lf
+*.psd1 text eol=lf
+
+# Rust.
+*.rs text eol=lf
+
+# Build, container, and tool configuration.
+Makefile text eol=lf
+GNUmakefile text eol=lf
+CMakeLists.txt text eol=lf
+*.cmake text eol=lf
+Dockerfile text eol=lf
+*.dockerfile text eol=lf
+Containerfile text eol=lf
+*.containerfile text eol=lf
+*.mk text eol=lf
+*.ninja text eol=lf
+*.bazel text eol=lf
+.bazelrc text eol=lf
+BUILD text eol=lf
+BUILD.bazel text eol=lf
+WORKSPACE text eol=lf
+WORKSPACE.bazel text eol=lf
+MODULE.bazel text eol=lf
+
+# Go.
+*.go text eol=lf
+go.mod text eol=lf
+go.sum text eol=lf
+go.work text eol=lf
+go.work.sum text eol=lf
+
+# TypeScript / JavaScript / frontend.
+*.js text eol=lf
+*.jsx text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.mjs text eol=lf
+*.cjs text eol=lf
+*.mts text eol=lf
+*.cts text eol=lf
+*.vue text eol=lf
+*.svelte text eol=lf
+*.astro text eol=lf
+*.css text eol=lf
+*.scss text eol=lf
+*.sass text eol=lf
+*.less text eol=lf
+*.html text eol=lf
+*.htm text eol=lf
+*.map text eol=lf
+.npmrc text eol=lf
+.yarnrc text eol=lf
+
+# Python.
+*.py text eol=lf
+*.pyi text eol=lf
+*.pyw text eol=lf
+*.ipynb text eol=lf
+requirements*.txt text eol=lf
+pyproject.toml text eol=lf
+poetry.lock text eol=lf
+Pipfile text eol=lf
+Pipfile.lock text eol=lf
+.python-version text eol=lf
+
+# C# / .NET. Prefer LF for project files unless a future tool proves otherwise.
+*.cs text eol=lf
+*.csx text eol=lf
+*.csproj text eol=lf
+*.vbproj text eol=lf
+*.vbproj.user text eol=lf
+*.fsproj text eol=lf
+*.sln text eol=lf
+*.slnf text eol=lf
+*.slnx text eol=lf
+*.razor text eol=lf
+*.cshtml text eol=lf
+*.xaml text eol=lf
+*.resx text eol=lf
+*.settings text eol=lf
+*.props text eol=lf
+*.targets text eol=lf
+*.ruleset text eol=lf
+*.globalconfig text eol=lf
+Directory.Build.props text eol=lf
+Directory.Build.targets text eol=lf
+Directory.Packages.props text eol=lf
+NuGet.config text eol=lf
+
+# C / C++ / Objective-C / native build metadata.
+*.c text eol=lf
+*.cc text eol=lf
+*.cpp text eol=lf
+*.cxx text eol=lf
+*.c++ text eol=lf
+*.h text eol=lf
+*.hh text eol=lf
+*.hpp text eol=lf
+*.hxx text eol=lf
+*.h++ text eol=lf
+*.inl text eol=lf
+*.ipp text eol=lf
+*.tpp text eol=lf
+*.ixx text eol=lf
+*.m text eol=lf
+*.mm text eol=lf
+*.S text eol=lf
+*.s text eol=lf
+*.asm text eol=lf
+*.inc text eol=lf
+*.rc text eol=lf
+*.def text eol=lf
+*.natvis text eol=lf
+*.vcxproj text eol=lf
+*.vcxproj.filters text eol=lf
+*.vcxproj.user text eol=lf
+*.vcxproj.shared text eol=lf
+*.vcxproj.props text eol=lf
+*.vcxproj.targets text eol=lf
+.clang-format text eol=lf
+.clang-tidy text eol=lf
+.clangd text eol=lf
+
+# Zig.
+*.zig text eol=lf
+*.zon text eol=lf
+
+# Swift / Apple project text files.
+*.swift text eol=lf
+*.metal text eol=lf
+*.plist text eol=lf
+*.entitlements text eol=lf
+*.xcconfig text eol=lf
+*.pbxproj text eol=lf
+*.storyboard text eol=lf
+*.xib text eol=lf
+*.strings text eol=lf
+*.stringsdict text eol=lf
+*.xcworkspacedata text eol=lf
+Package.swift text eol=lf

@@ -1,0 +1,36 @@
+[package]
+name         = "xtask"
+version      .workspace = true
+edition      .workspace = true
+license-file .workspace = true
+authors      .workspace = true
+repository   .workspace = true
+publish      .workspace = true
+readme       .workspace = true
+description  = "Workspace automation runner — `cargo xtask <subcommand>`."
+default-run  = "xtask"
+
+[lib]
+name = "xtask"
+path = "src/lib.rs"
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[[bin]]
+name = "precommit-hook"
+path = "src/precommit_hook.rs"
+
+# disabled for now
+# [lints]
+# workspace = true
+
+[dependencies]
+agents-md.workspace = true
+strict-xtask-agents-md.workspace = true
+strict-xtask-cargo.workspace = true
+strict-xtask-core.workspace = true
+
+[dev-dependencies]
+strict-test-support = { workspace = true }

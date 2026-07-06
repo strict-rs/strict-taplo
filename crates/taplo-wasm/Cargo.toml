@@ -13,21 +13,21 @@ repository   = { workspace = true }
 crate-type = ["cdylib"]
 
 [dependencies]
-lsp-async-stub = { path = "../lsp-async-stub" }
-taplo          = { path = "../taplo" }
-taplo-cli      = { path = "../taplo-cli", optional = true, default-features = false }
-taplo-common   = { path = "../taplo-common", default-features = false, features = ["rustls-tls", "schema", "reqwest"] }
-taplo-lsp      = { path = "../taplo-lsp", optional = true, default-features = false }
+lsp-async-stub = { workspace = true }
+taplo          = { workspace = true }
+taplo-cli      = { workspace = true, optional = true, default-features = false }
+taplo-common   = { workspace = true, default-features = false, features = ["rustls-tls", "schema", "reqwest"] }
+taplo-lsp      = { workspace = true, optional = true, default-features = false }
 
 anyhow                   = { workspace = true }
 async-trait              = { workspace = true }
 clap                     = { workspace = true, features = ["derive"] }
-console_error_panic_hook = { version = "0.1.7" }
+console_error_panic_hook = { workspace = true }
 futures                  = { workspace = true }
 getrandom                = { workspace = true, features = ["js"] }
 indexmap                 = { workspace = true }
 serde                    = { workspace = true, features = ["derive"] }
-serde-wasm-bindgen       = { version = "0.6.5" }
+serde-wasm-bindgen       = { workspace = true }
 serde_json               = { workspace = true }
 time                     = { workspace = true, features = ["parsing"] }
 tokio                    = { workspace = true }
@@ -35,9 +35,9 @@ tracing                  = { workspace = true }
 url                      = { workspace = true }
 
 # Bump all together since it's a monorepo
-js-sys               = { version = "0.3.72" }
-wasm-bindgen         = { version = "0.2.95" }
-wasm-bindgen-futures = { version = "0.4.45" }
+js-sys               = { workspace = true }
+wasm-bindgen         = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
 
 [features]
 default = ["cli", "lsp"]

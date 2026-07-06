@@ -17,12 +17,12 @@ schema     = []
 reqwest    = ["dep:reqwest"]
 
 [dependencies]
-taplo = { version = "0.14.0", path = "../taplo", features = ["schema"] }
+taplo = { workspace = true, features = ["schema"] }
 
 ahash              = { workspace = true, features = ["serde"] }
 anyhow             = { workspace = true }
 arc-swap           = { workspace = true }
-async-recursion    = { version = "1.0.0" }
+async-recursion    = { workspace = true }
 async-trait        = { workspace = true }
 futures            = { workspace = true }
 glob               = { workspace = true }
@@ -30,15 +30,15 @@ globset            = { workspace = true }
 hex                = { workspace = true }
 indexmap           = { workspace = true, features = ["rayon", "serde"] }
 itertools          = { workspace = true }
-json_value_merge   = { version = "2.0.0" }
-jsonschema         = { version = "0.17.1", default-features = false }
-lru                = { version = "0.11.1" }
+json_value_merge   = { workspace = true }
+jsonschema         = { workspace = true, default-features = false }
+lru                = { workspace = true }
 parking_lot        = { workspace = true }
-percent-encoding   = { version = "2.1.0" }
+percent-encoding   = { workspace = true }
 regex              = { workspace = true }
 reqwest            = { workspace = true, features = ["json"], optional = true }
 schemars           = { workspace = true, features = ["url"] }
-semver             = { version = "1.0.5", features = ["serde"] }
+semver             = { workspace = true, features = ["serde"] }
 serde              = { workspace = true, features = ["derive"] }
 serde_json         = { workspace = true, features = ["preserve_order"] }
 sha1               = { workspace = true }

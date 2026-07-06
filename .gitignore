@@ -10,3 +10,40 @@ __pycache__/
 *venv/
 dist/
 wheels/
+
+# Cargo / rust
+/target/
+**/target/
+**/*.rs.bk
+**/*.rmeta
+
+# Coverage reports (written by `cargo xtask coverage`)
+/cov/html/
+/report/
+
+# Code metrics (written by `cargo xtask cq`)
+/metrics/
+
+# Mutation testing output (written by `cargo xtask mutants`)
+/mutants.out/
+/mutants.out.old/
+
+# Rustfmt backup
+**/*.bk
+
+# Intentionally do not lock
+Cargo.lock
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env overrides
+.envrc
+.direnv/

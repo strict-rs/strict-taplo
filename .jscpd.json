@@ -1,0 +1,31 @@
+{
+  "threshold": 0,
+  "reporters": [
+    "markdown",
+    "ai",
+    "json"
+  ],
+  "ignore": [
+    "**/__snapshots__/**",
+    "**/node_modules/**",
+    "**/.cache/**",
+    "**/dist/**",
+    "**/coverage/**",
+    "**/cov/**",
+    "**/reports/**",
+    "**/build/**",
+    "**/target/**",
+    "**/vendor/**"
+  ],
+  "format": [
+    "rust"
+  ],
+  "output": "./cov",
+  "absolute": true,
+  "minLines": 8,
+  "minTokens": 50,
+  "no-tips": true,
+  "ignorePattern": [
+    "(?m)^\\s*use\\s+[^;]+;"
+  ]
+}

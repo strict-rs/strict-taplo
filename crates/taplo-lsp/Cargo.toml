@@ -18,18 +18,18 @@ native-tls = ["taplo-common/native-tls"]
 rustls-tls = ["taplo-common/rustls-tls"]
 
 [dependencies]
-lsp-async-stub = { version = "0.7.0", path = "../lsp-async-stub" }
-taplo          = { version = "0.14.0", path = "../taplo", features = ["serde"] }
-taplo-common   = { version = "0.6.0", path = "../taplo-common", features = ["schema", "reqwest"] }
+lsp-async-stub = { workspace = true }
+taplo          = { workspace = true, features = ["serde"] }
+taplo-common   = { workspace = true, features = ["schema", "reqwest"] }
 
 anyhow      = { workspace = true }
 arc-swap    = { workspace = true }
 either      = { workspace = true }
-figment     = { version = "0.10.6", features = ["json"] }
+figment     = { workspace = true, features = ["json"] }
 futures     = { workspace = true }
 indexmap    = { workspace = true, features = ["serde"] }
 itertools   = { workspace = true }
-lsp-types   = { version = "0.93.0", features = ["proposed"] }
+lsp-types   = { workspace = true, features = ["proposed"] }
 once_cell   = { workspace = true }
 parking_lot = { workspace = true }
 regex       = { workspace = true }

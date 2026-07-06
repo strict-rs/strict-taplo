@@ -1,57 +1,1022 @@
 [workspace]
 exclude = ["util/test-gen"]
-members = ["crates/*"]
+members = ["crates/*", "xtask"]
 
-resolver = "2"
+resolver = "3"
 
 [workspace.package]
-authors      = ["tamasfe"]
-edition      = "2021"
+authors      = ["tamasfe", "Takumi"]
+edition      = "2024"
+version = "0.15.0"
+publish = false
 license      = "MIT"
-rust-version = "1.74"
-homepage     = "https://taplo.tamasfe.dev"
-repository   = "https://github.com/tamasfe/taplo"
+license-file = "LICENSE"
+rust-version = "1.96"
+homepage     = "hhttps://github.com/strict-rs/strict-taplo"
+repository   = "https://github.com/strict-rs/strict-taplo"
 
 [workspace.dependencies]
-ahash              = { version = "0.8.4" }
-anyhow             = { version = "1.0.53" }
-arc-swap           = { version = "1.5.0" }
-async-trait        = { version = "0.1.52" }
-clap               = { version = "4.5.31", default-features = false, features = ["std"] }
-either             = { version = "1.6.1" }
-futures            = { version = "0.3.30" }
-getrandom          = { version = "0.2", default-features = false }
+lsp-async-stub = { version = "0.7.0", path = "crates/lsp-async-stub", default-features = false }
+taplo        = { version = "0.14.0", path = "crates/taplo", default-features = false }
+taplo-cli      = { version = "0.10.0", path = "crates/taplo-cli", default-features = false }
+taplo-common = { version = "0.6.0", path = "crates/taplo-common", default-features = false }
+taplo-lsp    = { version = "0.8.0", path = "crates/taplo-lsp", default-features = false }
+
+ahash              = { version = "0.8.12" }
+anyhow             = { version = "1.0.103" }
+arc-swap           = { version = "1.9.2" }
+async-trait        = { version = "0.1.89" }
+clap               = { version = "4.6.1", default-features = false, features = ["std"] }
+either             = { version = "1.16.0" }
+futures            = { version = "0.3.32" }
+getrandom          = { version = "0.4", default-features = false }
 glob               = { version = "0.3" }
-globset            = { version = "0.4.8" }
+globset            = { version = "0.4.18" }
 hex                = { version = "0.4" }
-indexmap           = { version = "2.2" }
-itertools          = { version = "0.10.3" }
-lsp-types          = { version = "0.93.0" }
-once_cell          = { version = "1.4" }
-parking_lot        = { version = "0.12.0" }
-regex              = { version = "1.5" }
-reqwest            = { version = "0.11.9", default-features = false }
-rowan              = { version = "0.15.3" }
-schemars           = { version = "0.8.3" }
+indexmap           = { version = "2.14" }
+itertools          = { version = "0.15.0" }
+lsp-types          = { version = "0.97.0" }
+once_cell          = { version = "1.21" }
+parking_lot        = { version = "0.12.5" }
+regex              = { version = "1.12" }
+reqwest            = { version = "0.13.4", default-features = false }
+rowan              = { version = "0.16.1" }
+schemars           = { version = "1.2.1" }
 serde              = { version = "1" }
-serde_json         = { version = "1.0.78" }
-sha1               = { version = "0.10.5" }
+serde_json         = { version = "1.0.150" }
+sha1               = { version = "0.11.0" }
 tap                = { version = "1.0.1" }
-thiserror          = { version = "1.0.30" }
-time               = { version = "0.3.7" }
-tokio              = { version = "1.24.2", default-features = false }
-toml               = { version = "0.7" }
-tracing            = { version = "0.1.30" }
-tracing-subscriber = { version = "0.3.7" }
-url                = { version = "2.2.2" }
+thiserror          = { version = "2.0.18" }
+time               = { version = "0.3.53" }
+tokio              = { version = "1.52.3", default-features = false }
+toml               = { version = "1.1" }
+tracing            = { version = "0.1.44" }
+tracing-subscriber = { version = "0.3.23" }
+url                = { version = "2.5.8" }
 
-[profile.release]
-codegen-units = 1
-lto           = "thin"
-opt-level     = 3
-strip         = true
+# Consolidated
+logos      = { version = "0.16.1" }
+codespan-reporting = { version = "0.13.1" }
+ansi_term     = { version = "0.12" }
+async-ctrlc   = { version = "1.2.0", features = ["stream"] }
+clap_complete = { version = "4.6.7" }
+prettydiff    = { version = "0.9.0", default-features = false }               # `prettydiff` is also a CLI that pulls in `clap` by default
+async-recursion    = { version = "1.1.1" }
+json_value_merge   = { version = "2.0.1" }
+jsonschema         = { version = "0.46.10", default-features = false }
+lru                = { version = "0.18.0" }
+percent-encoding   = { version = "2.3.2" }
+semver             = { version = "1.0.28", features = ["serde"] }
+figment     = { version = "0.10.19", features = ["json"] }
+console_error_panic_hook = { version = "0.1.7" }
+serde-wasm-bindgen       = { version = "0.6.5" }
+# Bump all together since it's a monorepo
+js-sys               = { version = "0.3.103" }
+wasm-bindgen         = { version = "0.2.126" }
+wasm-bindgen-futures = { version = "0.4.76" }
 
+# Consolidated Dev Deps
+assert-json-diff = { version = "2" }
+criterion        = { version = "0.8" }   # criterion -> clap
+difference       = { version = "2.0.0" }
+pprof = { version = "0.15", features = ["flamegraph", "criterion"] } # pprof -> criterion -> clap
 
+agents-md = { version = "0.1.0", git = "ssh://git@github.com/earthlings-dev/agents-md-rs.git", branch = "main" }
+bpaf = { git = "ssh://git@github.com/strict-rs/strict-bpaf.git", branch = "sync", version = "0.10", default-features = false }
+strict-xtask-core = { version = "0.1.0", git = "ssh://git@github.com/earthlings-dev/strict-xtask-core-rs.git", branch = "main" }
+strict-xtask-cargo = { version = "0.1.0", git = "ssh://git@github.com/earthlings-dev/strict-xtask-cargo-rs.git", branch = "main" }
+strict-xtask-agents-md = { version = "0.1.0", git = "ssh://git@github.com/earthlings-dev/strict-xtask-agents-md-rs.git", branch = "main" }
+trybuild = { git = "ssh://git@github.com/strict-rs/strict-trybuild.git", branch = "strict", version = "1" }
+strict-test-support = { version = "0.1.0", git = "ssh://git@github.com/earthlings-dev/strict-test-support-rs.git", branch = "main" }
+
+syn         = { version = "2", features = ["full", "visit"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+cargo_metadata = "0.23"
+ignore = "0.4"
+toml_edit = "0.25"
+anstyle = "1"
+snapbox = { version = "1.2", features = ["diff"], default-features = false }
+
+[patch.crates-io]
+
+# strict-proptest (comment out if unused, do not remove)
+proptest = { version = "1.11.0", git = "ssh://git@github.com/strict-rs/strict-proptest.git", branch = "upgrade" }
+proptest-macro = { version = "0.5.0", git = "ssh://git@github.com/strict-rs/strict-proptest.git", branch = "upgrade" }
+proptest-state-machine = { version = "0.8", git = "ssh://git@github.com/strict-rs/strict-proptest.git", branch = "upgrade" }
+proptest-derive = { version = "0.8", git = "ssh://git@github.com/strict-rs/strict-proptest.git", branch = "upgrade" }
+
+# strict-trybuild (comment out if unused, do not remove)
+trybuild = { git = "ssh://git@github.com/strict-rs/strict-trybuild.git", branch = "strict", version = "1" }
+
+# strict-bpaf (comment out if unused, do not remove)
+bpaf = { git = "ssh://git@github.com/strict-rs/strict-bpaf.git", branch = "sync", version = "0.10" }
+bpaf_derive = { git = "ssh://git@github.com/strict-rs/strict-bpaf.git", branch = "sync", version = "0.10.0" }
+bpaf_cauwugo = { git = "ssh://git@github.com/strict-rs/strict-bpaf.git", branch = "sync", version = "0.10.0" }
+
+# strict-tracing (comment out if unused, do not remove)
+tracing = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.1.44" }
+tracing-appender = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.2.5" }
+tracing-attributes = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.1.31" }
+tracing-core = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.1.36" }
+tracing-error = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.2.1" }
+tracing-flame = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.2.0" }
+tracing-futures = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.2.5" }
+tracing-journald = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.3.2" }
+tracing-log = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.2.0" }
+tracing-mock = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.1.0-beta.3" }
+tracing-serde = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.2.0" }
+tracing-subscriber = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.3.23" }
+tracing-test = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.1.0" }
+tracing-tower = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.1.0" }
+
+# Original Taplo Release Profile
+# [profile.release]
+# codegen-units = 1
+# lto           = "thin"
+# opt-level     = 3
+# strip         = true
+
+# Original Taplo Bench
 [profile.bench]
 lto       = true
 opt-level = 3
+
+# ─── Release profile: small, fast, abort-on-panic ──────────────────────────
+[profile.release]
+lto              = "thin"
+codegen-units    = 1
+panic            = "abort"
+strip            = "symbols"
+opt-level        = 3
+overflow-checks  = true
+debug            = false
+incremental      = false
+
+# ─── Dev profile: fast incremental ─────────────────────────────────────────
+[profile.dev]
+debug            = "line-tables-only"
+opt-level        = 0
+overflow-checks  = true
+incremental      = true
+
+[profile.dev.package."*"]
+# Optimise third-party deps in dev builds (their sources rarely change).
+opt-level = 3
+
+# ─── Test profile: overflow checks on, fast codegen ────────────────────────
+[profile.test]
+opt-level        = 0
+overflow-checks  = true
+debug            = true
+
+[patch]
+
+# ─── cargo-machete integration ─────────────────────────────────────────────
+[workspace.metadata.cargo-machete]
+# Deps intentionally unused in the workspace root can be listed here.
+ignored = []
+
+# ─── Template configuration metadata ───────────────────────────────────────
+[workspace.metadata.config]
+schema-version = "0.1.0"
+template       = "rust-template"
+
+[workspace.metadata.config.layout]
+schema-version = "0.1.0"
+kind           = "members-dir"
+members-dir    = "crates"
+
+[workspace.metadata.config.update]
+schema-version   = "0.1.0"
+lockfile-refresh = "just-update-when-managed-dependencies-change"
+
+[workspace.metadata.config.update.opt-outs]
+files    = []
+defaults = []
+keys     = []
+elements = []
+
+[[workspace.metadata.config.contract.lines]]
+file = ".gitignore"
+ownership = "template-with-consumer-entries"
+required = [
+  "/target/",
+  "**/*.rs.bk",
+  "**/*.rmeta",
+  "/cov/html/",
+  "/report/",
+  "/metrics/",
+  "/mutants.out/",
+  "/mutants.out.old/",
+  "**/*.bk",
+  "Cargo.lock",
+  ".idea/",
+  ".vscode/",
+  "*.swp",
+  "*.swo",
+  ".DS_Store",
+  "Thumbs.db",
+  ".envrc",
+  ".direnv/",
+]
+
+[workspace.metadata.config.contract.justfile]
+file = "justfile"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "default"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "init"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "new"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "fmt"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "check"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "lint"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "lint-attrs"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "test"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "test-doc"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "test-all"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "coverage"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "coverage-per-feature"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "doc"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "audit"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "deadcode"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "hack"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "ci"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "precommit"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "precommit-refresh"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "upgrade"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "update"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "outdated"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "update-template"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "gen-lint-template"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "migrate-agent-guidance-fragments"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "gen-agent-guidance"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "repo-overview"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "agent"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "cq"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "snap-update"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "fuzz"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "mutants"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "mutant-fleet"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "comprehensive-mutants"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "badges"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "cross"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "x"
+ownership = "template"
+
+[[workspace.metadata.config.contract.justfile.recipes]]
+name = "help"
+ownership = "template"
+
+[[workspace.metadata.config.contract.toml]]
+file = ".cargo/config.toml"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "alias.xtask"
+ownership = "template"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "alias.xtest"
+ownership = "template"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "alias.xcheck"
+ownership = "template"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "alias.xclippy"
+ownership = "template"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "alias.xdoc"
+ownership = "template"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "alias.xbuild"
+ownership = "template"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "build.rustflags"
+ownership = "template-with-consumer-entries"
+entry-type = "string"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "term.verbose"
+ownership = "template"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "term.color"
+ownership = "template"
+
+[[workspace.metadata.config.contract.toml]]
+file = ".cargo/mutants.toml"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "all_features"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "test_workspace"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "additional_cargo_test_args"
+ownership = "template-with-consumer-entries"
+entry-type = "string"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "copy_vcs"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "cap_lints"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "minimum_test_timeout"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml]]
+file = "rust-toolchain.toml"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "toolchain.channel"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "toolchain.profile"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "toolchain.components"
+ownership = "template-with-consumer-entries"
+entry-type = "string"
+
+[[workspace.metadata.config.contract.toml]]
+file = "dupes.toml"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "similarity_threshold"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "min_nodes"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "min_lines"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "exclude"
+ownership = "template-with-consumer-entries"
+entry-type = "string"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "max_exact_duplicates"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "max_near_duplicates"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "token.min_lines"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "line.min_lines"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml]]
+file = "rustfmt.toml"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "edition"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "style_edition"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "max_width"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "tab_spaces"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "newline_style"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "hard_tabs"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "reorder_imports"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "reorder_modules"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "trailing_comma"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "trailing_semicolon"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "use_field_init_shorthand"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "use_try_shorthand"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "match_block_trailing_comma"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "remove_nested_parens"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "merge_derives"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "unstable_features"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "imports_granularity"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "group_imports"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "wrap_comments"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "comment_width"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "format_code_in_doc_comments"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "format_macro_matchers"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "format_macro_bodies"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "normalize_comments"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "normalize_doc_attributes"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "fn_params_layout"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "overflow_delimited_expr"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "use_small_heuristics"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "condense_wildcard_suffixes"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "format_generated_files"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "print_misformatted_file_names"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "chain_width"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "array_width"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "format_strings"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "struct_field_align_threshold"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "enum_discrim_align_threshold"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "force_explicit_abi"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "short_array_element_width_threshold"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "struct_lit_single_line"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "struct_variant_width"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "attr_fn_like_width"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "single_line_if_else_max_width"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "indent_style"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "brace_style"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "control_brace_style"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "match_arm_leading_pipes"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "fn_single_line"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "where_single_line"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "skip_children"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "imports_layout"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "doc_comment_code_block_width"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "space_before_colon"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "space_after_colon"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml]]
+file = "clippy.toml"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "avoid-breaking-exported-api"
+ownership = "template"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "allow-unwrap-in-tests"
+ownership = "template"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "allow-expect-in-tests"
+ownership = "template"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "allow-panic-in-tests"
+ownership = "template"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "allow-dbg-in-tests"
+ownership = "template"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "allow-print-in-tests"
+ownership = "template"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "allow-indexing-slicing-in-tests"
+ownership = "template"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "allow-useless-vec-in-tests"
+ownership = "template"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "cognitive-complexity-threshold"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "excessive-nesting-threshold"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "too-many-arguments-threshold"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "too-many-lines-threshold"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "type-complexity-threshold"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "enum-variant-size-threshold"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "enum-variant-name-threshold"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "large-error-threshold"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "pass-by-value-size-limit"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "single-char-binding-names-threshold"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "trivial-copy-size-limit"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "verbose-bit-mask-threshold"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "array-size-threshold"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "stack-size-threshold"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "future-size-threshold"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "literal-representation-threshold"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "max-fn-params-bools"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "max-struct-bools"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "max-include-file-size"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "max-suggested-slice-pattern-length"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "max-trait-bounds"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "vec-box-size-threshold"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "unnecessary-box-size"
+ownership = "template-with-consumer-override"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "allowed-idents-below-min-chars"
+ownership = "template-with-consumer-entries"
+entry-type = "string"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "doc-valid-idents"
+ownership = "template-with-consumer-entries"
+entry-type = "string"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "await-holding-invalid-types"
+ownership = "template-with-consumer-entries"
+entry-type = "string"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "disallowed-names"
+ownership = "template-with-consumer-entries"
+entry-type = "string"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "disallowed-macros"
+ownership = "template-with-consumer-entries"
+entry-type = "inline-table-path"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "disallowed-methods"
+ownership = "template-with-consumer-entries"
+entry-type = "inline-table-path"
+
+[[workspace.metadata.config.contract.toml.keys]]
+key = "disallowed-types"
+ownership = "template-with-consumer-entries"
+entry-type = "inline-table-path"
+
+[workspace.metadata.config.contract.deny]
+file = "deny.toml"
+
+[workspace.metadata.config.contract.deny.sources.unknown-registry]
+ownership = "template"
+value = "deny"
+
+[workspace.metadata.config.contract.deny.sources.unknown-git]
+ownership = "template"
+value = "deny"
+
+[workspace.metadata.config.contract.deny.sources.allow-registry]
+ownership = "template-with-consumer-entries"
+required = ["https://github.com/rust-lang/crates.io-index"]
+entry-type = "cargo-registry-url"
+sort = true
+
+[workspace.metadata.config.contract.deny.sources.allow-git]
+ownership = "derived"
+derive-from = ["cargo-deny.workspace-all-features.git-sources"]
+include-template-required = false
+include-consumer-declared = true
+consumer-entries = "explicit-only"
+remove-target-repository = true
+remove-unencountered = true
+entry-type = "cargo-deny-git-source-url"
+sort = true
+
+[workspace.metadata.config.update.cargo.workspace]
+dependencies = [
+  "agents-md",
+  "anstyle",
+  "bpaf",
+  "cargo_metadata",
+  "globset",
+  "ignore",
+  "parking_lot",
+  "proc-macro2",
+  "proptest",
+  "serde_json",
+  "snapbox",
+  "strict-test-support",
+  "strict-xtask-agents-md",
+  "strict-xtask-cargo",
+  "strict-xtask-core",
+  "syn",
+  "thiserror",
+  "toml",
+  "toml_edit",
+  "trybuild",
+]
+
+[[workspace.metadata.config.update.cargo.manifest]]
+path = "xtask/Cargo.toml"
+dependencies = [
+  "agents-md",
+  "strict-xtask-agents-md",
+  "strict-xtask-cargo",
+  "strict-xtask-core",
+]
+dev-dependencies = ["strict-test-support"]
+
+[workspace.metadata.config.update.guidance]
+regenerate = true
+
+[workspace.metadata.config.update.gitmodules]
+path             = ".gitmodules"
+preserve-unknown = true
+
+[[workspace.metadata.config.update.gitmodules.submodules]]
+id     = "agent-plugin.rust-template-core"
+name   = ".agents/plugins/rust-template-core"
+path   = ".agents/plugins/rust-template-core"
+url    = "git@github.com:earthlings-dev/agent-plugin-rust-template.git"
+branch = "main"
+
+[workspace.metadata.config.gates]
+schema-version = "0.1.0"
+format         = ["rustfmt.toml"]
+lint           = ["Cargo.toml", "clippy.toml"]
+audit          = ["deny.toml"]
+code-quality   = ["dupes.toml", ".jscpd.json"]
+toolchain      = ["rust-toolchain.toml"]
+github         = [".github/dependabot.yml", ".github/workflows/ci.yml", ".github/workflows/scheduled.yml"]
+automation     = ["justfile"]
+guidance       = ["AGENTS.md", "README.md", "crates/AGENTS.md", "xtask/AGENTS.md"]
+repository     = [".gitattributes", ".gitmodules", "LICENSE"]
+
+[[workspace.metadata.config.gates.rules]]
+id       = "coverage-contract"
+when-any = ["glob:cov/**", "glob:badges/**"]
+command  = "just coverage --per-file"
+reason   = "changed coverage policy, reports, or coverage-sensitive artifacts"
+fallout  = ["Coverage workflows may refresh reports under `cov/` and the full badge set under `badges/`."]
+
+[[workspace.metadata.config.gates.rules]]
+id       = "feature-matrix"
+when-any = ["path:Cargo.toml", "path:Cargo.lock", "glob:**/Cargo.toml"]
+command  = "just hack"
+reason   = "changed feature declarations or workspace dependency wiring"
+
+[[workspace.metadata.config.gates.rules]]
+id       = "tests-or-behavior"
+when-any = ["glob:**/*.rs", "glob:**/tests/**", "glob:**/*.snap", "glob:**/*.stderr"]
+command  = "just mutants"
+reason   = "changed tests or behavior where missed assertions are plausible"
+
+[[workspace.metadata.config.gates.rules]]
+id       = "guidance"
+when-any = ["glob:fragments/**", "glob:docs/fragments/**", "path:AGENTS.md", "glob:**/AGENTS.md", "path:README.md", "glob:**/README.md", "path:CLAUDE.md"]
+command  = "just gen-agent-guidance"
+reason   = "changed generated-doc fragments or generated doc targets"
+fallout  = ["Generated Markdown docs may be rewritten."]
+
+[[workspace.metadata.config.gates.rules]]
+id       = "plugins"
+when-any = ["glob:.agents/plugins/**", "path:.gitmodules", "path:.agents/plugins/marketplace.json"]
+command  = "skills-ref validate .agents/plugins/rust-template-core/skills/*"
+reason   = "changed bundled agent skills or repo marketplace entries"
+
+[[workspace.metadata.config.gates.rules]]
+id        = "shared-workflow"
+when-any  = ["glob:xtask/**", "glob:.github/workflows/**", "path:justfile", "path:clippy.toml", "path:rustfmt.toml", "path:deny.toml", "path:dupes.toml", "path:.jscpd.json", "path:rust-toolchain.toml", "path:template-lint.toml", "path:template-clippy.toml"]
+command   = "just ci"
+reason    = "changed shared workflow, policy, or xtask automation"
+exclusive = true
+fallout   = ["`just ci`, `just cq`, any coverage workflow, or the pre-commit hook may refresh `cov/tokei.json` and `badges/`."]
+
+[[workspace.metadata.config.gates.rules]]
+id       = "rust-code"
+when-any = ["glob:**/*.rs", "path:Cargo.lock", "glob:**/Cargo.toml"]
+command  = "just fmt && just lint && just test-all"
+reason   = "changed Rust code or workspace manifests"
+
+[workspace.metadata.config.agent-plugins]
+schema-version = "0.1.0"
+marketplace    = ".agents/plugins/marketplace.json"
+plugins-root   = ".agents/plugins"
+submodules     = ".gitmodules"
+
+[[workspace.metadata.config.agent-plugins.plugins]]
+id              = "rust-template-core"
+path            = ".agents/plugins/rust-template-core"
+manifest        = "plugin.json"
+codex-manifest  = ".codex-plugin/plugin.json"
+claude-manifest = ".claude-plugin/plugin.json"
+skills          = "skills"
+source          = { kind = "git", url = "git@github.com:earthlings-dev/agent-plugin-rust-template.git", branch = "main" }
