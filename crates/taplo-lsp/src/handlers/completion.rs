@@ -1,15 +1,10 @@
-use lsp_async_stub::{
-    rpc::Error,
-    util::{LspExt, Position},
-    Context, Params,
-};
+use lsp_async_stub::{rpc::Error, Context, Params};
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse, CompletionTextEdit,
     Documentation, InsertTextFormat, MarkupContent, Range, TextEdit,
 };
 use serde_json::Value;
 use std::borrow::Cow;
-use std::fmt::Write as _;
 use taplo::dom::{node::TableKind, Keys, Node};
 use taplo_common::{
     environment::Environment,
@@ -33,28 +28,27 @@ pub async fn completion<E: Environment>(
         return Ok(None);
     };
 
-    let workspaces = context.workspaces.read().await;
-    let ws = workspaces.by_document(&document_uri);
+    let Some(snapshot) = context.document_snapshot(&document_uri).await else {
+        return Ok(None);
+    };
 
     // All completions are tied to schemas.
-    if !ws.config.schema.enabled {
+    if !snapshot.config.schema.enabled {
         return Ok(None);
     }
 
-    let doc = match ws.document(&document_uri) {
-        Ok(d) => d,
-        Err(error) => {
-            tracing::debug!(%error, "failed to get document from workspace");
-            return Ok(None);
-        }
-    };
+    let doc = &snapshot.document;
 
-    let Some(schema_association) = ws.schemas.associations().association_for(&document_uri) else {
+    let Some(schema_association) = snapshot
+        .schemas
+        .associations()
+        .association_for(&document_uri)
+    else {
         return Ok(None);
     };
 
     let position = p.text_document_position.position;
-    let Some(offset) = doc.mapper.offset(Position::from_lsp(position)) else {
+    let Some(offset) = doc.mapper.offset(crate::uri::from_lsp_position(position)) else {
         tracing::error!(?position, "document position not found");
         return Ok(None);
     };
@@ -72,13 +66,13 @@ pub async fn completion<E: Environment>(
     if query.in_table_header() {
         let key_count = query.header_keys().len();
 
-        let object_schemas = match ws
+        let object_schemas = match snapshot
             .schemas
             .possible_schemas_from(
                 &schema_association.url,
                 &value,
                 &Keys::empty(),
-                key_count + ws.config.completion.max_keys + 1,
+                completion_depth(key_count, snapshot.config.completion.max_keys),
             )
             .await
             .map(|s| {
@@ -97,13 +91,11 @@ pub async fn completion<E: Environment>(
             }
         };
 
-        let key_range = query.header_key().map(|k| k.text_range()).and_then(|r| {
-            if r.is_empty() {
-                None
-            } else {
-                Some(r)
-            }
-        });
+        let key_range = query
+            .header_key()
+            .map(|key| key.text_range())
+            .filter(|range| !range.is_empty());
+        let key_lsp_range = key_range.and_then(|range| crate::uri::to_lsp_range(&doc.mapper, range));
 
         let node = query
             .dom_node()
@@ -120,31 +112,34 @@ pub async fn completion<E: Environment>(
                     }
                     None => true,
                 })
-                .map(|(full_key, _, s)| CompletionItem {
-                    label: full_key.to_string(),
+                .map(|(full_key, _, s)| {
+                    let text = full_key.to_string();
+                    CompletionItem {
+                    label: text.clone(),
                     kind: Some(CompletionItemKind::STRUCT),
                     documentation: documentation(&s),
-                    text_edit: key_range.map(|r| {
+                    insert_text: Some(text.clone()),
+                    text_edit: key_lsp_range.map(|range| {
                         CompletionTextEdit::Edit(TextEdit {
-                            range: doc.mapper.range(r).unwrap().into_lsp(),
-                            new_text: full_key.to_string(),
+                            range,
+                            new_text: text,
                         })
                     }),
                     ..Default::default()
-                })
+                }})
                 .collect(),
         )));
     }
 
     if query.in_table_array_header() {
         let key_count = query.header_keys().len();
-        let array_of_objects_schemas = match ws
+        let array_of_objects_schemas = match snapshot
             .schemas
             .possible_schemas_from(
                 &schema_association.url,
                 &value,
                 &Keys::empty(),
-                key_count + ws.config.completion.max_keys + 1,
+                completion_depth(key_count, snapshot.config.completion.max_keys),
             )
             .await
             .map(|s| {
@@ -160,28 +155,29 @@ pub async fn completion<E: Environment>(
             }
         };
 
-        let key_range = query.header_key().map(|k| k.text_range()).and_then(|r| {
-            if r.is_empty() {
-                None
-            } else {
-                Some(r)
-            }
-        });
+        let key_range = query
+            .header_key()
+            .map(|key| key.text_range())
+            .filter(|range| !range.is_empty());
+        let key_lsp_range = key_range.and_then(|range| crate::uri::to_lsp_range(&doc.mapper, range));
 
         return Ok(Some(CompletionResponse::Array(
             array_of_objects_schemas
-                .map(|(full_key, _, s)| CompletionItem {
-                    label: full_key.to_string(),
+                .map(|(full_key, _, s)| {
+                    let text = full_key.to_string();
+                    CompletionItem {
+                    label: text.clone(),
                     kind: Some(CompletionItemKind::STRUCT),
                     documentation: documentation(&s),
-                    text_edit: key_range.map(|r| {
+                    insert_text: Some(text.clone()),
+                    text_edit: key_lsp_range.map(|range| {
                         CompletionTextEdit::Edit(TextEdit {
-                            range: doc.mapper.range(r).unwrap().into_lsp(),
-                            new_text: full_key.to_string(),
+                            range,
+                            new_text: text,
                         })
                     }),
                     ..Default::default()
-                })
+                }})
                 .collect(),
         )));
     }
@@ -189,13 +185,13 @@ pub async fn completion<E: Environment>(
     if query.empty_line() {
         let parent_table = query.parent_table_or_array_table(&doc.dom);
 
-        let schemas = match ws
+        let schemas = match snapshot
             .schemas
             .possible_schemas_from(
                 &schema_association.url,
                 &value,
                 &lookup_keys(doc.dom.clone(), &parent_table.0),
-                ws.config.completion.max_keys + 1,
+                completion_depth(0, snapshot.config.completion.max_keys),
             )
             .await
         {
@@ -237,13 +233,13 @@ pub async fn completion<E: Environment>(
 
         parent_keys = parent_keys.skip_right(entry_keys.len());
 
-        let schemas = match ws
+        let schemas = match snapshot
             .schemas
             .possible_schemas_from(
                 &schema_association.url,
                 &value,
                 &lookup_keys(doc.dom.clone(), &parent_keys),
-                entry_keys.len() + ws.config.completion.max_keys + 1,
+                completion_depth(entry_keys.len(), snapshot.config.completion.max_keys),
             )
             .await
         {
@@ -254,7 +250,11 @@ pub async fn completion<E: Environment>(
             }
         };
 
-        let key_range = query.entry_key().map(|k| k.text_range());
+        let key_range = query
+            .entry_key()
+            .map(|key| key.text_range())
+            .filter(|range| !range.is_empty());
+        let key_lsp_range = key_range.and_then(|range| crate::uri::to_lsp_range(&doc.mapper, range));
 
         let has_eq = query.entry_has_eq();
 
@@ -265,9 +265,9 @@ pub async fn completion<E: Environment>(
                     label: relative_keys.to_string(),
                     kind: Some(CompletionItemKind::VARIABLE),
                     documentation: documentation(&schema),
-                    text_edit: key_range.map(|r| {
+                    text_edit: key_lsp_range.map(|range| {
                         CompletionTextEdit::Edit(TextEdit {
-                            range: doc.mapper.range(r).unwrap().into_lsp(),
+                            range,
                             new_text: if has_eq {
                                 relative_keys.to_string() + " "
                             } else {
@@ -292,17 +292,19 @@ pub async fn completion<E: Environment>(
     }
 
     if query.in_entry_value() {
-        let (path, _) = query.dom_node().unwrap();
+        let Some((path, _)) = query.dom_node() else {
+            return Ok(None);
+        };
 
         // Pretty much same as the entry on an empty line
         if query.in_inline_table() {
-            let schemas = match ws
+            let schemas = match snapshot
                 .schemas
                 .possible_schemas_from(
                     &schema_association.url,
                     &value,
                     &lookup_keys(doc.dom.clone(), path),
-                    ws.config.completion.max_keys + 1,
+                    completion_depth(0, snapshot.config.completion.max_keys),
                 )
                 .await
             {
@@ -341,13 +343,13 @@ pub async fn completion<E: Environment>(
             lookup_keys(doc.dom.clone(), &parent.0.extend(entry_key))
         };
 
-        let schemas = match ws
+        let schemas = match snapshot
             .schemas
             .possible_schemas_from(
                 &schema_association.url,
                 &value,
                 &path,
-                ws.config.completion.max_keys + 1,
+                completion_depth(0, snapshot.config.completion.max_keys),
             )
             .await
         {
@@ -364,8 +366,7 @@ pub async fn completion<E: Environment>(
             query
                 .entry_value()
                 .map(|k| k.text_range())
-                .and_then(|r| doc.mapper.range(r))
-                .map(lsp_async_stub::util::LspExt::into_lsp)
+                .and_then(|range| crate::uri::to_lsp_range(&doc.mapper, range))
         };
 
         let mut completions = Vec::new();
@@ -394,13 +395,13 @@ pub async fn completion<E: Environment>(
 
     parent_keys = parent_keys.skip_right(entry_keys.len());
 
-    let schemas = match ws
+    let schemas = match snapshot
         .schemas
         .possible_schemas_from(
             &schema_association.url,
             &value,
             &lookup_keys(doc.dom.clone(), &parent_keys),
-            ws.config.completion.max_keys + 1,
+            completion_depth(0, snapshot.config.completion.max_keys),
         )
         .await
     {
@@ -411,6 +412,7 @@ pub async fn completion<E: Environment>(
         }
     };
 
+    let replacement_range = crate::uri::to_lsp_range(&doc.mapper, entry_keys.all_text_range());
     Ok(Some(CompletionResponse::Array(
         schemas
             .into_iter()
@@ -419,45 +421,125 @@ pub async fn completion<E: Environment>(
                 Some(n) => n.as_table().is_some_and(|t| t.kind() == TableKind::Pseudo),
                 None => true,
             })
-            .map(|(_, relative_keys, schema)| CompletionItem {
+            .map(|(_, relative_keys, schema)| {
+                let text = new_entry_snippet(&relative_keys, &schema, false);
+                CompletionItem {
                 label: relative_keys.to_string(),
                 kind: Some(CompletionItemKind::VARIABLE),
                 documentation: documentation(&schema),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
-                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-                    range: doc
-                        .mapper
-                        .range(entry_keys.all_text_range())
-                        .unwrap()
-                        .into_lsp(),
-                    new_text: new_entry_snippet(&relative_keys, &schema, false),
+                insert_text: Some(text.clone()),
+                text_edit: replacement_range.map(|range| CompletionTextEdit::Edit(TextEdit {
+                    range,
+                    new_text: text,
                 })),
                 ..Default::default()
-            })
+            }})
             .collect(),
     )))
 }
 
 fn documentation(schema: &Value) -> Option<Documentation> {
-    if let Some(ext) = schema_ext_of(schema) {
-        if let Some(docs) = ext.docs {
-            if let Some(docs) = docs.main {
-                return Some(Documentation::MarkupContent(MarkupContent {
-                    kind: lsp_types::MarkupKind::Markdown,
-                    value: docs,
-                }));
+    schema_ext_of(schema)
+        .and_then(|ext| ext.docs)
+        .and_then(|docs| docs.main)
+        .or_else(|| schema["description"].as_str().map(ToOwned::to_owned))
+        .filter(|docs| !docs.is_empty())
+        .map(markdown_documentation)
+}
+
+fn markdown_documentation(value: String) -> Documentation {
+    Documentation::MarkupContent(MarkupContent {
+        kind: lsp_types::MarkupKind::Markdown,
+        value,
+    })
+}
+
+fn completion_depth(prefix_length: usize, max_keys: usize) -> usize {
+    prefix_length.saturating_add(max_keys)
+}
+
+fn schema_value_to_toml(
+    value: &Value,
+    single_quote: bool,
+) -> Option<(String, CompletionItemKind)> {
+    if value.is_null() {
+        return None;
+    }
+
+    match serde_json::from_value::<Node>(value.clone()) {
+        Ok(node) => {
+            match serde_json::to_value(&node) {
+                Ok(round_trip) if round_trip == *value => {}
+                Ok(round_trip) => {
+                    tracing::warn!(?value, ?round_trip, "schema value loses data during TOML conversion");
+                    return None;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "converted schema value cannot be serialized for verification");
+                    return None;
+                }
             }
+            let kind = if matches!(&node, Node::Table(_)) {
+                CompletionItemKind::STRUCT
+            } else {
+                CompletionItemKind::VALUE
+            };
+            let mut text = String::new();
+            if let Err(error) = node.to_toml_fmt(&mut text, true, single_quote) {
+                tracing::warn!(%error, "schema value cannot be rendered as TOML");
+                return None;
+            }
+            Some((text, kind))
+        }
+        Err(error) => {
+            tracing::warn!(%error, "schema value cannot be represented as TOML");
+            None
         }
     }
+}
 
-    if let Some(docs) = schema["description"].as_str() {
-        return Some(Documentation::MarkupContent(MarkupContent {
-            kind: lsp_types::MarkupKind::Markdown,
-            value: docs.into(),
-        }));
+fn value_completion(
+    text: String,
+    kind: CompletionItemKind,
+    docs: Option<String>,
+    range: Option<Range>,
+) -> CompletionItem {
+    CompletionItem {
+        label: text.clone(),
+        kind: Some(kind),
+        documentation: docs.filter(|docs| !docs.is_empty()).map(markdown_documentation),
+        insert_text: Some(text.clone()),
+        text_edit: range.map(|range| {
+            CompletionTextEdit::Edit(TextEdit {
+                range,
+                new_text: text,
+            })
+        }),
+        ..Default::default()
     }
+}
 
-    None
+fn snippet_completion(
+    label: &str,
+    text: &str,
+    docs: Option<String>,
+    range: Option<Range>,
+) -> CompletionItem {
+    CompletionItem {
+        label: label.into(),
+        kind: Some(CompletionItemKind::VALUE),
+        documentation: docs.filter(|docs| !docs.is_empty()).map(markdown_documentation),
+        insert_text: Some(text.into()),
+        insert_text_format: Some(InsertTextFormat::SNIPPET),
+        text_edit: range.map(|range| {
+            CompletionTextEdit::Edit(TextEdit {
+                range,
+                new_text: text.into(),
+            })
+        }),
+        ..Default::default()
+    }
 }
 
 fn add_value_completions(
@@ -475,106 +557,52 @@ fn add_value_completions(
         .or_else(|| schema["description"].as_str().map(Into::into));
 
     if let Some(enum_values) = schema["enum"].as_array() {
-        for (idx, val) in enum_values.iter().enumerate() {
-            let node: Node = match serde_json::from_value(val.clone()) {
-                Ok(v) => v,
-                Err(err) => {
-                    tracing::error!(error = %err, "failed to parse JSON");
-                    continue;
-                }
-            };
-
-            let toml_value = node.to_toml(true, single_quote);
-
-            completions.push(CompletionItem {
-                label: toml_value.clone(),
-                sort_text: Some(format!("{idx}{toml_value}")),
-                kind: Some(match node {
-                    Node::Table(_) => CompletionItemKind::STRUCT,
-                    _ => CompletionItemKind::VALUE,
-                }),
-                documentation: enum_docs
-                    .get(idx)
+        let enum_completions = enum_values
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| {
+                let (text, kind) = schema_value_to_toml(value, single_quote)?;
+                let docs = enum_docs
+                    .get(index)
                     .cloned()
                     .flatten()
-                    .or_else(|| schema_docs.clone())
-                    .map(|value| {
-                        Documentation::MarkupContent(MarkupContent {
-                            kind: lsp_types::MarkupKind::Markdown,
-                            value,
-                        })
-                    }),
-                text_edit: range.map(|range| {
-                    CompletionTextEdit::Edit(TextEdit {
-                        range,
-                        new_text: toml_value,
-                    })
-                }),
-                ..Default::default()
-            });
+                    .or_else(|| schema_docs.clone());
+                let mut completion = value_completion(text.clone(), kind, docs, range);
+                completion.sort_text = Some(format!("{index}{text}"));
+                Some(completion)
+            })
+            .collect::<Vec<_>>();
+
+        if !enum_completions.is_empty() {
+            completions.extend(enum_completions);
+            return;
         }
+    }
+
+    if let Some((text, kind)) = schema
+        .get("const")
+        .and_then(|value| schema_value_to_toml(value, single_quote))
+    {
+        completions.push(value_completion(
+            text,
+            kind,
+            ext_docs.const_value.or_else(|| schema_docs.clone()),
+            range,
+        ));
         return;
     }
 
-    if let Some(const_value) = schema.get("const") {
-        if !const_value.is_null() {
-            let node: Node = serde_json::from_value(const_value.clone()).unwrap();
-            let toml_value = node.to_toml(true, single_quote);
-            completions.push(CompletionItem {
-                label: toml_value.clone(),
-                kind: Some(match node {
-                    Node::Table(_) => CompletionItemKind::STRUCT,
-                    _ => CompletionItemKind::VALUE,
-                }),
-                documentation: ext_docs
-                    .const_value
-                    .or_else(|| schema_docs.clone())
-                    .map(|value| {
-                        Documentation::MarkupContent(MarkupContent {
-                            kind: lsp_types::MarkupKind::Markdown,
-                            value,
-                        })
-                    }),
-                text_edit: range.map(|range| {
-                    CompletionTextEdit::Edit(TextEdit {
-                        range,
-                        new_text: toml_value,
-                    })
-                }),
-                ..Default::default()
-            });
-        }
-
+    if let Some((text, kind)) = schema
+        .get("default")
+        .and_then(|value| schema_value_to_toml(value, single_quote))
+    {
+        completions.push(value_completion(
+            text,
+            kind,
+            ext_docs.default_value.or_else(|| schema_docs.clone()),
+            range,
+        ));
         return;
-    }
-
-    if let Some(default_value) = schema.get("default") {
-        if !default_value.is_null() {
-            let node: Node = serde_json::from_value(default_value.clone()).unwrap();
-            let toml_value = node.to_toml(true, single_quote);
-            completions.push(CompletionItem {
-                label: toml_value.clone(),
-                kind: Some(match node {
-                    Node::Table(_) => CompletionItemKind::STRUCT,
-                    _ => CompletionItemKind::VALUE,
-                }),
-                documentation: ext_docs.default_value.or_else(|| schema_docs.clone()).map(
-                    |value| {
-                        Documentation::MarkupContent(MarkupContent {
-                            kind: lsp_types::MarkupKind::Markdown,
-                            value,
-                        })
-                    },
-                ),
-                text_edit: range.map(|range| {
-                    CompletionTextEdit::Edit(TextEdit {
-                        range,
-                        new_text: toml_value,
-                    })
-                }),
-                ..Default::default()
-            });
-        }
     }
 
     let types = match schema["type"].clone() {
@@ -584,99 +612,41 @@ fn add_value_completions(
         _ => Vec::new(),
     };
 
-    for ty in types {
-        if let Some(s) = ty.as_str() {
-            match s {
-                "string" => {
-                    completions.push(CompletionItem {
-                        label: r#""""#.into(),
-                        kind: Some(CompletionItemKind::VALUE),
-                        documentation: Some(Documentation::MarkupContent(MarkupContent {
-                            kind: lsp_types::MarkupKind::Markdown,
-                            value: schema_docs.clone().unwrap_or_else(|| "string".into()),
-                        })),
-                        insert_text_format: Some(InsertTextFormat::SNIPPET),
-                        text_edit: range.map(|range| {
-                            CompletionTextEdit::Edit(TextEdit {
-                                range,
-                                new_text: r#""$0""#.into(),
-                            })
-                        }),
-                        ..Default::default()
-                    });
-                }
-                "boolean" => {
-                    completions.push(CompletionItem {
-                        label: r"true".into(),
-                        kind: Some(CompletionItemKind::VALUE),
-                        documentation: Some(Documentation::MarkupContent(MarkupContent {
-                            kind: lsp_types::MarkupKind::Markdown,
-                            value: schema_docs.clone().unwrap_or_else(|| "true value".into()),
-                        })),
-                        insert_text_format: Some(InsertTextFormat::SNIPPET),
-                        text_edit: range.map(|range| {
-                            CompletionTextEdit::Edit(TextEdit {
-                                range,
-                                new_text: r"true$0".into(),
-                            })
-                        }),
-                        ..Default::default()
-                    });
-                    completions.push(CompletionItem {
-                        label: r"false".into(),
-                        kind: Some(CompletionItemKind::VALUE),
-                        documentation: Some(Documentation::MarkupContent(MarkupContent {
-                            kind: lsp_types::MarkupKind::Markdown,
-                            value: schema_docs.clone().unwrap_or_else(|| "false value".into()),
-                        })),
-                        insert_text_format: Some(InsertTextFormat::SNIPPET),
-                        text_edit: range.map(|range| {
-                            CompletionTextEdit::Edit(TextEdit {
-                                range,
-                                new_text: r"false$0".into(),
-                            })
-                        }),
-                        ..Default::default()
-                    });
-                }
-                "array" => {
-                    completions.push(CompletionItem {
-                        label: r"[]".into(),
-                        kind: Some(CompletionItemKind::VALUE),
-                        documentation: Some(Documentation::MarkupContent(MarkupContent {
-                            kind: lsp_types::MarkupKind::Markdown,
-                            value: schema_docs.clone().unwrap_or_else(|| "array".into()),
-                        })),
-                        insert_text_format: Some(InsertTextFormat::SNIPPET),
-                        text_edit: range.map(|range| {
-                            CompletionTextEdit::Edit(TextEdit {
-                                range,
-                                new_text: r"[$0]".into(),
-                            })
-                        }),
-                        ..Default::default()
-                    });
-                }
-                "object" => {
-                    completions.push(CompletionItem {
-                        label: r"{ }".into(),
-                        kind: Some(CompletionItemKind::VALUE),
-                        documentation: Some(Documentation::MarkupContent(MarkupContent {
-                            kind: lsp_types::MarkupKind::Markdown,
-                            value: schema_docs.clone().unwrap_or_else(|| "object".into()),
-                        })),
-                        insert_text_format: Some(InsertTextFormat::SNIPPET),
-                        text_edit: range.map(|range| {
-                            CompletionTextEdit::Edit(TextEdit {
-                                range,
-                                new_text: r"{ $0 }".into(),
-                            })
-                        }),
-                        ..Default::default()
-                    });
-                }
-                _ => {}
+    for schema_type in types.iter().filter_map(Value::as_str) {
+        match schema_type {
+            "string" => completions.push(snippet_completion(
+                r#""""#,
+                r#""$0""#,
+                schema_docs.clone().or_else(|| Some("string".into())),
+                range,
+            )),
+            "boolean" => {
+                completions.push(snippet_completion(
+                    "true",
+                    "true$0",
+                    schema_docs.clone().or_else(|| Some("true value".into())),
+                    range,
+                ));
+                completions.push(snippet_completion(
+                    "false",
+                    "false$0",
+                    schema_docs.clone().or_else(|| Some("false value".into())),
+                    range,
+                ));
             }
+            "array" => completions.push(snippet_completion(
+                "[]",
+                "[$0]",
+                schema_docs.clone().or_else(|| Some("array".into())),
+                range,
+            )),
+            "object" => completions.push(snippet_completion(
+                "{ }",
+                "{ $0 }",
+                schema_docs.clone().or_else(|| Some("object".into())),
+                range,
+            )),
+            _ => {}
         }
     }
 }
@@ -691,64 +661,61 @@ fn default_value_snippet(
     cursor_count: usize,
     single_quote: bool,
 ) -> Cow<'static, str> {
-    if let Some(const_value) = schema.get("const") {
-        if !const_value.is_null() {
-            let node: Node = serde_json::from_value(const_value.clone()).unwrap();
-            return format!("${{{}:{}}}", cursor_count, node.to_toml(true, single_quote)).into();
-        }
+    if let Some((text, _)) = schema
+        .get("const")
+        .and_then(|value| schema_value_to_toml(value, single_quote))
+    {
+        return format!("${{{cursor_count}:{text}}}").into();
     }
 
-    if let Some(default_value) = schema.get("default") {
-        if !default_value.is_null() {
-            let node: Node = serde_json::from_value(default_value.clone()).unwrap();
-            return format!("${{{}:{}}}", cursor_count, node.to_toml(true, single_quote)).into();
-        }
+    if let Some((text, _)) = schema
+        .get("default")
+        .and_then(|value| schema_value_to_toml(value, single_quote))
+    {
+        return format!("${{{cursor_count}:{text}}}").into();
     }
 
-    if schema.get("enum").is_some() {
+    if schema["enum"].as_array().is_some_and(|values| {
+        values
+            .iter()
+            .any(|value| schema_value_to_toml(value, single_quote).is_some())
+    }) {
         return format!("${cursor_count}").into();
     }
 
-    let mut init_keys = Vec::new();
+    let mut init_keys = schema_ext_of(schema)
+        .and_then(|ext| ext.init_keys)
+        .unwrap_or_default();
 
-    if let Some(ext) = schema_ext_of(schema) {
-        if let Some(extra_init_keys) = ext.init_keys {
-            init_keys.extend(extra_init_keys);
-        }
-    }
-
-    if let Some(arr) = schema["required"].as_array() {
+    if let Some(required) = schema["required"].as_array() {
         init_keys.extend(
-            arr.iter()
-                .filter_map(|s| s.as_str().map(ToString::to_string)),
+            required
+                .iter()
+                .filter_map(|value| value.as_str().map(ToOwned::to_owned)),
         );
     }
 
     init_keys.dedup();
 
     if !init_keys.is_empty() {
-        let mut s = String::new();
-        s += "{ ";
+        let nested_cursor = cursor_count.saturating_add(1);
+        let mut snippet = String::from("{ ");
 
-        for (i, init_key) in init_keys.iter().enumerate() {
-            if i != 0 {
-                s += ", ";
+        for (index, init_key) in init_keys.iter().enumerate() {
+            if index != 0 {
+                snippet.push_str(", ");
             }
-            write!(
-                s,
-                "{init_key} = {}",
-                default_value_snippet(
-                    &schema["properties"][init_key],
-                    cursor_count + 1,
-                    single_quote
-                )
-            )
-            .unwrap();
+            snippet.push_str(init_key);
+            snippet.push_str(" = ");
+            snippet.push_str(&default_value_snippet(
+                &schema["properties"][init_key],
+                nested_cursor,
+                single_quote,
+            ));
         }
 
-        s += " }$0";
-
-        return s.into();
+        snippet.push_str(" }$0");
+        return snippet.into();
     }
 
     empty_value_snippet(schema, cursor_count).into()
@@ -761,7 +728,7 @@ fn empty_value_snippet(schema: &Value, cursor_count: usize) -> String {
 
     match &schema["type"] {
         Value::Null => format!("{{ ${cursor_count} }}"),
-        Value::String(s) => match s.as_str() {
+        Value::String(value) => match value.as_str() {
             "object" => format!("{{ ${cursor_count} }}"),
             "array" => format!("[${cursor_count}]"),
             "string" => format!(r#""${cursor_count}""#),
@@ -769,5 +736,240 @@ fn empty_value_snippet(schema: &Value, cursor_count: usize) -> String {
             _ => format!("${cursor_count}"),
         },
         _ => format!("${cursor_count}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        add_value_completions, completion_depth, default_value_snippet, documentation,
+        schema_value_to_toml,
+    };
+    use lsp_types::{CompletionItemKind, Documentation, MarkupContent, Range};
+    use serde_json::{json, Value};
+    use strict_test_support::{ensure, ensure_contains, ensure_eq, ensure_some, TestFailure};
+
+    /// Extract rendered Markdown from one completion documentation value.
+    fn markdown(docs: &Option<Documentation>) -> Option<&str> {
+        match docs {
+            Some(Documentation::MarkupContent(MarkupContent { value, .. })) => Some(value),
+            Some(Documentation::String(value)) => Some(value),
+            None => None,
+        }
+    }
+
+    #[test]
+    fn completion_documentation_prefers_extension_content() -> Result<(), TestFailure> {
+        let schema = json!({
+            "description": "description docs",
+            "x-taplo": { "docs": { "main": "extension docs" } }
+        });
+        let docs = ensure_some(documentation(&schema), "completion docs must exist")?;
+        ensure(
+            markdown(&Some(docs)) == Some("extension docs"),
+            "extension main docs must override schema description",
+        )?;
+        ensure(
+            markdown(&documentation(&json!({ "description": "description docs" })))
+                == Some("description docs"),
+            "schema description must backfill absent extension docs",
+        )?;
+        ensure(
+            documentation(&json!({ "description": "" })).is_none(),
+            "empty documentation must be omitted",
+        )
+    }
+
+    #[test]
+    fn enum_completion_uses_only_convertible_values_and_suppresses_fallbacks(
+    ) -> Result<(), TestFailure> {
+        let schema = json!({
+            "enum": [1, null, 2],
+            "const": 3,
+            "default": 4,
+            "type": "string",
+            "description": "schema docs",
+            "x-taplo": {
+                "docs": { "enumValues": ["one docs", null, "two docs"] }
+            }
+        });
+        let mut completions = Vec::new();
+        add_value_completions(&schema, Some(Range::default()), &mut completions, false);
+        ensure_eq(
+            &completions.len(),
+            &2,
+            "a nonempty convertible enum must suppress const, default, and type completions",
+        )?;
+        ensure(
+            completions
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>()
+                == vec!["1", "2"],
+            "invalid enum values must be omitted while valid values retain declaration order",
+        )?;
+        let first = ensure_some(completions.first(), "the first enum completion must exist")?;
+        let second = ensure_some(completions.get(1), "the second enum completion must exist")?;
+        ensure(
+            markdown(&first.documentation) == Some("one docs"),
+            "enum documentation must remain aligned by original schema index",
+        )?;
+        ensure(
+            markdown(&second.documentation) == Some("two docs"),
+            "later enum documentation must remain aligned after an invalid value is skipped",
+        )?;
+        ensure(
+            completions
+                .iter()
+                .all(|item| item.insert_text.is_some() && item.text_edit.is_some()),
+            "mapped enum completions must support both insertion and replacement",
+        )
+    }
+
+    #[test]
+    fn invalid_enum_const_and_default_values_fall_through_in_order() -> Result<(), TestFailure> {
+        let const_schema = json!({
+            "enum": [null, { "bad": null }],
+            "const": 3,
+            "default": 4,
+            "type": "string"
+        });
+        let mut completions = Vec::new();
+        add_value_completions(&const_schema, None, &mut completions, false);
+        ensure(
+            completions
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>()
+                == vec!["3"],
+            "an all-invalid enum must fall through to a valid const",
+        )?;
+        let const_completion = ensure_some(
+            completions.first(),
+            "the const fallback completion must exist",
+        )?;
+        ensure(
+            const_completion.text_edit.is_none() && const_completion.insert_text.is_some(),
+            "an unmappable optional range must retain insert text without a replacement edit",
+        )?;
+
+        let default_schema = json!({
+            "enum": [],
+            "const": null,
+            "default": "fallback",
+            "type": "boolean"
+        });
+        completions.clear();
+        add_value_completions(&default_schema, None, &mut completions, false);
+        ensure(
+            completions
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>()
+                == vec!["\"fallback\""],
+            "empty enum and null const must fall through to a valid default",
+        )?;
+
+        let type_schema = json!({
+            "enum": [null],
+            "const": { "bad": null },
+            "default": null,
+            "type": "boolean"
+        });
+        completions.clear();
+        add_value_completions(&type_schema, None, &mut completions, false);
+        ensure(
+            completions
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>()
+                == vec!["true", "false"],
+            "invalid enum, const, and default values must fall through to type snippets",
+        )?;
+        ensure(
+            schema_value_to_toml(&Value::Null, false).is_none(),
+            "null must never become bogus TOML completion text",
+        )?;
+        ensure(
+            schema_value_to_toml(&json!({ "bad": null }), false).is_none(),
+            "a nonconvertible composite value must be omitted",
+        )
+    }
+
+    #[test]
+    fn schema_value_conversion_preserves_value_kind() -> Result<(), TestFailure> {
+        let scalar = ensure_some(
+            schema_value_to_toml(&json!(1), false),
+            "an integer schema value must convert",
+        )?;
+        ensure(
+            scalar == ("1".into(), CompletionItemKind::VALUE),
+            "scalar schema values must produce value completions",
+        )?;
+        let object = ensure_some(
+            schema_value_to_toml(&json!({ "key": 1 }), false),
+            "an object schema value must convert",
+        )?;
+        ensure(
+            object.1 == CompletionItemKind::STRUCT,
+            "object schema values must produce structural completions",
+        )
+    }
+
+    #[test]
+    fn recursive_default_snippets_use_safe_precedence_and_saturating_cursors(
+    ) -> Result<(), TestFailure> {
+        ensure_eq(
+            &default_value_snippet(
+                &json!({ "const": "fixed", "default": "other", "type": "string" }),
+                0,
+                false,
+            )
+            .as_ref(),
+            &r#"${0:"fixed"}"#,
+            "valid const must win over default and type snippet",
+        )?;
+        ensure_eq(
+            &default_value_snippet(
+                &json!({ "const": null, "default": true, "type": "string" }),
+                0,
+                false,
+            )
+            .as_ref(),
+            &"${0:true}",
+            "null const must fall through to a valid default",
+        )?;
+        ensure_eq(
+            &default_value_snippet(&json!({ "enum": [null, 1], "type": "string" }), 0, false)
+                .as_ref(),
+            &"$0",
+            "an enum placeholder must be used only when at least one value converts",
+        )?;
+        ensure_eq(
+            &default_value_snippet(&json!({ "enum": [null], "type": "string" }), 0, false)
+                .as_ref(),
+            &r#""$0""#,
+            "an all-invalid enum must fall through to type-derived syntax",
+        )?;
+
+        let recursive = default_value_snippet(
+            &json!({
+                "type": "object",
+                "required": ["name"],
+                "properties": { "name": { "const": "fixed" } }
+            }),
+            usize::MAX,
+            false,
+        );
+        ensure_contains(
+            recursive.as_ref(),
+            &format!("${{{}:\"fixed\"}}", usize::MAX),
+            "recursive cursor numbering must saturate instead of overflowing",
+        )?;
+        ensure_eq(
+            &completion_depth(usize::MAX, 1),
+            &usize::MAX,
+            "completion traversal depth must saturate at the platform maximum",
+        )
     }
 }

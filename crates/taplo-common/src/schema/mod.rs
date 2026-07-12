@@ -20,6 +20,61 @@ pub mod associations;
 pub mod cache;
 pub mod ext;
 
+/// Mutable output and immutable root data shared by recursive child-schema traversal.
+struct ChildSchemaContext<'a> {
+    /// URL used to resolve schema references.
+    root_url: &'a Url,
+    /// Document path at which traversal began.
+    root_path: &'a Keys,
+    /// Collected absolute path, relative path, and schema triples.
+    schemas: &'a mut Vec<(Keys, Keys, Arc<Value>)>,
+}
+
+/// A JSON Schema composition keyword with nonempty branches.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CompositionKind {
+    /// Intersection branches.
+    Intersection,
+    /// Exclusive-alternative branches.
+    ExclusiveAlternative,
+    /// Alternative branches.
+    Alternative,
+}
+
+impl CompositionKind {
+    /// Return this keyword's branch array, or an empty slice when absent or malformed.
+    fn branches(self, schema: &Value) -> &[Value] {
+        let name = match self {
+            Self::Intersection => "allOf",
+            Self::ExclusiveAlternative => "oneOf",
+            Self::Alternative => "anyOf",
+        };
+        schema[name].as_array().map_or(&[], Vec::as_slice)
+    }
+}
+
+/// Recognize a metadata wrapper around exactly one nonempty composition keyword.
+fn composition_only_kind(schema: &Value) -> Option<CompositionKind> {
+    let object = schema.as_object()?;
+    let has_own_properties = object
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|properties| !properties.is_empty());
+    if has_own_properties {
+        return None;
+    }
+
+    let mut kinds = [
+        CompositionKind::Intersection,
+        CompositionKind::ExclusiveAlternative,
+        CompositionKind::Alternative,
+    ]
+    .into_iter()
+    .filter(|kind| !kind.branches(schema).is_empty());
+    let kind = kinds.next()?;
+    kinds.next().is_none().then_some(kind)
+}
+
 pub mod builtins {
     use serde_json::Value;
     use std::sync::Arc;
@@ -47,13 +102,27 @@ pub struct Schemas<E: Environment> {
     env: E,
     associations: SchemaAssociations<E>,
     concurrent_requests: Arc<Semaphore>,
-    http: reqwest::Client,
+    http: Option<reqwest::Client>,
     validators: Arc<Mutex<LruCache<Url, Arc<Validator>>>>,
     cache: Cache<E>,
 }
 
 impl<E: Environment> Schemas<E> {
     pub fn new(env: E, http: reqwest::Client) -> Self {
+        Self::with_http(env, Some(http))
+    }
+
+    /// Construct schema services without HTTP/HTTPS transport.
+    ///
+    /// Built-in, memory-cached, disk-cached, and `file:` schemas remain available. Attempts to
+    /// fetch remote schemas or catalogs return an actionable transport error.
+    #[must_use]
+    pub fn new_offline(env: E) -> Self {
+        Self::with_http(env, None)
+    }
+
+    /// Construct schema services with an explicit remote-transport capability.
+    fn with_http(env: E, http: Option<reqwest::Client>) -> Self {
         let cache = Cache::new(env.clone());
 
         Self {
@@ -63,7 +132,7 @@ impl<E: Environment> Schemas<E> {
             concurrent_requests: Arc::new(Semaphore::new(10)),
             http,
             validators: Arc::new(Mutex::new(LruCache::with_hasher(
-                NonZeroUsize::new(3).unwrap(),
+                NonZeroUsize::new(3).unwrap_or(NonZeroUsize::MIN),
                 ahash::RandomState::new(),
             ))),
         }
@@ -110,7 +179,7 @@ impl<E: Environment> Schemas<E> {
         let validator = self.get_or_build_validator(schema_url).await?;
         Ok(validator
             .iter_errors(value)
-            .map(SchemaValidationError::from_jsonschema)
+            .map(|error| SchemaValidationError::from_jsonschema(&error))
             .collect())
     }
 
@@ -256,13 +325,14 @@ impl<E: Environment> Schemas<E> {
     async fn fetch_external(&self, schema_url: &Url) -> Result<Value, anyhow::Error> {
         let _permit = self.concurrent_requests.acquire().await?;
         match schema_url.scheme() {
-            "http" | "https" => Ok(self
-                .http
-                .get(schema_url.clone())
-                .send()
-                .await?
-                .json()
-                .await?),
+            "http" | "https" => {
+                let Some(http) = &self.http else {
+                    return Err(anyhow!(
+                        "HTTP schema transport is unavailable for schema `{schema_url}`"
+                    ));
+                };
+                Ok(http.get(schema_url.clone()).send().await?.json().await?)
+            }
             "file" => Ok(serde_json::from_slice(
                 &self
                     .env
@@ -332,31 +402,59 @@ impl<E: Environment> Schemas<E> {
                 .await;
         }
 
-        if let Some(one_ofs) = schema["oneOf"].as_array() {
-            for one_of in one_ofs {
-                self.collect_schemas(root_url, one_of, value, full_path.clone(), path, schemas)
+        let composition = composition_only_kind(schema);
+        let preserve_all_of_wrapper =
+            path.is_empty() && composition == Some(CompositionKind::Intersection);
+
+        if !preserve_all_of_wrapper {
+            if let Some(one_ofs) = schema["oneOf"].as_array() {
+                for one_of in one_ofs {
+                    self.collect_schemas(
+                        root_url,
+                        one_of,
+                        value,
+                        full_path.clone(),
+                        path,
+                        schemas,
+                    )
                     .await?;
+                }
+            }
+
+            if let Some(any_ofs) = schema["anyOf"].as_array() {
+                for any_of in any_ofs {
+                    self.collect_schemas(
+                        root_url,
+                        any_of,
+                        value,
+                        full_path.clone(),
+                        path,
+                        schemas,
+                    )
+                    .await?;
+                }
+            }
+
+            if let Some(all_ofs) = schema["allOf"].as_array() {
+                for all_of in all_ofs {
+                    self.collect_schemas(
+                        root_url,
+                        all_of,
+                        value,
+                        full_path.clone(),
+                        path,
+                        schemas,
+                    )
+                    .await?;
+                }
             }
         }
-
-        if let Some(any_ofs) = schema["anyOf"].as_array() {
-            for any_of in any_ofs {
-                self.collect_schemas(root_url, any_of, value, full_path.clone(), path, schemas)
-                    .await?;
-            }
-        }
-
-        if let Some(all_ofs) = schema["allOf"].as_array() {
-            for all_of in all_ofs {
-                self.collect_schemas(root_url, all_of, value, full_path.clone(), path, schemas)
-                    .await?;
-            }
-        }
-
-        let include_self = schema["allOf"].is_null();
 
         let Some(key) = path.iter().next() else {
-            if include_self {
+            if !matches!(
+                composition,
+                Some(CompositionKind::ExclusiveAlternative | CompositionKind::Alternative)
+            ) {
                 schemas.push((full_path.clone(), Arc::new(schema.clone())));
             }
             return Ok(());
@@ -399,18 +497,22 @@ impl<E: Environment> Schemas<E> {
 
                 if let Some(pattern_props) = schema["patternProperties"].as_object() {
                     for (pattern, pattern_schema) in pattern_props {
-                        if let Ok(re) = Regex::new(pattern) {
-                            if re.is_match(k.value()) {
-                                self.collect_schemas(
-                                    root_url,
-                                    pattern_schema,
-                                    &value[k.value()],
-                                    full_path.join(k.clone()),
-                                    &child_path,
-                                    schemas,
-                                )
-                                .await?;
-                            }
+                        let regex = Regex::new(pattern).with_context(|| {
+                            format!(
+                                "invalid patternProperties regex `{pattern}` while resolving key `{}` at schema `{root_url}` path `{full_path}`",
+                                k.value()
+                            )
+                        })?;
+                        if regex.is_match(k.value()) {
+                            self.collect_schemas(
+                                root_url,
+                                pattern_schema,
+                                &value[k.value()],
+                                full_path.join(k.clone()),
+                                &child_path,
+                                schemas,
+                            )
+                            .await?;
                         }
                     }
                 }
@@ -456,15 +558,13 @@ impl<E: Environment> Schemas<E> {
         let mut children = Vec::with_capacity(schemas.len());
 
         for (path, schema) in schemas {
-            self.collect_child_schemas(
-                schema_url,
-                &schema,
-                &path,
-                &Keys::empty(),
-                max_depth,
-                &mut children,
-            )
-            .await;
+            let mut context = ChildSchemaContext {
+                root_url: schema_url,
+                root_path: &path,
+                schemas: &mut children,
+            };
+            self.collect_child_schemas(&mut context, &schema, &Keys::empty(), max_depth)
+                .await;
         }
 
         children = children
@@ -477,106 +577,86 @@ impl<E: Environment> Schemas<E> {
 
     #[async_recursion(?Send)]
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
     async fn collect_child_schemas(
         &self,
-        root_url: &Url,
+        context: &mut ChildSchemaContext<'_>,
         schema: &Value,
-        root_path: &Keys,
         path: &Keys,
-        mut depth: usize,
-        schemas: &mut Vec<(Keys, Keys, Arc<Value>)>,
+        depth: usize,
     ) {
         if !schema.is_object() || depth == 0 {
             return;
         }
 
-        if let Some(schema) = self.ref_schema_value(root_url, schema).await {
+        if let Some(schema) = self.ref_schema_value(context.root_url, schema).await {
             return self
-                .collect_child_schemas(root_url, &schema, root_path, path, depth, schemas)
+                .collect_child_schemas(context, &schema, path, depth)
                 .await;
         }
 
-        if let Some(one_ofs) = schema["oneOf"].as_array() {
-            for one_of in one_ofs {
-                self.collect_child_schemas(root_url, one_of, root_path, path, depth, schemas)
-                    .await;
-            }
-        }
-
-        if let Some(any_ofs) = schema["anyOf"].as_array() {
-            for any_of in any_ofs {
-                self.collect_child_schemas(root_url, any_of, root_path, path, depth, schemas)
-                    .await;
-            }
-        }
-
-        // Deal with the { "description": "Foo", "allOf": [{ "$ref": "Bar" }] }
-        // pattern.
-        let composed = [
-            !schema["allOf"].is_null(),
-            !schema["oneOf"].is_null(),
-            !schema["anyOf"].is_null(),
-        ]
-        .into_iter()
-        .filter(|b| *b)
-        .count()
-            == 1
-            && schema["properties"].is_null();
-
-        if let Some(all_ofs) = schema["allOf"].as_array() {
-            if !all_ofs.is_empty() && composed {
-                let mut schema = schema.clone();
-                if let Some(obj) = schema["allOf"].as_object_mut() {
-                    obj.remove("allOf");
-                }
-
+        if let Some(composition) = composition_only_kind(schema) {
+            let branches = composition.branches(schema);
+            if composition == CompositionKind::Intersection {
                 let mut merged_all_of = Value::Object(serde_json::Map::default());
-
-                for all_of in all_ofs {
-                    merged_all_of.merge(match self.ref_schema_value(root_url, all_of).await {
-                        Some(ref schema) => schema,
-                        None => all_of,
+                for branch in branches {
+                    merged_all_of.merge(match self
+                        .ref_schema_value(context.root_url, branch)
+                        .await
+                    {
+                        Some(ref resolved) => resolved,
+                        None => branch,
                     });
                 }
 
-                merged_all_of.merge(&schema);
+                let mut wrapper = schema.clone();
+                if let Some(object) = wrapper.as_object_mut() {
+                    object.remove("allOf");
+                }
+                merged_all_of.merge(&wrapper);
 
                 self.collect_child_schemas(
-                    root_url,
+                    context,
                     &merged_all_of,
-                    root_path,
                     path,
                     depth,
-                    schemas,
                 )
                 .await;
+                return;
             }
-            // TODO: handle allOfs in regular schemas.
-            // doing so currently will overflow the stack.
+
+            for branch in branches {
+                self.collect_child_schemas(context, branch, path, depth)
+                    .await;
+            }
+            return;
         }
 
-        let include_self = !composed;
-
-        if include_self {
-            schemas.push((
-                root_path.extend(path.clone()),
-                path.clone(),
-                Arc::new(schema.clone()),
-            ));
+        for composition in [
+            CompositionKind::ExclusiveAlternative,
+            CompositionKind::Alternative,
+            CompositionKind::Intersection,
+        ] {
+            for branch in composition.branches(schema) {
+                self.collect_child_schemas(context, branch, path, depth)
+                    .await;
+            }
         }
 
-        depth -= 1;
+        context.schemas.push((
+            context.root_path.extend(path.clone()),
+            path.clone(),
+            Arc::new(schema.clone()),
+        ));
+
+        let child_depth = depth.saturating_sub(1);
 
         if let Some(map) = schema["properties"].as_object() {
             for (k, v) in map {
                 self.collect_child_schemas(
-                    root_url,
+                    context,
                     v,
-                    root_path,
                     &path.join(Key::from(k)),
-                    depth,
-                    schemas,
+                    child_depth,
                 )
                 .await;
             }
@@ -678,7 +758,7 @@ pub enum PathSegment {
 }
 
 impl SchemaValidationError {
-    fn from_jsonschema(error: jsonschema::ValidationError<'_>) -> Self {
+    fn from_jsonschema(error: &jsonschema::ValidationError<'_>) -> Self {
         let additional_properties = match error.kind() {
             ValidationErrorKind::AdditionalProperties { unexpected } => Some(unexpected.clone()),
             _ => None,
@@ -780,5 +860,362 @@ mod formats {
 
     pub(super) fn semver_req(value: &str) -> bool {
         semver::VersionReq::parse(value).is_ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        builtins, NodeValidationError, PathSegment, SchemaValidationError, Schemas,
+    };
+    use crate::test_support::{ensure_anyhow, TestEnvironment};
+    use serde_json::{json, Value};
+    use std::{path::PathBuf, sync::Arc};
+    use strict_test_support::{
+        ensure, ensure_contains, ensure_ok, ensure_some, TestFailure,
+    };
+    use taplo::{dom::Keys, parser::parse};
+    use url::Url;
+
+    fn url(value: &str) -> Result<Url, TestFailure> {
+        ensure_ok(Url::parse(value), "the schema fixture URL must parse")
+    }
+
+    fn keys(value: &str) -> Result<Keys, TestFailure> {
+        ensure_ok(value.parse(), "the schema fixture path must parse")
+    }
+
+    async fn seed(
+        schemas: &Schemas<TestEnvironment>,
+        schema_url: &Url,
+        schema: Value,
+    ) {
+        schemas.add_schema(schema_url, Arc::new(schema)).await;
+    }
+
+    #[test]
+    fn offline_transport_preserves_local_schema_capabilities() -> Result<(), TestFailure> {
+        futures::executor::block_on(async {
+            let environment = TestEnvironment::default();
+            environment.insert_file(
+                "/workspace/file-schema.json",
+                serde_json::to_vec(&json!({ "title": "file" }))
+                    .unwrap_or_default(),
+            );
+            let schemas = Schemas::new_offline(environment.clone());
+
+            let builtin_url = url(builtins::TAPLO_CONFIG_URL)?;
+            ensure_anyhow(
+                schemas.load_schema(&builtin_url).await,
+                "offline mode must retain built-in schemas",
+            )?;
+
+            let memory_url = url("https://example.com/in-memory.json")?;
+            seed(&schemas, &memory_url, json!({ "title": "memory" })).await;
+            let memory = ensure_anyhow(
+                schemas.load_schema(&memory_url).await,
+                "offline mode must retain explicitly seeded memory schemas",
+            )?;
+            ensure(
+                memory["title"].as_str() == Some("memory"),
+                "memory schema contents",
+            )?;
+
+            let file_url = url("file:///workspace/file-schema.json")?;
+            let file = ensure_anyhow(
+                schemas.load_schema(&file_url).await,
+                "offline mode must retain file-backed schemas",
+            )?;
+            ensure(
+                file["title"].as_str() == Some("file"),
+                "file schema contents",
+            )?;
+
+            let disk_url = url("https://example.com/disk.json")?;
+            schemas
+                .cache()
+                .set_cache_path(Some(PathBuf::from("/cache")));
+            ensure_anyhow(
+                schemas
+                    .cache()
+                    .save(disk_url.clone(), Arc::new(json!({ "title": "disk" })))
+                    .await,
+                "the disk schema fixture must persist",
+            )?;
+            let disk_reader = Schemas::new_offline(environment);
+            disk_reader
+                .cache()
+                .set_cache_path(Some(PathBuf::from("/cache")));
+            let disk = ensure_anyhow(
+                disk_reader.load_schema(&disk_url).await,
+                "offline mode must retain disk-cached schemas",
+            )?;
+            ensure(
+                disk["title"].as_str() == Some("disk"),
+                "disk schema contents",
+            )?;
+
+            let remote_url = url("https://example.com/not-cached.json")?;
+            let remote_error = ensure_some(
+                disk_reader.load_schema(&remote_url).await.err(),
+                "offline remote schema loading must fail",
+            )?;
+            ensure_contains(
+                &remote_error.to_string(),
+                "HTTP schema transport is unavailable",
+                "offline schema errors must explain the missing transport",
+            )?;
+            let catalog_error = ensure_some(
+                disk_reader
+                    .associations()
+                    .add_from_catalog(&remote_url)
+                    .await
+                    .err(),
+                "offline remote catalog loading must fail",
+            )?;
+            ensure_contains(
+                &catalog_error.to_string(),
+                "HTTP schema transport is unavailable",
+                "offline catalog errors must explain the missing transport",
+            )
+        })
+    }
+
+    #[test]
+    fn pattern_properties_match_reject_and_report_invalid_regex() -> Result<(), TestFailure> {
+        futures::executor::block_on(async {
+            let schemas = Schemas::new_offline(TestEnvironment::default());
+            let matching_url = url("https://example.com/pattern.json")?;
+            seed(
+                &schemas,
+                &matching_url,
+                json!({
+                    "patternProperties": {
+                        "^foo$": { "title": "matched" }
+                    }
+                }),
+            )
+            .await;
+            let value = json!({ "foo": 1, "bar": 2 });
+            let matching = ensure_anyhow(
+                schemas
+                    .schemas_at_path(&matching_url, &value, &keys("foo")?)
+                    .await,
+                "a valid matching pattern must resolve",
+            )?;
+            ensure(
+                matching
+                    .iter()
+                    .any(|(_, schema)| schema["title"] == "matched"),
+                "a matching pattern property must contribute its schema",
+            )?;
+            let nonmatching = ensure_anyhow(
+                schemas
+                    .schemas_at_path(&matching_url, &value, &keys("bar")?)
+                    .await,
+                "a valid nonmatching pattern must be skipped normally",
+            )?;
+            ensure(
+                nonmatching.is_empty(),
+                "a valid nonmatching pattern must not contribute a schema",
+            )?;
+
+            let invalid_url = url("https://example.com/invalid-pattern.json")?;
+            seed(
+                &schemas,
+                &invalid_url,
+                json!({ "patternProperties": { "[": { "title": "invalid" } } }),
+            )
+            .await;
+            let invalid = ensure_some(
+                schemas
+                    .schemas_at_path(&invalid_url, &value, &keys("foo")?)
+                    .await
+                    .err(),
+                "an invalid pattern must return a resolution error",
+            )?;
+            ensure_contains(
+                &invalid.to_string(),
+                "invalid patternProperties regex `[`",
+                "the invalid pattern error must include the offending expression",
+            )?;
+            ensure_contains(
+                &invalid.to_string(),
+                "foo",
+                "the invalid pattern error must include the current key context",
+            )
+        })
+    }
+
+    #[test]
+    fn child_schema_traversal_distinguishes_wrappers_regular_composition_and_depth(
+    ) -> Result<(), TestFailure> {
+        futures::executor::block_on(async {
+            let schemas = Schemas::new_offline(TestEnvironment::default());
+            let wrapper_url = url("https://example.com/wrapper.json")?;
+            seed(
+                &schemas,
+                &wrapper_url,
+                json!({
+                    "description": "wrapper docs",
+                    "allOf": [
+                        { "properties": { "left": { "type": "string" } } },
+                        { "properties": { "right": { "type": "integer" } } }
+                    ]
+                }),
+            )
+            .await;
+            let wrapper = ensure_anyhow(
+                schemas
+                    .possible_schemas_from(&wrapper_url, &json!({}), &Keys::empty(), 2)
+                    .await,
+                "a composition-only allOf wrapper must traverse",
+            )?;
+            ensure(
+                wrapper.iter().any(|(_, relative, schema)| {
+                    relative.is_empty() && schema["description"] == "wrapper docs"
+                }),
+                "wrapper metadata must override and survive the merged composition",
+            )?;
+            ensure(
+                wrapper
+                    .iter()
+                    .any(|(_, relative, _)| relative.dotted() == "left")
+                    && wrapper
+                        .iter()
+                        .any(|(_, relative, _)| relative.dotted() == "right"),
+                "all allOf branch properties must survive the wrapper merge",
+            )?;
+
+            let regular_url = url("https://example.com/regular.json")?;
+            seed(
+                &schemas,
+                &regular_url,
+                json!({
+                    "properties": { "own": { "type": "boolean" } },
+                    "allOf": [
+                        { "properties": { "branch": { "type": "number" } } }
+                    ]
+                }),
+            )
+            .await;
+            let regular = ensure_anyhow(
+                schemas
+                    .possible_schemas_from(&regular_url, &json!({}), &Keys::empty(), 2)
+                    .await,
+                "a regular schema with allOf must traverse independently",
+            )?;
+            ensure(
+                regular
+                    .iter()
+                    .any(|(_, relative, _)| relative.dotted() == "own")
+                    && regular
+                        .iter()
+                        .any(|(_, relative, _)| relative.dotted() == "branch"),
+                "regular own properties and allOf branch properties must both be exposed",
+            )?;
+
+            let empty_url = url("https://example.com/empty-composition.json")?;
+            seed(
+                &schemas,
+                &empty_url,
+                json!({ "title": "empty", "allOf": [] }),
+            )
+            .await;
+            let zero_depth = ensure_anyhow(
+                schemas
+                    .possible_schemas_from(&empty_url, &json!({}), &Keys::empty(), 0)
+                    .await,
+                "zero-depth traversal must terminate normally",
+            )?;
+            ensure(
+                zero_depth.is_empty(),
+                "zero depth must return no child schemas",
+            )?;
+            let positive_depth = ensure_anyhow(
+                schemas
+                    .possible_schemas_from(&empty_url, &json!({}), &Keys::empty(), 1)
+                    .await,
+                "an empty composition array must not suppress the schema",
+            )?;
+            ensure(
+                positive_depth
+                    .iter()
+                    .any(|(_, relative, schema)| relative.is_empty() && schema["title"] == "empty"),
+                "empty allOf must retain the schema itself at positive depth",
+            )
+        })
+    }
+
+    #[test]
+    fn borrowed_validation_errors_retain_owned_paths_messages_and_ranges(
+    ) -> Result<(), TestFailure> {
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": { "known": { "type": "integer" } }
+        });
+        let validator = ensure_ok(
+            jsonschema::validator_for(&schema),
+            "the validation fixture schema must compile",
+        )?;
+        let value = json!({ "known": "wrong", "unexpected": 1 });
+        let owned: Vec<SchemaValidationError> = validator
+            .iter_errors(&value)
+            .map(|error| SchemaValidationError::from_jsonschema(&error))
+            .collect();
+
+        let additional = ensure_some(
+            owned
+                .iter()
+                .find(|error| error.additional_properties.is_some()),
+            "the additional-properties error must be retained",
+        )?;
+        ensure(
+            additional
+                .additional_properties
+                .as_ref()
+                .is_some_and(|properties| properties == &["unexpected"]),
+            "the owned error must retain the unexpected property name",
+        )?;
+        ensure(
+            !additional.message.is_empty(),
+            "the owned additional-properties error must retain its message",
+        )?;
+
+        let typed = ensure_some(
+            owned
+                .iter()
+                .find(|error| error.additional_properties.is_none()),
+            "the property-type error must be retained",
+        )?;
+        ensure(
+            matches!(typed.instance_path.as_slice(), [PathSegment::Property(property)] if property == "known"),
+            "the owned property error must retain its instance path",
+        )?;
+
+        let parsed = parse("known = \"wrong\"\nunexpected = 1\n");
+        ensure(
+            parsed.errors.is_empty(),
+            "the validation range fixture must parse cleanly",
+        )?;
+        let root = parsed.into_dom();
+        let additional_node = ensure_anyhow(
+            NodeValidationError::new(&root, additional.clone()),
+            "the additional-properties error must resolve to the DOM",
+        )?;
+        let additional_ranges: Vec<_> = additional_node.text_ranges().collect();
+        ensure(
+            !additional_ranges.is_empty(),
+            "an unexpected property must retain its concrete DOM range",
+        )?;
+        let typed_node = ensure_anyhow(
+            NodeValidationError::new(&root, typed.clone()),
+            "the property-type error must resolve to the DOM child",
+        )?;
+        ensure(
+            typed_node.text_ranges().next().is_some(),
+            "a normal child validation error must retain a child range",
+        )
     }
 }

@@ -1,53 +1,55 @@
-use super::{Context, MessageWriter, Params};
+//! Typed request and notification handlers erased behind kind-specific local-future traits.
+
+use super::{Context, Params};
 use crate::rpc;
-use async_trait::async_trait;
-use futures::{Future, SinkExt};
+use futures::{future::LocalBoxFuture, Future, FutureExt};
 use lsp_types::{notification::Notification, request::Request};
 use serde::{de::DeserializeOwned, Serialize};
 use std::marker::PhantomData;
 
-#[async_trait(?Send)]
-pub(crate) trait Handler<W: Clone> {
-    fn method(&self) -> &'static str;
+/// Result of invoking an erased request handler before its JSON-RPC response is written.
+pub(crate) enum RequestOutcome {
+    /// Typed handler success serialized to JSON.
+    Success(serde_json::Value),
+    /// Typed handler failure already represented as an RPC error.
+    RpcError(rpc::Error),
+    /// Request parameters could not be deserialized.
+    InvalidParams(String),
+    /// A successful typed result could not be serialized.
+    SerializationFailure(String),
+}
 
-    async fn handle(
-        &mut self,
+/// Kind-safe erased request handler.
+pub(crate) trait ErasedRequestHandler<W: Clone> {
+    /// Deserialize parameters, invoke the typed handler, and serialize its result locally.
+    fn handle(
+        &self,
         context: Context<W>,
-        message: rpc::Request<serde_json::Value>,
-        writer: Option<&mut dyn MessageWriter>,
-    );
-
-    fn box_clone(&self) -> Box<dyn Handler<W>>;
+        params: Option<serde_json::Value>,
+    ) -> LocalBoxFuture<'static, RequestOutcome>;
 }
 
-impl<W: Clone> Clone for Box<dyn Handler<W>> {
-    fn clone(&self) -> Self {
-        self.box_clone()
-    }
+/// Kind-safe erased notification handler.
+pub(crate) trait ErasedNotificationHandler<W: Clone> {
+    /// Deserialize parameters and invoke the typed notification handler locally.
+    fn handle(
+        &self,
+        context: Context<W>,
+        params: Option<serde_json::Value>,
+    ) -> LocalBoxFuture<'static, ()>;
 }
 
-pub struct RequestHandler<R, F, W>
+/// Typed request handler adapter.
+pub(crate) struct RequestHandler<R, F, W>
 where
     R: Request,
     F: Future<Output = Result<R::Result, rpc::Error>>,
     W: Clone,
 {
-    f: fn(Context<W>, Params<R::Params>) -> F,
-    t: PhantomData<W>,
-}
-
-impl<R, F, W> Clone for RequestHandler<R, F, W>
-where
-    R: Request,
-    F: Future<Output = Result<R::Result, rpc::Error>>,
-    W: Clone,
-{
-    fn clone(&self) -> Self {
-        Self {
-            f: self.f,
-            t: Default::default(),
-        }
-    }
+    /// Registered typed handler function.
+    function: fn(Context<W>, Params<R::Params>) -> F,
+    /// Adapter type ownership without storing values.
+    marker: PhantomData<fn() -> R>,
 }
 
 impl<R, F, W> RequestHandler<R, F, W>
@@ -56,129 +58,96 @@ where
     F: Future<Output = Result<R::Result, rpc::Error>>,
     W: Clone,
 {
-    pub fn new(f: fn(Context<W>, Params<R::Params>) -> F) -> Self {
+    /// Construct a typed request handler adapter.
+    pub(crate) fn new(function: fn(Context<W>, Params<R::Params>) -> F) -> Self {
         Self {
-            f,
-            t: Default::default(),
+            function,
+            marker: PhantomData,
         }
     }
 }
 
-#[async_trait(?Send)]
-impl<R, F, P, W> Handler<W> for RequestHandler<R, F, W>
+impl<R, F, W> ErasedRequestHandler<W> for RequestHandler<R, F, W>
 where
-    R: Request<Params = P> + 'static,
-    P: Serialize + DeserializeOwned + 'static,
+    R: Request + 'static,
+    R::Params: DeserializeOwned + 'static,
+    R::Result: Serialize + 'static,
     F: Future<Output = Result<R::Result, rpc::Error>> + 'static,
     W: Clone + 'static,
 {
-    fn method(&self) -> &'static str {
-        R::METHOD
-    }
-
-    async fn handle(
-        &mut self,
+    fn handle(
+        &self,
         context: Context<W>,
-        message: rpc::Request<serde_json::Value>,
-        writer: Option<&mut dyn MessageWriter>,
-    ) {
-        let req_id = message.id.clone();
-        let req = match message.into_params::<R::Params>() {
-            Ok(r) => r,
-            Err(e) => {
-                if let Some(w) = writer {
-                    w.send(
-                        rpc::Response::error(rpc::Error::invalid_params().with_data(e.to_string()))
-                            .with_request_id(req_id.unwrap())
-                            .into_message(),
-                    )
-                    .await
-                    .unwrap();
-                }
+        params: Option<serde_json::Value>,
+    ) -> LocalBoxFuture<'static, RequestOutcome> {
+        let function = self.function;
+        async move {
+            let params = match params.map(serde_json::from_value).transpose() {
+                Ok(params) => params,
+                Err(error) => return RequestOutcome::InvalidParams(error.to_string()),
+            };
 
-                return;
+            match function(context, Params::from(params)).await {
+                Ok(result) => match serde_json::to_value(result) {
+                    Ok(result) => RequestOutcome::Success(result),
+                    Err(error) => RequestOutcome::SerializationFailure(error.to_string()),
+                },
+                Err(error) => RequestOutcome::RpcError(error),
             }
-        };
-
-        let call_result = (self.f)(context, req.params.into()).await;
-
-        if let Some(w) = writer {
-            let res = rpc::Response::from(call_result).with_request_id(req.id.unwrap());
-            w.send(res.into_message()).await.unwrap();
         }
-    }
-
-    fn box_clone(&self) -> Box<dyn Handler<W>> {
-        Box::new((*self).clone())
+        .boxed_local()
     }
 }
 
-#[derive(Clone)]
-pub struct NotificationHandler<N, F, W>
+/// Typed notification handler adapter.
+pub(crate) struct NotificationHandler<N, F, W>
 where
     N: Notification,
-    F: Future,
+    F: Future<Output = ()>,
     W: Clone,
 {
-    f: fn(Context<W>, Params<N::Params>) -> F,
-    t: PhantomData<W>,
+    /// Registered typed handler function.
+    function: fn(Context<W>, Params<N::Params>) -> F,
+    /// Adapter type ownership without storing values.
+    marker: PhantomData<fn() -> N>,
 }
 
 impl<N, F, W> NotificationHandler<N, F, W>
 where
     N: Notification,
-    F: Future,
+    F: Future<Output = ()>,
     W: Clone,
 {
-    pub fn new(f: fn(Context<W>, Params<N::Params>) -> F) -> Self {
+    /// Construct a typed notification handler adapter.
+    pub(crate) fn new(function: fn(Context<W>, Params<N::Params>) -> F) -> Self {
         Self {
-            f,
-            t: Default::default(),
+            function,
+            marker: PhantomData,
         }
     }
 }
 
-impl<N, F, W> NotificationHandler<N, F, W>
+impl<N, F, W> ErasedNotificationHandler<W> for NotificationHandler<N, F, W>
 where
-    N: Notification,
-    F: Future,
-    W: Clone,
-{
-    fn clone(&self) -> Self {
-        Self {
-            f: self.f,
-            t: Default::default(),
-        }
-    }
-}
-
-#[async_trait(?Send)]
-impl<N, F, P, W> Handler<W> for NotificationHandler<N, F, W>
-where
-    N: Notification<Params = P> + 'static,
-    P: Serialize + DeserializeOwned + 'static,
-    F: Future + 'static,
+    N: Notification + 'static,
+    N::Params: DeserializeOwned + 'static,
+    F: Future<Output = ()> + 'static,
     W: Clone + 'static,
 {
-    fn method(&self) -> &'static str {
-        N::METHOD
-    }
-
-    async fn handle(
-        &mut self,
+    fn handle(
+        &self,
         context: Context<W>,
-        message: rpc::Request<serde_json::Value>,
-        _writer: Option<&mut dyn MessageWriter>,
-    ) {
-        let req = match message.into_params::<N::Params>() {
-            Ok(r) => r,
-            Err(_) => return,
-        };
-
-        (self.f)(context, req.params.into()).await;
-    }
-
-    fn box_clone(&self) -> Box<dyn Handler<W>> {
-        Box::new((*self).clone())
+        params: Option<serde_json::Value>,
+    ) -> LocalBoxFuture<'static, ()> {
+        let function = self.function;
+        async move {
+            match params.map(serde_json::from_value).transpose() {
+                Ok(params) => function(context, Params::from(params)).await,
+                Err(error) => {
+                    tracing::warn!(%error, "invalid notification parameters");
+                }
+            }
+        }
+        .boxed_local()
     }
 }

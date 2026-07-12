@@ -1,3 +1,5 @@
+//! Manual schema association queries and updates.
+
 use crate::{
     diagnostics::publish_diagnostics,
     lsp_ext::{
@@ -7,7 +9,7 @@ use crate::{
             ListSchemasResponse, SchemaInfo,
         },
     },
-    world::World,
+    world::{send_association_notifications, World},
 };
 use lsp_async_stub::{rpc::Error, Context, Params};
 use serde_json::json;
@@ -21,20 +23,17 @@ pub async fn list_schemas<E: Environment>(
     context: Context<World<E>>,
     params: Params<ListSchemasParams>,
 ) -> Result<ListSchemasResponse, Error> {
-    let p = params.required()?;
-
-    let workspaces = context.workspaces.read().await;
-    let ws = workspaces.by_document(&p.document_uri);
-
-    let associations = ws.schemas.associations().read();
-
+    let params = params.required()?;
+    let workspace = context.workspace_for_document(&params.document_uri).await;
+    let workspace = workspace.read().await;
+    let associations = workspace.schemas.associations().read();
     Ok(ListSchemasResponse {
         schemas: associations
             .iter()
             .filter(|(rule, _)| !matches!(rule, AssociationRule::Url(..)))
-            .map(|(_, s)| SchemaInfo {
-                url: s.url.clone(),
-                meta: s.meta.clone(),
+            .map(|(_, association)| SchemaInfo {
+                url: association.url.clone(),
+                meta: association.meta.clone(),
             })
             .collect(),
     })
@@ -45,77 +44,84 @@ pub async fn associate_schema<E: Environment>(
     context: Context<World<E>>,
     params: Params<AssociateSchemaParams>,
 ) {
-    let Ok(p) = params.required() else {
+    let Ok(params) = params.required() else {
         return;
     };
-
-    let workspaces = context.workspaces.read().await;
-
-    let assoc = SchemaAssociation {
-        priority: p.priority.unwrap_or(priority::MAX),
-        url: p.schema_uri,
+    let association = SchemaAssociation {
+        priority: params.priority.unwrap_or(priority::MAX),
+        url: params.schema_uri,
         meta: {
-            let mut meta = p.meta.unwrap_or_default();
+            let mut meta = params.meta.unwrap_or_else(|| json!({}));
             if !meta.is_object() {
                 meta = json!({});
             }
-
             meta["source"] = source::MANUAL.into();
             meta
         },
     };
 
-    for (_, ws) in workspaces.iter() {
-        // FIXME: there is no way to remove these.
-        match &p.rule {
-            notification::AssociationRule::Glob(glob) => {
-                let rule = match AssociationRule::glob(glob) {
-                    Ok(re) => re,
-                    Err(err) => {
-                        tracing::error!(
-                        error = %err,
-                        schema_uri = %assoc.url,
-                        "invalid pattern for schema");
-                        return;
-                    }
-                };
-
-                ws.schemas.associations().add(rule, assoc.clone());
-            }
-            notification::AssociationRule::Regex(regex) => {
-                let rule = match AssociationRule::regex(regex) {
-                    Ok(re) => re,
-                    Err(err) => {
-                        tracing::error!(
-                        error = %err,
-                        schema_uri = %assoc.url,
-                        "invalid pattern for schema");
-                        return;
-                    }
-                };
-
-                ws.schemas.associations().add(rule, assoc.clone());
-            }
-            notification::AssociationRule::Url(document_uri) => {
-                ws.schemas
+    let mut notifications = Vec::new();
+    let mut diagnostic_document = None;
+    match params.rule {
+        notification::AssociationRule::Glob(glob) => {
+            let rule = match AssociationRule::glob(&glob) {
+                Ok(rule) => rule,
+                Err(error) => {
+                    tracing::error!(%error, schema_uri = %association.url, "invalid schema glob");
+                    return;
+                }
+            };
+            for handle in context.all_workspace_handles().await {
+                let workspace = handle.write().await;
+                workspace
+                    .schemas
                     .associations()
-                    .retain(|(rule, assoc)| match rule {
-                        AssociationRule::Url(u) => {
-                            !(u == document_uri && assoc.meta["source"] == source::MANUAL)
-                        }
-                        _ => true,
-                    });
-
-                ws.schemas
-                    .associations()
-                    .add(AssociationRule::Url(document_uri.clone()), assoc.clone());
-
-                let ws_root = ws.root.clone();
-                publish_diagnostics(context.clone(), ws_root, document_uri.clone()).await;
+                    .add(rule.clone(), association.clone());
+                notifications.extend(workspace.association_notifications());
             }
         }
-        ws.emit_associations(context.clone()).await;
+        notification::AssociationRule::Regex(regex) => {
+            let rule = match AssociationRule::regex(&regex) {
+                Ok(rule) => rule,
+                Err(error) => {
+                    tracing::error!(%error, schema_uri = %association.url, "invalid schema regex");
+                    return;
+                }
+            };
+            for handle in context.all_workspace_handles().await {
+                let workspace = handle.write().await;
+                workspace
+                    .schemas
+                    .associations()
+                    .add(rule.clone(), association.clone());
+                notifications.extend(workspace.association_notifications());
+            }
+        }
+        notification::AssociationRule::Url(document_uri) => {
+            let handle = context.workspace_for_document(&document_uri).await;
+            let workspace = handle.write().await;
+            workspace
+                .schemas
+                .associations()
+                .retain(|(rule, existing)| match rule {
+                    AssociationRule::Url(url) => {
+                        url != &document_uri || existing.meta["source"] != source::MANUAL
+                    }
+                    _ => true,
+                });
+            workspace
+                .schemas
+                .associations()
+                .add(AssociationRule::Url(document_uri.clone()), association);
+            notifications.extend(workspace.association_notifications());
+            diagnostic_document = Some(document_uri);
+        }
     }
+
+    if let Some(document) = diagnostic_document {
+        publish_diagnostics(context.clone(), document).await;
+    }
+    send_association_notifications(context, notifications).await;
 }
 
 #[tracing::instrument(skip_all)]
@@ -123,19 +129,17 @@ pub async fn associated_schema<E: Environment>(
     context: Context<World<E>>,
     params: Params<AssociatedSchemaParams>,
 ) -> Result<AssociatedSchemaResponse, Error> {
-    let p = params.required()?;
-
-    let workspaces = context.workspaces.read().await;
-    let ws = workspaces.by_document(&p.document_uri);
-
+    let params = params.required()?;
+    let workspace = context.workspace_for_document(&params.document_uri).await;
+    let workspace = workspace.read().await;
     Ok(AssociatedSchemaResponse {
-        schema: ws
+        schema: workspace
             .schemas
             .associations()
-            .association_for(&p.document_uri)
-            .map(|s| SchemaInfo {
-                url: s.url,
-                meta: s.meta,
+            .association_for(&params.document_uri)
+            .map(|association| SchemaInfo {
+                url: association.url,
+                meta: association.meta,
             }),
     })
 }

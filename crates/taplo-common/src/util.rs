@@ -126,7 +126,7 @@ pub fn get_reqwest_client(timeout: std::time::Duration) -> Result<reqwest::Clien
     #[cfg(any(feature = "native-tls", feature = "rustls-tls"))]
     fn get_certs(
         mut builder: reqwest::ClientBuilder,
-        path: &std::ffi::OsString,
+        path: &std::ffi::OsStr,
     ) -> reqwest::ClientBuilder {
         fn get_cert(path: &Path) -> Result<reqwest::Certificate, anyhow::Error> {
             let is_der = path.extension().is_some_and(|ext| ext == "der");
@@ -156,7 +156,7 @@ pub fn get_reqwest_client(timeout: std::time::Duration) -> Result<reqwest::Clien
     #[cfg(not(any(feature = "native-tls", feature = "rustls-tls")))]
     fn get_certs(
         builder: reqwest::ClientBuilder,
-        path: std::ffi::OsString,
+        path: &std::ffi::OsStr,
     ) -> reqwest::ClientBuilder {
         tracing::error!(?path, "Could not load certs, taplo was built without TLS");
         builder

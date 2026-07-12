@@ -5,7 +5,7 @@
 
 use crate::{
     dom::{self, node::DomNode, FromSyntax, Keys, Node},
-    syntax::{SyntaxElement, SyntaxKind::*, SyntaxNode, SyntaxToken},
+    syntax::{SyntaxKind::*, SyntaxNode, SyntaxToken},
     util::overlaps,
 };
 use itertools::Itertools;
@@ -14,7 +14,7 @@ use rowan::{GreenNode, NodeOrToken, TextRange};
 use std::{
     cmp,
     collections::VecDeque,
-    iter::{repeat, FromIterator},
+    iter::{repeat_n, FromIterator},
     ops::Range,
     rc::Rc,
 };
@@ -187,7 +187,10 @@ impl Options {
     }
 
     fn newlines(&self, count: usize) -> impl Iterator<Item = &'static str> {
-        repeat(self.newline()).take(usize::min(count, self.allowed_blank_lines + 1))
+        repeat_n(
+            self.newline(),
+            usize::min(count, self.allowed_blank_lines + 1),
+        )
     }
 
     fn should_align_comments(&self, comment_count: usize) -> bool {
@@ -235,7 +238,7 @@ impl Context {
     }
 
     fn indent<'o>(&self, opts: &'o Options) -> impl Iterator<Item = &'o str> {
-        repeat(opts.indent_string.as_ref()).take(self.indent_level)
+        repeat_n(opts.indent_string.as_ref(), self.indent_level)
     }
 }
 
@@ -284,11 +287,7 @@ pub fn format_with_scopes(
         ..Context::default()
     };
 
-    let mut s = format_impl(
-        dom.syntax().unwrap().clone().into_node().unwrap(),
-        options.clone(),
-        c,
-    );
+    let mut s = format_dom(dom, options.clone(), c);
 
     s = s.trim_end().into();
 
@@ -330,11 +329,7 @@ where
 
     c.scopes = Rc::new(ScopedOptions::from_iter(s));
 
-    let mut s = format_impl(
-        dom.syntax().unwrap().clone().into_node().unwrap(),
-        options.clone(),
-        c,
-    );
+    let mut s = format_dom(dom, options.clone(), c);
 
     s = s.trim_end().into();
 
@@ -346,8 +341,11 @@ where
 }
 
 fn format_impl(node: SyntaxNode, options: Options, context: Context) -> String {
-    assert!(node.kind() == ROOT);
-    let mut formatted = format_root(node, &options, &context);
+    let mut formatted = if node.kind() == ROOT {
+        format_root(node, &options, &context)
+    } else {
+        node.to_string()
+    };
 
     if formatted.ends_with("\r\n") {
         formatted.truncate(formatted.len() - 2);
@@ -362,8 +360,19 @@ fn format_impl(node: SyntaxNode, options: Options, context: Context) -> String {
     formatted
 }
 
+/// Format a syntax-backed DOM root, preserving a detached DOM through its TOML representation.
+fn format_dom(dom: Node, options: Options, context: Context) -> String {
+    dom.syntax()
+        .and_then(|syntax| syntax.clone().into_node())
+        .map_or_else(
+            || dom.to_toml(false, false),
+            |syntax| format_impl(syntax, options, context),
+        )
+}
+
 struct FormattedEntry {
-    syntax: SyntaxElement,
+    /// The value node used when an over-width entry must be reformatted as multiline.
+    value_syntax: Option<SyntaxNode>,
     key: String,
     /// This field is used to cache the "cleaned" version of the key and should only
     /// be accessed through the `cleaned_key` helpers method.
@@ -373,7 +382,7 @@ struct FormattedEntry {
 }
 
 impl FormattedEntry {
-    fn cleaned_key(&self) -> &Vec<String> {
+    fn cleaned_key(&self) -> &[String] {
         self.cleaned_key.get_or_init(|| {
             self.key
                 .replace(['\'', '"'], "")
@@ -381,6 +390,17 @@ impl FormattedEntry {
                 .map(ToOwned::to_owned)
                 .collect()
         })
+    }
+
+    /// Append the rendered entry to `formatted` using the active separator policy.
+    fn append_to(&self, formatted: &mut String, options: &Options) {
+        formatted.push_str(&self.key);
+        if options.compact_entries {
+            formatted.push('=');
+        } else {
+            formatted.push_str(" = ");
+        }
+        formatted.push_str(&self.value);
     }
 }
 
@@ -404,28 +424,35 @@ impl Ord for FormattedEntry {
     }
 }
 
-impl FormattedItem for FormattedEntry {
-    fn write_to(&self, formatted: &mut String, options: &Options) {
-        *formatted += &self.key;
-        if options.compact_entries {
-            *formatted += "=";
-        } else {
-            *formatted += " = ";
+/// A rendered formatter value plus its optional trailing comment.
+struct FormattedValue {
+    /// Rendered TOML text.
+    text: String,
+    /// Comment that belongs after the rendered text.
+    trailing_comment: Option<String>,
+}
+
+impl FormattedValue {
+    /// Construct a rendered value.
+    fn new(text: String, trailing_comment: Option<String>) -> Self {
+        Self {
+            text,
+            trailing_comment,
         }
-        *formatted += &self.value;
     }
 
+    /// Append the rendered text to `formatted`.
+    fn append_to(&self, formatted: &mut String) {
+        formatted.push_str(&self.text);
+    }
+
+    /// Clone the trailing comment for a parent rendering context.
     fn trailing_comment(&self) -> Option<String> {
-        self.comment.clone()
-    }
-
-    fn syntax(&self) -> SyntaxElement {
-        self.syntax.clone()
+        self.trailing_comment.clone()
     }
 }
 
 fn format_root(node: SyntaxNode, options: &Options, context: &Context) -> String {
-    assert!(node.kind() == ROOT);
     let mut formatted = String::new();
 
     let mut entry_group: Vec<FormattedEntry> = Vec::new();
@@ -524,7 +551,7 @@ fn format_root(node: SyntaxNode, options: &Options, context: &Context) -> String
                         formatted.extend(header_context.indent(&scoped_options));
                     }
 
-                    header.write_to(&mut formatted, &scoped_options);
+                    header.append_to(&mut formatted);
                     if let Some(c) = comment {
                         formatted += " ";
                         formatted += &c;
@@ -547,7 +574,7 @@ fn format_root(node: SyntaxNode, options: &Options, context: &Context) -> String
                     entry_group.push(format_entry(node, &scoped_options, &context));
                     skip_newlines += 1;
                 }
-                _ => unreachable!(),
+                _ => formatted.push_str(&node.to_string()),
             },
             NodeOrToken::Token(token) => match token.kind() {
                 NEWLINE => {
@@ -672,28 +699,18 @@ fn add_entries(
                     context.force_multiline = true;
 
                     // too long, reformat the value of the entry
-                    let value = format_value(
-                        entry
-                            .syntax
-                            .as_node()
-                            .unwrap()
-                            .children()
-                            .find(|n| n.kind() == VALUE)
-                            .unwrap(),
-                        options,
-                        &context,
-                    );
+                    let Some(value_syntax) = entry.value_syntax.clone() else {
+                        continue;
+                    };
+                    let value = format_value(value_syntax, options, &context);
 
                     entry.value.clear();
 
                     if let Some(c) = value.trailing_comment() {
-                        debug_assert!(
-                            entry.comment.is_none() || entry.comment.clone().unwrap() == c
-                        );
                         entry.comment = Some(c);
                     }
 
-                    value.write_to(&mut entry.value, options);
+                    value.append_to(&mut entry.value);
                     break;
                 }
             }
@@ -748,6 +765,7 @@ fn format_entry(node: SyntaxNode, options: &Options, context: &Context) -> Forma
     let mut key = String::new();
     let mut value = String::new();
     let mut comment = None;
+    let mut value_syntax = None;
 
     for c in node.children_with_tokens() {
         match c {
@@ -756,21 +774,20 @@ fn format_entry(node: SyntaxNode, options: &Options, context: &Context) -> Forma
                     format_key(n, &mut key, options, context);
                 }
                 VALUE => {
+                    value_syntax = Some(n.clone());
                     let val = format_value(n, options, context);
                     let c = val.trailing_comment();
 
-                    if c.is_some() {
-                        debug_assert!(comment.is_none());
-                        comment = c;
+                    if let Some(c) = c {
+                        comment = Some(c);
                     }
 
-                    val.write_to(&mut value, options);
+                    val.append_to(&mut value);
                 }
-                _ => unreachable!(),
+                _ => value.push_str(&n.to_string()),
             },
             NodeOrToken::Token(t) => {
                 if let COMMENT = t.kind() {
-                    debug_assert!(comment.is_none());
                     comment = Some(t.text().into())
                 }
             }
@@ -778,7 +795,7 @@ fn format_entry(node: SyntaxNode, options: &Options, context: &Context) -> Forma
     }
 
     FormattedEntry {
-        syntax: node.into(),
+        value_syntax,
         key,
         cleaned_key: OnceCell::new(),
         value,
@@ -801,7 +818,7 @@ fn format_key(node: SyntaxNode, formatted: &mut String, _options: &Options, _con
     }
 }
 
-fn format_value(node: SyntaxNode, options: &Options, context: &Context) -> impl FormattedItem {
+fn format_value(node: SyntaxNode, options: &Options, context: &Context) -> FormattedValue {
     let mut value = String::new();
     let mut comment = None;
 
@@ -817,12 +834,10 @@ fn format_value(node: SyntaxNode, options: &Options, context: &Context) -> impl 
                     let c = formatted.trailing_comment();
 
                     if let Some(c) = c {
-                        debug_assert!(comment.is_none());
                         comment = Some(c)
                     }
 
-                    debug_assert!(value.is_empty());
-                    formatted.write_to(&mut value, &scoped_options);
+                    formatted.append_to(&mut value);
                 }
                 INLINE_TABLE => {
                     let formatted = format_inline_table(n, &scoped_options, context);
@@ -830,20 +845,16 @@ fn format_value(node: SyntaxNode, options: &Options, context: &Context) -> impl 
                     let c = formatted.trailing_comment();
 
                     if let Some(c) = c {
-                        debug_assert!(comment.is_none());
                         comment = Some(c)
                     }
 
-                    debug_assert!(value.is_empty());
-
-                    formatted.write_to(&mut value, &scoped_options);
+                    formatted.append_to(&mut value);
                 }
-                _ => unreachable!(),
+                _ => value.push_str(&n.to_string()),
             },
             NodeOrToken::Token(t) => match t.kind() {
                 NEWLINE | WHITESPACE => {}
                 COMMENT => {
-                    debug_assert!(comment.is_none());
                     comment = Some(t.text().into());
                 }
                 _ => {
@@ -853,14 +864,14 @@ fn format_value(node: SyntaxNode, options: &Options, context: &Context) -> impl 
         }
     }
 
-    (node.into(), value, comment)
+    FormattedValue::new(value, comment)
 }
 
 fn format_inline_table(
     node: SyntaxNode,
     options: &Options,
     context: &Context,
-) -> impl FormattedItem {
+) -> FormattedValue {
     let mut formatted = String::new();
     let mut comment = None;
 
@@ -904,8 +915,7 @@ fn format_inline_table(
                 };
 
                 let entry = format_entry(child, options, context);
-                debug_assert!(entry.comment.is_none());
-                entry.write_to(&mut formatted, options);
+                entry.append_to(&mut formatted, options);
 
                 node_index += 1;
             }
@@ -934,7 +944,6 @@ fn format_inline_table(
                 }
                 WHITESPACE | COMMA => {}
                 COMMENT => {
-                    debug_assert!(comment.is_none());
                     comment = Some(t.text().into());
                 }
                 _ => formatted += t.text(),
@@ -942,7 +951,7 @@ fn format_inline_table(
         }
     }
 
-    (node.into(), formatted, comment)
+    FormattedValue::new(formatted, comment)
 }
 // Check whether the array spans multiple lines in its current form.
 fn is_array_multiline(node: &SyntaxNode) -> bool {
@@ -953,7 +962,7 @@ fn can_collapse_array(node: &SyntaxNode) -> bool {
     !node.descendants_with_tokens().any(|n| n.kind() == COMMENT)
 }
 
-fn format_array(node: SyntaxNode, options: &Options, context: &Context) -> impl FormattedItem {
+fn format_array(node: SyntaxNode, options: &Options, context: &Context) -> FormattedValue {
     let mut multiline = is_array_multiline(&node) || context.force_multiline;
 
     let mut formatted = String::new();
@@ -990,12 +999,15 @@ fn format_array(node: SyntaxNode, options: &Options, context: &Context) -> impl 
 
         if !multiline {
             for (idx, (val, comment)) in value_group.drain(0..).enumerate() {
-                debug_assert!(comment.is_none());
                 if idx != 0 {
                     *formatted += " "
                 }
 
                 *formatted += &val;
+                if let Some(comment) = comment {
+                    *formatted += " ";
+                    *formatted += &comment;
+                }
             }
 
             return were_values;
@@ -1052,7 +1064,7 @@ fn format_array(node: SyntaxNode, options: &Options, context: &Context) -> impl 
                     let val = format_value(n, options, &inner_context);
                     let mut val_string = String::new();
 
-                    val.write_to(&mut val_string, options);
+                    val.append_to(&mut val_string);
 
                     let has_comma =
                         node_index < node_count - 1 || (multiline && options.array_trailing_comma);
@@ -1064,9 +1076,13 @@ fn format_array(node: SyntaxNode, options: &Options, context: &Context) -> impl 
                     node_index += 1;
                 }
                 _ => {
-                    if cfg!(debug_assertions) {
-                        unreachable!()
-                    }
+                    add_values(
+                        &mut value_group,
+                        &mut commas_group,
+                        &mut formatted,
+                        &inner_context,
+                    );
+                    formatted.push_str(&n.to_string());
                 }
             },
             NodeOrToken::Token(t) => match t.kind() {
@@ -1135,7 +1151,9 @@ fn format_array(node: SyntaxNode, options: &Options, context: &Context) -> impl 
 
                     if !newline_before && !value_group.is_empty() {
                         // It's actually trailing comment, so we add it to the last value.
-                        value_group.last_mut().unwrap().1 = Some(t.text().to_string());
+                        if let Some(last_value) = value_group.last_mut() {
+                            last_value.1 = Some(t.text().to_string());
+                        }
                         continue;
                     }
 
@@ -1166,14 +1184,14 @@ fn format_array(node: SyntaxNode, options: &Options, context: &Context) -> impl 
         formatted = "[]".into();
     }
 
-    (node.into(), formatted, None)
+    FormattedValue::new(formatted, None)
 }
 
 fn format_table_header(
     node: SyntaxNode,
     options: &Options,
     context: &Context,
-) -> impl FormattedItem {
+) -> FormattedValue {
     let mut formatted = String::new();
     let mut comment = None;
 
@@ -1186,7 +1204,6 @@ fn format_table_header(
                 BRACKET_START | BRACKET_END => formatted += t.text(),
                 WHITESPACE | NEWLINE => {}
                 COMMENT => {
-                    debug_assert!(comment.is_none());
                     comment = Some(t.text().to_string());
                 }
                 _ => formatted += t.text(),
@@ -1194,29 +1211,7 @@ fn format_table_header(
         }
     }
 
-    (node.into(), formatted, comment)
-}
-
-// Simply a tuple of the formatted item and an optional trailing comment.
-impl<T: AsRef<str>> FormattedItem for (SyntaxElement, T, Option<T>) {
-    fn write_to(&self, formatted: &mut String, _options: &Options) {
-        *formatted += self.1.as_ref()
-    }
-
-    fn trailing_comment(&self) -> Option<String> {
-        self.2.as_ref().map(|s| s.as_ref().to_string())
-    }
-
-    fn syntax(&self) -> SyntaxElement {
-        self.0.clone()
-    }
-}
-
-trait FormattedItem {
-    fn syntax(&self) -> SyntaxElement;
-    #[allow(clippy::ptr_arg)]
-    fn write_to(&self, formatted: &mut String, options: &Options);
-    fn trailing_comment(&self) -> Option<String>;
+    FormattedValue::new(formatted, comment)
 }
 
 trait NewlineCount {
@@ -1298,7 +1293,7 @@ where
                 && item_idx < row.as_ref().len() - 1
             {
                 let diff = diff_widths(last_align_idx..item_idx + 1, row);
-                out.extend(repeat(" ").take(diff));
+                out.extend(repeat_n(" ", diff));
                 last_align_idx = item_idx + 1;
             }
         }
@@ -1322,13 +1317,9 @@ where
 fn dangling_newlines(t: SyntaxToken) -> Option<usize> {
     let newline_count = t.text().newline_count();
 
-    if let Some(nt) = t.next_sibling_or_token() {
-        if let Some(nnt) = nt.next_sibling_or_token() {
-            if nt.kind() == WHITESPACE && nnt.kind() == NEWLINE {
-                return Some(newline_count);
-            }
-        }
-    }
-
-    None
+    t.next_sibling_or_token()
+        .filter(|next| next.kind() == WHITESPACE)
+        .and_then(|next| next.next_sibling_or_token())
+        .filter(|next_next| next_next.kind() == NEWLINE)
+        .map(|_| newline_count)
 }

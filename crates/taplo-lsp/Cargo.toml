@@ -30,7 +30,6 @@ futures     = { workspace = true }
 indexmap    = { workspace = true, features = ["serde"] }
 itertools   = { workspace = true }
 lsp-types   = { workspace = true, features = ["proposed"] }
-once_cell   = { workspace = true }
 parking_lot = { workspace = true }
 regex       = { workspace = true }
 reqwest     = { workspace = true, features = ["json"] }
@@ -42,6 +41,11 @@ time        = { workspace = true, features = ["formatting", "parsing"] }
 toml        = { workspace = true }
 tracing     = { workspace = true }
 url         = { workspace = true, features = ["serde"] }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+strict-test-support = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync"] }
 
 [package.metadata.auto-tag]
 enabled = true

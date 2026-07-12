@@ -1,19 +1,17 @@
+//! Schema-backed identifier and primitive hover presentation.
+
 use crate::{
     query::{lookup_keys, Query},
     world::World,
 };
 use itertools::Itertools;
-use lsp_async_stub::{
-    rpc::Error,
-    util::{LspExt, Position},
-    Context, Params,
-};
+use lsp_async_stub::{rpc::Error, Context, Params};
 use lsp_types::{Hover, HoverContents, HoverParams, MarkupContent, MarkupKind};
 use serde_json::Value;
 use taplo::{
     dom::{KeyOrIndex, Keys},
     syntax::SyntaxKind::{
-        self, BOOL, DATE, DATE_TIME_LOCAL, DATE_TIME_OFFSET, IDENT, INTEGER, INTEGER_BIN,
+        self, BOOL, DATE, DATE_TIME_LOCAL, DATE_TIME_OFFSET, FLOAT, IDENT, INTEGER, INTEGER_BIN,
         INTEGER_HEX, INTEGER_OCT, MULTI_LINE_STRING, MULTI_LINE_STRING_LITERAL, STRING,
         STRING_LITERAL, TIME,
     },
@@ -25,261 +23,188 @@ pub(crate) async fn hover<E: Environment>(
     context: Context<World<E>>,
     params: Params<HoverParams>,
 ) -> Result<Option<Hover>, Error> {
-    let p = params.required()?;
-
+    let params = params.required()?;
     let Some(document_uri) =
-        crate::uri::to_url(&p.text_document_position_params.text_document.uri)
+        crate::uri::to_url(&params.text_document_position_params.text_document.uri)
     else {
         return Ok(None);
     };
-
-    let workspaces = context.workspaces.read().await;
-    let ws = workspaces.by_document(&document_uri);
-    let doc = match ws.document(&document_uri) {
-        Ok(d) => d,
-        Err(error) => {
-            tracing::debug!(%error, "failed to get document from workspace");
-            return Ok(None);
-        }
-    };
-
-    let position = p.text_document_position_params.position;
-    let Some(offset) = doc.mapper.offset(Position::from_lsp(position)) else {
-        tracing::error!(?position, "document position not found");
+    let Some(snapshot) = context.document_snapshot(&document_uri).await else {
         return Ok(None);
     };
-
-    let query = Query::at(&doc.dom, offset);
-
-    let position_info = match query.before.clone().and_then(|p| {
-        if p.syntax.kind() == IDENT || is_primitive(p.syntax.kind()) {
-            Some(p)
-        } else {
-            None
-        }
-    }) {
-        Some(before) => before,
-        None => match query.after.clone().and_then(|p| {
-            if p.syntax.kind() == IDENT || is_primitive(p.syntax.kind()) {
-                Some(p)
-            } else {
-                None
-            }
-        }) {
-            Some(after) => after,
-            None => return Ok(None),
-        },
+    let document = &snapshot.document;
+    let Some(offset) = document.mapper.offset(crate::uri::from_lsp_position(
+        params.text_document_position_params.position,
+    )) else {
+        return Ok(None);
     };
-
-    if let Some(schema_association) = ws.schemas.associations().association_for(&document_uri) {
-        tracing::debug!(
-            schema.url = %schema_association.url,
-            schema.name = schema_association.meta["name"].as_str().unwrap_or(""),
-            schema.source = schema_association.meta["source"].as_str().unwrap_or(""),
-            "using schema"
+    let query = Query::at(&document.dom, offset);
+    let Some(position) = query.first_matching(|position| {
+        position.syntax.kind() == IDENT || is_primitive(position.syntax.kind())
+    }) else {
+        return Ok(None);
+    };
+    let Some(association) = snapshot
+        .schemas
+        .associations()
+        .association_for(&document_uri)
+    else {
+        return Ok(None);
+    };
+    let value = match serde_json::to_value(&document.dom) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(%error, "cannot turn DOM into JSON");
+            return Ok(None);
+        }
+    };
+    let Some((position_keys, _)) = &position.dom_node else {
+        return Ok(None);
+    };
+    let mut keys = position_keys.clone();
+    if query.header_key().is_some() {
+        let Some(index) = query.header_identifier_index(&position.syntax) else {
+            return Ok(None);
+        };
+        keys = lookup_keys(
+            document.dom.clone(),
+            &Keys::new(keys.into_iter().take(index.saturating_add(1))),
         );
-
-        let value = match serde_json::to_value(&doc.dom) {
-            Ok(v) => v,
-            Err(error) => {
-                tracing::warn!(%error, "cannot turn DOM into JSON");
-                return Ok(None);
-            }
-        };
-
-        let Some((keys, _)) = &position_info.dom_node else {
-            return Ok(None);
-        };
-
-        let links_in_hover = !ws.config.schema.links;
-
-        let mut keys = keys.clone();
-
-        if let Some(header_key) = query.header_key() {
-            let key_idx = header_key
-                .descendants_with_tokens()
-                .filter(|t| t.kind() == SyntaxKind::IDENT)
-                .position(|t| t.as_token().unwrap() == &position_info.syntax)
-                .unwrap();
-
-            keys = lookup_keys(
-                doc.dom.clone(),
-                &Keys::new(keys.into_iter().take(key_idx + 1)),
-            );
-        }
-
-        let Some(node) = doc.dom.path(&keys) else {
-            return Ok(None);
-        };
-
-        if position_info.syntax.kind() == SyntaxKind::IDENT {
-            keys = lookup_keys(doc.dom.clone(), &keys);
-
-            // We're interested in the array itself, not its item type.
-            while let Some(KeyOrIndex::Index(_)) = keys.iter().last() {
-                keys = keys.skip_right(1);
-            }
-
-            let schemas = match ws
-                .schemas
-                .schemas_at_path(&schema_association.url, &value, &keys)
-                .await
-            {
-                Ok(s) => s,
-                Err(error) => {
-                    tracing::error!(?error, "schema resolution failed");
-                    return Ok(None);
-                }
-            };
-
-            let content = schemas
-                .iter()
-                .map(|(_, schema)| {
-                    let ext = schema_ext_of(schema).unwrap_or_default();
-                    let ext_docs = ext.docs.unwrap_or_default();
-                    let ext_links = ext.links.unwrap_or_default();
-
-                    let mut s = String::new();
-                    if let Some(docs) = ext_docs.main {
-                        s += &docs;
-                    } else if let Some(desc) = schema["description"].as_str() {
-                        s += desc;
-                    }
-
-                    let link_title = schema["title"].as_str().unwrap_or("...");
-
-                    if links_in_hover {
-                        if let Some(link) = &ext_links.key {
-                            s = format!("[{link_title}]({link})\n\n{s}");
-                        }
-                    }
-
-                    s
-                })
-                .join("\n\n");
-
-            if content.is_empty() {
-                return Ok(None);
-            }
-
-            return Ok(Some(Hover {
-                contents: HoverContents::Markup(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: content,
-                }),
-                range: Some(
-                    doc.mapper
-                        .range(position_info.syntax.text_range())
-                        .unwrap()
-                        .into_lsp(),
-                ),
-            }));
-        } else if is_primitive(position_info.syntax.kind()) {
-            let schemas = match ws
-                .schemas
-                .schemas_at_path(&schema_association.url, &value, &keys)
-                .await
-            {
-                Ok(s) => s,
-                Err(error) => {
-                    tracing::error!(?error, "schema resolution failed");
-                    return Ok(None);
-                }
-            };
-
-            let value = match serde_json::to_value(node) {
-                Ok(v) => v,
-                Err(error) => {
-                    tracing::warn!(%error, "failed to turn DOM into JSON");
-                    Value::Null
-                }
-            };
-
-            let content = schemas
-                .iter()
-                .map(|(_, schema)| {
-                    let ext = schema_ext_of(schema).unwrap_or_default();
-                    let ext_docs = ext.docs.unwrap_or_default();
-                    let enum_docs = ext_docs.enum_values.unwrap_or_default();
-
-                    let ext_links = ext.links.unwrap_or_default();
-                    let enum_links = ext_links.enum_values.unwrap_or_default();
-
-                    if !enum_docs.is_empty() {
-                        if let Some(enum_values) = schema["enum"].as_array() {
-                            for (idx, val) in enum_values.iter().enumerate() {
-                                if val == &value {
-                                    if let Some(enum_docs) = enum_docs.get(idx).cloned().flatten() {
-                                        if links_in_hover {
-                                            let link_title =
-                                                schema["title"].as_str().unwrap_or("...");
-
-                                            if let Some(enum_link) =
-                                                enum_links.get(idx).and_then(Option::as_ref)
-                                            {
-                                                return format!(
-                                                    "[{link_title}]({enum_link})\n\n{enum_docs}"
-                                                );
-                                            }
-                                        }
-
-                                        return enum_docs;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if let (Some(docs), Some(default_value)) =
-                        (ext_docs.default_value, schema.get("default"))
-                    {
-                        if &value == default_value {
-                            return docs;
-                        }
-                    }
-
-                    if let (Some(docs), Some(const_value)) =
-                        (ext_docs.const_value, schema.get("const"))
-                    {
-                        if &value == const_value {
-                            return docs;
-                        }
-                    }
-
-                    if let Some(docs) = ext_docs.main {
-                        docs
-                    } else if let Some(desc) = schema["description"].as_str() {
-                        desc.to_string()
-                    } else if let Some(title) = schema["title"].as_str() {
-                        title.to_string()
-                    } else {
-                        String::new()
-                    }
-                })
-                .join("\n");
-
-            if content.is_empty() {
-                return Ok(None);
-            }
-
-            return Ok(Some(Hover {
-                contents: HoverContents::Markup(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: content,
-                }),
-                range: Some(
-                    doc.mapper
-                        .range(position_info.syntax.text_range())
-                        .unwrap()
-                        .into_lsp(),
-                ),
-            }));
-        }
     }
+    let Some(node) = document.dom.path(&keys) else {
+        return Ok(None);
+    };
+    let links_in_hover = !snapshot.config.schema.links;
 
-    Ok(None)
+    let content = if position.syntax.kind() == IDENT {
+        keys = lookup_keys(document.dom.clone(), &keys);
+        while matches!(keys.iter().last(), Some(KeyOrIndex::Index(_))) {
+            keys = keys.skip_right(1);
+        }
+        let schemas = match snapshot
+            .schemas
+            .schemas_at_path(&association.url, &value, &keys)
+            .await
+        {
+            Ok(schemas) => schemas,
+            Err(error) => {
+                tracing::error!(%error, "schema resolution failed");
+                return Ok(None);
+            }
+        };
+        schemas
+            .iter()
+            .filter_map(|(_, schema)| key_documentation(schema, links_in_hover))
+            .join("\n\n")
+    } else {
+        let schemas = match snapshot
+            .schemas
+            .schemas_at_path(&association.url, &value, &keys)
+            .await
+        {
+            Ok(schemas) => schemas,
+            Err(error) => {
+                tracing::error!(%error, "schema resolution failed");
+                return Ok(None);
+            }
+        };
+        let primitive = match serde_json::to_value(node) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(%error, "failed to turn DOM value into JSON");
+                return Ok(None);
+            }
+        };
+        schemas
+            .iter()
+            .filter_map(|(_, schema)| {
+                primitive_documentation(schema, &primitive, links_in_hover)
+            })
+            .join("\n")
+    };
+    if content.is_empty() {
+        return Ok(None);
+    }
+    let Some(range) = crate::uri::to_lsp_range(&document.mapper, position.syntax.text_range()) else {
+        return Ok(None);
+    };
+    Ok(Some(Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: content,
+        }),
+        range: Some(range),
+    }))
 }
 
+/// Render key documentation with its optional embedded external link.
+fn key_documentation(schema: &Value, links_in_hover: bool) -> Option<String> {
+    let extension = schema_ext_of(schema).unwrap_or_default();
+    let mut content = extension
+        .docs
+        .as_ref()
+        .and_then(|docs| docs.main.clone())
+        .or_else(|| schema["description"].as_str().map(ToOwned::to_owned))?;
+    if content.is_empty() {
+        return None;
+    }
+    if links_in_hover
+        && let Some(link) = extension.links.and_then(|links| links.key)
+    {
+        let title = schema["title"].as_str().unwrap_or("...");
+        content = format!("[{title}]({link})\n\n{content}");
+    }
+    Some(content)
+}
+
+/// Select primitive-value documentation in the established specialized-to-general precedence.
+fn primitive_documentation(
+    schema: &Value,
+    value: &Value,
+    links_in_hover: bool,
+) -> Option<String> {
+    let extension = schema_ext_of(schema).unwrap_or_default();
+    let docs = extension.docs.unwrap_or_default();
+    let links = extension.links.unwrap_or_default();
+    if let Some(index) = schema["enum"]
+        .as_array()
+        .and_then(|values| values.iter().position(|candidate| candidate == value))
+        && let Some(mut content) = docs
+            .enum_values
+            .as_ref()
+            .and_then(|values| values.get(index))
+            .cloned()
+            .flatten()
+    {
+        if links_in_hover
+            && let Some(link) = links
+                .enum_values
+                .as_ref()
+                .and_then(|values| values.get(index))
+                .and_then(Option::as_ref)
+        {
+            let title = schema["title"].as_str().unwrap_or("...");
+            content = format!("[{title}]({link})\n\n{content}");
+        }
+        return (!content.is_empty()).then_some(content);
+    }
+    if schema.get("default") == Some(value)
+        && let Some(content) = docs.default_value
+    {
+        return (!content.is_empty()).then_some(content);
+    }
+    if schema.get("const") == Some(value)
+        && let Some(content) = docs.const_value
+    {
+        return (!content.is_empty()).then_some(content);
+    }
+    docs.main
+        .or_else(|| schema["description"].as_str().map(ToOwned::to_owned))
+        .or_else(|| schema["title"].as_str().map(ToOwned::to_owned))
+        .filter(|content| !content.is_empty())
+}
+
+/// Whether a syntax token represents a primitive TOML value.
 fn is_primitive(kind: SyntaxKind) -> bool {
     matches!(
         kind,
@@ -291,9 +216,167 @@ fn is_primitive(kind: SyntaxKind) -> bool {
             | MULTI_LINE_STRING
             | STRING_LITERAL
             | MULTI_LINE_STRING_LITERAL
+            | FLOAT
             | INTEGER
             | INTEGER_HEX
             | INTEGER_OCT
             | INTEGER_BIN
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_primitive, key_documentation, primitive_documentation};
+    use serde_json::json;
+    use strict_test_support::{
+        ensure, ensure_contains, ensure_eq, ensure_lacks, ensure_some, TestFailure,
+    };
+    use taplo::syntax::SyntaxKind::{FLOAT, IDENT, STRING};
+
+    #[test]
+    fn key_documentation_prefers_extensions_and_embeds_links_only_in_hover(
+    ) -> Result<(), TestFailure> {
+        let schema = json!({
+            "title": "Setting",
+            "description": "schema description",
+            "x-taplo": {
+                "docs": { "main": "extension documentation" },
+                "links": { "key": "https://example.com/key" }
+            }
+        });
+        let embedded = ensure_some(
+            key_documentation(&schema, true),
+            "key documentation with extension content must exist",
+        )?;
+        ensure_contains(
+            &embedded,
+            "[Setting](https://example.com/key)",
+            "embedded hover mode must prefix the key link",
+        )?;
+        ensure_contains(
+            &embedded,
+            "extension documentation",
+            "extension docs must override the schema description",
+        )?;
+        ensure_lacks(
+            &embedded,
+            "schema description",
+            "lower-precedence schema description must not leak into extension docs",
+        )?;
+
+        let standalone_mode = ensure_some(
+            key_documentation(&schema, false),
+            "standalone-link mode must retain key documentation",
+        )?;
+        ensure_eq(
+            &standalone_mode.as_str(),
+            &"extension documentation",
+            "standalone-link mode must not duplicate the URL inside hover content",
+        )?;
+
+        let description_only = json!({ "description": "fallback description" });
+        ensure(
+            key_documentation(&description_only, true)
+                == Some("fallback description".into()),
+            "schema description must backfill absent extension docs",
+        )?;
+        ensure(
+            key_documentation(&json!({ "description": "" }), true).is_none(),
+            "empty key documentation must produce no hover content",
+        )
+    }
+
+    #[test]
+    fn primitive_documentation_obeys_specialized_then_general_precedence(
+    ) -> Result<(), TestFailure> {
+        let schema = json!({
+            "title": "Value",
+            "description": "description docs",
+            "enum": [1, 2],
+            "default": 2,
+            "const": 2,
+            "x-taplo": {
+                "docs": {
+                    "main": "main docs",
+                    "enumValues": ["one docs", "two docs"],
+                    "defaultValue": "default docs",
+                    "constValue": "const docs"
+                },
+                "links": {
+                    "enumValues": [null, "https://example.com/two"]
+                }
+            }
+        });
+        let enum_embedded = ensure_some(
+            primitive_documentation(&schema, &json!(2), true),
+            "a matching documented enum value must produce content",
+        )?;
+        ensure_contains(
+            &enum_embedded,
+            "[Value](https://example.com/two)",
+            "embedded mode must prefix a matching enum link",
+        )?;
+        ensure_contains(&enum_embedded, "two docs", "matching enum docs")?;
+
+        ensure(
+            primitive_documentation(&schema, &json!(2), false) == Some("two docs".into()),
+            "standalone-link mode must retain enum docs without embedding the link",
+        )?;
+
+        let no_enum_docs = json!({
+            "enum": [2],
+            "default": 2,
+            "const": 2,
+            "x-taplo": {
+                "docs": {
+                    "defaultValue": "default docs",
+                    "constValue": "const docs"
+                }
+            }
+        });
+        ensure(
+            primitive_documentation(&no_enum_docs, &json!(2), true)
+                == Some("default docs".into()),
+            "a matching enum without enum docs must fall through to default before const",
+        )?;
+
+        let const_only = json!({
+            "const": true,
+            "x-taplo": { "docs": { "constValue": "const docs" } }
+        });
+        ensure(
+            primitive_documentation(&const_only, &json!(true), true)
+                == Some("const docs".into()),
+            "matching const docs must be selected when no default docs match",
+        )?;
+
+        ensure(
+            primitive_documentation(&schema, &json!(99), true) == Some("main docs".into()),
+            "a nonmatching value must fall through to extension main docs",
+        )?;
+        ensure(
+            primitive_documentation(&json!({ "description": "description" }), &json!(1), true)
+                == Some("description".into()),
+            "description must follow extension docs",
+        )?;
+        ensure(
+            primitive_documentation(&json!({ "title": "title" }), &json!(1), true)
+                == Some("title".into()),
+            "title must be the final nonempty fallback",
+        )?;
+        ensure(
+            primitive_documentation(&json!({}), &json!(1), true).is_none(),
+            "a schema without documentation must produce no hover",
+        )
+    }
+
+    #[test]
+    fn primitive_selection_includes_floats_but_excludes_identifiers() -> Result<(), TestFailure> {
+        ensure(is_primitive(FLOAT), "floating-point values must be hoverable")?;
+        ensure(is_primitive(STRING), "string values must be hoverable")?;
+        ensure(
+            !is_primitive(IDENT),
+            "identifier handling must remain a distinct hover branch",
+        )
+    }
 }

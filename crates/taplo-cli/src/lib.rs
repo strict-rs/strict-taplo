@@ -51,10 +51,11 @@ impl<E: Environment> Taplo<E> {
 
         let mut config_path = general.config.clone();
 
-        if config_path.is_none() && !general.no_auto_config {
-            if let Some(cwd) = self.env.cwd_normalized() {
-                config_path = self.env.find_config_file_normalized(&cwd).await
-            }
+        if config_path.is_none()
+            && !general.no_auto_config
+            && let Some(cwd) = self.env.cwd_normalized()
+        {
+            config_path = self.env.find_config_file_normalized(&cwd).await;
         }
 
         let mut config = Config::default();

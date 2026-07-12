@@ -1,6 +1,6 @@
 use super::{builtins, cache::Cache};
 use crate::{
-    config::Config,
+    config::{Config, SchemaOptions},
     environment::Environment,
     util::{normalize_str, GlobRule},
     IndexMap,
@@ -43,14 +43,14 @@ pub mod source {
 #[derive(Clone)]
 pub struct SchemaAssociations<E: Environment> {
     concurrent_requests: Arc<Semaphore>,
-    http: reqwest::Client,
+    http: Option<reqwest::Client>,
     env: E,
     associations: Arc<RwLock<Vec<(AssociationRule, SchemaAssociation)>>>,
     cache: Cache<E>,
 }
 
 impl<E: Environment> SchemaAssociations<E> {
-    pub(crate) fn new(env: E, cache: Cache<E>, http: reqwest::Client) -> Self {
+    pub(crate) fn new(env: E, cache: Cache<E>, http: Option<reqwest::Client>) -> Self {
         let this = Self {
             concurrent_requests: Arc::new(Semaphore::new(10)),
             cache,
@@ -85,22 +85,32 @@ impl<E: Environment> SchemaAssociations<E> {
     pub fn add_builtins(&self) {
         self.retain(|(_, assoc)| assoc.meta["source"] != source::BUILTIN);
 
-        self.associations.write().push((
-            AssociationRule::Regex(Regex::new(r".*\.?taplo\.toml$").unwrap()),
-            SchemaAssociation {
-                url: builtins::TAPLO_CONFIG_URL.parse().unwrap(),
-                meta: json!({
-                    "name": "Taplo",
-                    "description": "Taplo configuration file.",
-                    "source": source::BUILTIN
-                }),
-                priority: priority::BUILTIN,
-            },
-        ));
+        let regex = Regex::new(r".*\.?taplo\.toml$");
+        let url = builtins::TAPLO_CONFIG_URL.parse();
+        match (regex, url) {
+            (Ok(regex), Ok(url)) => self.associations.write().push((
+                AssociationRule::Regex(regex),
+                SchemaAssociation {
+                    url,
+                    meta: json!({
+                        "name": "Taplo",
+                        "description": "Taplo configuration file.",
+                        "source": source::BUILTIN
+                    }),
+                    priority: priority::BUILTIN,
+                },
+            )),
+            (Err(error), _) => tracing::error!(%error, "invalid built-in association regex"),
+            (_, Err(error)) => tracing::error!(%error, "invalid built-in schema URL"),
+        }
     }
 
     pub async fn add_from_catalog(&self, url: &Url) -> Result<(), anyhow::Error> {
         let index = self.load_catalog(url).await?;
+        self.retain(|(_, association)| {
+            association.meta["source"] != source::CATALOG
+                || association.meta["catalog_url"].as_str() != Some(url.as_str())
+        });
         match index {
             SchemaCatalog::SchemaStore(index) => {
                 for schema in &index.schemas {
@@ -169,14 +179,7 @@ impl<E: Environment> SchemaAssociations<E> {
 
     /// Adds the schema from either a directive, or a `$schema` key in the root.
     pub fn add_from_document(&self, doc_url: &Url, root: &Node) {
-        self.retain(|(rule, assoc)| match rule {
-            AssociationRule::Url(u) => {
-                !(u == doc_url
-                    && (assoc.meta["source"] == source::DIRECTIVE
-                        || assoc.meta["source"] == source::SCHEMA_FIELD))
-            }
-            _ => true,
-        });
+        self.remove_from_document(doc_url);
 
         for comment in root.header_comments() {
             if let Some("schema") = comment.directive() {
@@ -254,27 +257,38 @@ impl<E: Environment> SchemaAssociations<E> {
         }
     }
 
+    /// Remove only directive and `$schema` associations owned by one document.
+    pub fn remove_from_document(&self, doc_url: &Url) {
+        self.retain(|(rule, association)| match rule {
+            AssociationRule::Url(url) => {
+                url != doc_url
+                    || (association.meta["source"] != source::DIRECTIVE
+                        && association.meta["source"] != source::SCHEMA_FIELD)
+            }
+            _ => true,
+        });
+    }
+
     pub fn add_from_config(&self, config: &Config) {
+        self.retain(|(_, association)| association.meta["source"] != source::CONFIG);
+
         for rule in &config.rule {
+            if rule.keys.is_some() {
+                continue;
+            }
             let Some(file_rule) = rule.file_rule.clone() else {
                 continue;
             };
 
-            if let Some(schema_opts) = &rule.options.schema {
-                if let Some(url) = &schema_opts.url {
-                    if schema_opts.enabled.unwrap_or(true) {
-                        self.associations.write().push((
-                            file_rule.into(),
-                            SchemaAssociation {
-                                url: url.clone(),
-                                meta: json!({
-                                    "source": source::CONFIG,
-                                }),
-                                priority: priority::CONFIG_RULE,
-                            },
-                        ));
-                    }
-                }
+            if let Some(association) = rule
+                .options
+                .schema
+                .as_ref()
+                .and_then(|options| config_association(options, priority::CONFIG_RULE))
+            {
+                self.associations
+                    .write()
+                    .push((file_rule.into(), association));
             }
         }
 
@@ -282,21 +296,15 @@ impl<E: Environment> SchemaAssociations<E> {
             return;
         };
 
-        if let Some(schema_opts) = &config.global_options.schema {
-            if let Some(url) = &schema_opts.url {
-                if schema_opts.enabled.unwrap_or(true) {
-                    self.associations.write().push((
-                        file_rule.into(),
-                        SchemaAssociation {
-                            url: url.clone(),
-                            meta: json!({
-                                "source": source::CONFIG,
-                            }),
-                            priority: priority::CONFIG,
-                        },
-                    ));
-                }
-            }
+        if let Some(association) = config
+            .global_options
+            .schema
+            .as_ref()
+            .and_then(|options| config_association(options, priority::CONFIG))
+        {
+            self.associations
+                .write()
+                .push((file_rule.into(), association));
         }
     }
 
@@ -342,14 +350,12 @@ impl<E: Environment> SchemaAssociations<E> {
 
         index.transform_paths();
 
-        if self.cache.is_cache_path_set() {
-            if let Err(error) = self
-                .cache
-                .save(index_url.clone(), Arc::new(serde_json::to_value(&index)?))
-                .await
-            {
-                tracing::warn!(%error, "failed to cache index");
-            }
+        if let Err(error) = self
+            .cache
+            .save_if_configured(index_url.clone(), Arc::new(serde_json::to_value(&index)?))
+            .await
+        {
+            tracing::warn!(%error, "failed to cache index");
         }
 
         Ok(index)
@@ -358,13 +364,14 @@ impl<E: Environment> SchemaAssociations<E> {
     async fn fetch_external(&self, index_url: &Url) -> Result<SchemaCatalog, anyhow::Error> {
         let _permit = self.concurrent_requests.acquire().await?;
         match index_url.scheme() {
-            "http" | "https" => Ok(self
-                .http
-                .get(index_url.clone())
-                .send()
-                .await?
-                .json()
-                .await?),
+            "http" | "https" => {
+                let Some(http) = &self.http else {
+                    return Err(anyhow!(
+                        "HTTP schema transport is unavailable for catalog `{index_url}`"
+                    ));
+                };
+                Ok(http.get(index_url.clone()).send().await?.json().await?)
+            }
             "file" => Ok(serde_json::from_slice(
                 &self
                     .env
@@ -423,14 +430,26 @@ impl AssociationRule {
             AssociationRule::Glob(g) => g.is_match(&*normalize_str(
                 url.as_str()
                     .strip_prefix(url.scheme())
-                    .unwrap()
-                    .strip_prefix("://")
-                    .unwrap(),
+                    .and_then(|without_scheme| without_scheme.strip_prefix("://"))
+                    .unwrap_or(url.path()),
             )),
             AssociationRule::Regex(r) => r.is_match(&normalize_str(url.as_str())),
             AssociationRule::Url(u) => u == url,
         }
     }
+}
+
+/// Convert prepared configuration options into an enabled, URL-bearing association.
+fn config_association(options: &SchemaOptions, priority: usize) -> Option<SchemaAssociation> {
+    if options.enabled == Some(false) {
+        return None;
+    }
+
+    Some(SchemaAssociation {
+        url: options.url.clone()?,
+        meta: json!({ "source": source::CONFIG }),
+        priority,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -540,4 +559,195 @@ pub struct SchemaAssociation {
     pub meta: Value,
     pub url: Url,
     pub priority: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{priority, source, AssociationRule, SchemaAssociation, SchemaAssociations};
+    use crate::{
+        config::{Config, Options, Rule, SchemaOptions},
+        schema::cache::Cache,
+        test_support::{ensure_anyhow, TestEnvironment},
+    };
+    use serde_json::json;
+    use std::path::Path;
+    use strict_test_support::{ensure, ensure_eq, ensure_ok, ensure_some, TestFailure};
+    use taplo::parser::parse;
+    use url::Url;
+
+    fn url(value: &str) -> Result<Url, TestFailure> {
+        ensure_ok(Url::parse(value), "the association fixture URL must parse")
+    }
+
+    fn schema_options(schema_url: Option<Url>, enabled: Option<bool>) -> Options {
+        Options {
+            schema: Some(SchemaOptions {
+                enabled,
+                path: None,
+                url: schema_url,
+            }),
+            formatting: None,
+        }
+    }
+
+    fn source_count(
+        associations: &SchemaAssociations<TestEnvironment>,
+        expected_source: &str,
+    ) -> usize {
+        associations
+            .read()
+            .iter()
+            .filter(|(_, association)| association.meta["source"] == expected_source)
+            .count()
+    }
+
+    #[test]
+    fn config_associations_replace_transactionally_and_preserve_other_sources(
+    ) -> Result<(), TestFailure> {
+        let environment = TestEnvironment::default();
+        let associations =
+            SchemaAssociations::new(environment.clone(), Cache::new(environment.clone()), None);
+        let global_url = url("https://example.com/global.json")?;
+        let rule_url = url("https://example.com/rule.json")?;
+        let document_url = url("file:///workspace/match.toml")?;
+        let manual_url = url("https://example.com/manual.json")?;
+        associations.add(
+            AssociationRule::Url(document_url.clone()),
+            SchemaAssociation {
+                meta: json!({ "source": source::MANUAL }),
+                url: manual_url.clone(),
+                priority: priority::MAX,
+            },
+        );
+
+        let mut first = Config {
+            global_options: schema_options(Some(global_url), Some(true)),
+            rule: Vec::from([
+                Rule {
+                    include: Some(Vec::from(["**/match.toml".into()])),
+                    options: schema_options(Some(rule_url), Some(true)),
+                    ..Rule::default()
+                },
+                Rule {
+                    include: Some(Vec::from(["**/match.toml".into()])),
+                    keys: Some(Vec::from(["nested".into()])),
+                    options: schema_options(
+                        Some(url("https://example.com/key-scoped.json")?),
+                        Some(true),
+                    ),
+                    ..Rule::default()
+                },
+                Rule {
+                    include: Some(Vec::from(["**/match.toml".into()])),
+                    options: schema_options(None, Some(true)),
+                    ..Rule::default()
+                },
+            ]),
+            ..Config::default()
+        };
+        ensure_anyhow(
+            first.prepare(&environment, Path::new("/workspace")),
+            "the first association config must prepare",
+        )?;
+        associations.add_from_config(&first);
+        ensure_eq(
+            &source_count(&associations, source::CONFIG),
+            &2,
+            "only enabled URL-bearing global and file rules may create associations",
+        )?;
+        let selected = ensure_some(
+            associations.association_for(&document_url),
+            "the document must have an association",
+        )?;
+        ensure_eq(
+            &selected.url.as_str(),
+            &manual_url.as_str(),
+            "a preserved higher-priority manual association must remain selected",
+        )?;
+
+        let mut disabled = Config {
+            global_options: schema_options(
+                Some(url("https://example.com/disabled.json")?),
+                Some(false),
+            ),
+            ..Config::default()
+        };
+        ensure_anyhow(
+            disabled.prepare(&environment, Path::new("/workspace")),
+            "the disabling config must prepare",
+        )?;
+        associations.add_from_config(&disabled);
+        ensure_eq(
+            &source_count(&associations, source::CONFIG),
+            &0,
+            "disabling config must remove stale config-derived associations",
+        )?;
+        ensure_eq(
+            &source_count(&associations, source::MANUAL),
+            &1,
+            "transactional config replacement must preserve manual associations",
+        )
+    }
+
+    #[test]
+    fn document_refresh_replaces_only_document_owned_sources() -> Result<(), TestFailure> {
+        let environment = TestEnvironment::default();
+        let associations =
+            SchemaAssociations::new(environment.clone(), Cache::new(environment), None);
+        let document_url = url("file:///workspace/document.toml")?;
+        associations.add(
+            AssociationRule::Url(document_url.clone()),
+            SchemaAssociation {
+                meta: json!({ "source": source::MANUAL }),
+                url: url("https://example.com/manual.json")?,
+                priority: priority::MAX,
+            },
+        );
+
+        let directive = parse("#:schema https://example.com/directive.json\nvalue = 1\n");
+        ensure(
+            directive.errors.is_empty(),
+            "the directive fixture must parse cleanly",
+        )?;
+        associations.add_from_document(&document_url, &directive.into_dom());
+        ensure_eq(
+            &source_count(&associations, source::DIRECTIVE),
+            &1,
+            "a schema directive must create one document-owned association",
+        )?;
+        ensure_eq(
+            &source_count(&associations, source::MANUAL),
+            &1,
+            "adding a directive must preserve a manual URL association",
+        )?;
+
+        let schema_field = parse("\"$schema\" = \"https://example.com/field.json\"\n");
+        ensure(
+            schema_field.errors.is_empty(),
+            "the schema-field fixture must parse cleanly",
+        )?;
+        associations.add_from_document(&document_url, &schema_field.into_dom());
+        ensure_eq(
+            &source_count(&associations, source::DIRECTIVE),
+            &0,
+            "refreshing the document must remove its previous directive",
+        )?;
+        ensure_eq(
+            &source_count(&associations, source::SCHEMA_FIELD),
+            &1,
+            "refreshing the document must install its current schema field",
+        )?;
+
+        associations.remove_from_document(&document_url);
+        ensure_eq(
+            &source_count(&associations, source::SCHEMA_FIELD),
+            &0,
+            "removing document ownership must remove its schema field",
+        )?;
+        ensure_eq(
+            &source_count(&associations, source::MANUAL),
+            &1,
+            "removing document ownership must preserve the manual association",
+        )
+    }
 }

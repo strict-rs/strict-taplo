@@ -29,24 +29,23 @@ pub(crate) async fn semantic_tokens<E: Environment>(
         return Ok(None);
     };
 
-    let workspaces = context.workspaces.read().await;
-    let ws = workspaces.by_document(&document_uri);
-
-    if !ws.config.syntax.semantic_tokens {
+    let Some(snapshot) = context.document_snapshot(&document_uri).await else {
+        return Ok(None);
+    };
+    if !snapshot.config.syntax.semantic_tokens {
         return Ok(None);
     }
-
-    let doc = match ws.document(&document_uri) {
-        Ok(d) => d,
-        Err(error) => {
-            tracing::debug!(%error, "failed to get document from workspace");
-            return Ok(None);
-        }
+    let doc = &snapshot.document;
+    let Some(syntax) = doc.dom.syntax().and_then(|syntax| syntax.as_node()) else {
+        return Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+            result_id: None,
+            data: Vec::new(),
+        })));
     };
 
     Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
         result_id: None,
-        data: create_tokens(doc.dom.syntax().unwrap().as_node().unwrap(), &doc.mapper),
+        data: create_tokens(syntax, &doc.mapper),
     })))
 }
 

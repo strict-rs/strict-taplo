@@ -118,10 +118,10 @@ impl Config {
         }
 
         for rule in self.rules_for(path) {
-            if rule.keys.is_none() {
-                if let Some(rule_opts) = rule.options.formatting.clone() {
-                    options.update(rule_opts);
-                }
+            if rule.keys.is_none()
+                && let Some(rule_opts) = rule.options.formatting.clone()
+            {
+                options.update(rule_opts);
             }
         }
     }
@@ -147,27 +147,17 @@ impl Config {
             .and_then(|s| s.enabled)
             .unwrap_or(true);
 
-        for rule in &self.rule {
-            let rule_matched = match &self.file_rule {
-                Some(r) => r.is_match(path),
-                None => {
-                    tracing::debug!("no file matches were set up");
-                    false
-                }
-            };
-
-            if !rule_matched {
-                continue;
-            }
-
-            let rule_schema_enabled = rule
+        for rule in self
+            .rules_for(path)
+            .filter(|rule| rule.keys.is_none())
+        {
+            if rule
                 .options
                 .schema
                 .as_ref()
-                .and_then(|s| s.enabled)
-                .unwrap_or(true);
-
-            if !rule_schema_enabled {
+                .and_then(|schema| schema.enabled)
+                == Some(false)
+            {
                 return false;
             }
         }
@@ -380,4 +370,137 @@ pub struct Plugin {
     /// Optional settings for the plugin.
     #[serde(default)]
     pub settings: Option<Value>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Config, Options, Rule, SchemaOptions};
+    use crate::test_support::{ensure_anyhow, TestEnvironment};
+    use std::path::Path;
+    use strict_test_support::{ensure, ensure_eq, TestFailure};
+    use taplo::formatter::{Options as FormatOptions, OptionsIncomplete};
+
+    fn formatting(column_width: usize) -> Options {
+        Options {
+            formatting: Some(OptionsIncomplete {
+                column_width: Some(column_width),
+                ..OptionsIncomplete::default()
+            }),
+            ..Options::default()
+        }
+    }
+
+    fn schema(enabled: bool) -> Options {
+        Options {
+            schema: Some(SchemaOptions {
+                enabled: Some(enabled),
+                path: None,
+                url: None,
+            }),
+            formatting: None,
+        }
+    }
+
+    #[test]
+    fn whole_document_formatting_uses_only_matching_file_rules() -> Result<(), TestFailure> {
+        let environment = TestEnvironment::default();
+        let mut config = Config {
+            global_options: formatting(80),
+            rule: Vec::from([
+                Rule {
+                    include: Some(Vec::from(["**/match.toml".into()])),
+                    options: formatting(100),
+                    ..Rule::default()
+                },
+                Rule {
+                    include: Some(Vec::from(["**/other.toml".into()])),
+                    options: formatting(120),
+                    ..Rule::default()
+                },
+                Rule {
+                    include: Some(Vec::from(["**/match.toml".into()])),
+                    keys: Some(Vec::from(["package.metadata".into()])),
+                    options: formatting(140),
+                    ..Rule::default()
+                },
+            ]),
+            ..Config::default()
+        };
+        ensure_anyhow(
+            config.prepare(&environment, Path::new("/workspace")),
+            "the formatting config must prepare",
+        )?;
+
+        let mut matching = FormatOptions::default();
+        config.update_format_options(Path::new("/workspace/match.toml"), &mut matching);
+        ensure_eq(
+            &matching.column_width,
+            &100,
+            "a matching file-only rule must override the global option",
+        )?;
+
+        let mut unrelated = FormatOptions::default();
+        config.update_format_options(Path::new("/workspace/unrelated.toml"), &mut unrelated);
+        ensure_eq(
+            &unrelated.column_width,
+            &80,
+            "nonmatching and key-scoped rules must not alter whole-document options",
+        )
+    }
+
+    #[test]
+    fn schema_disablement_is_matching_file_scoped_and_only_narrows() -> Result<(), TestFailure> {
+        let environment = TestEnvironment::default();
+        let mut enabled_config = Config {
+            global_options: schema(true),
+            rule: Vec::from([
+                Rule {
+                    include: Some(Vec::from(["**/disabled.toml".into()])),
+                    options: schema(false),
+                    ..Rule::default()
+                },
+                Rule {
+                    include: Some(Vec::from(["**/key-scoped.toml".into()])),
+                    keys: Some(Vec::from(["nested".into()])),
+                    options: schema(false),
+                    ..Rule::default()
+                },
+            ]),
+            ..Config::default()
+        };
+        ensure_anyhow(
+            enabled_config.prepare(&environment, Path::new("/workspace")),
+            "the enabled schema config must prepare",
+        )?;
+        ensure(
+            !enabled_config.is_schema_enabled(Path::new("/workspace/disabled.toml")),
+            "a matching file-only rule must disable schema validation",
+        )?;
+        ensure(
+            enabled_config.is_schema_enabled(Path::new("/workspace/other.toml")),
+            "the same disabling rule must not affect a nonmatching file",
+        )?;
+        ensure(
+            enabled_config.is_schema_enabled(Path::new("/workspace/key-scoped.toml")),
+            "a key-scoped rule must not disable whole-document validation",
+        )?;
+
+        let mut globally_disabled = Config {
+            global_options: schema(false),
+            rule: Vec::from([Rule {
+                include: Some(Vec::from(["**/*.toml".into()])),
+                options: schema(true),
+                ..Rule::default()
+            }]),
+            ..Config::default()
+        };
+        ensure_anyhow(
+            globally_disabled.prepare(&environment, Path::new("/workspace")),
+            "the globally disabled schema config must prepare",
+        )?;
+        ensure(
+            !globally_disabled.is_schema_enabled(Path::new("/workspace/file.toml")),
+            "a matching explicit enable must not override global disablement",
+        )
+    }
 }

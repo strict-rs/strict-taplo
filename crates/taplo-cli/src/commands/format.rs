@@ -255,17 +255,17 @@ impl<E: Environment> Taplo<E> {
             .map_err(|err| anyhow!("invalid key pattern: {err}"))?;
 
             if source != formatted {
-                if cmd.diff {
-                    if let Err(e) = self.print_diff(&path, &source, &formatted).await {
-                        self.env
-                            .stderr()
-                            .write_all(
-                                format!("Failed to write diff to stdout: {:?}", e)
-                                    .as_str()
-                                    .as_bytes(),
-                            )
-                            .await?;
-                    }
+                if cmd.diff
+                    && let Err(error) = self.print_diff(&path, &source, &formatted).await
+                {
+                    self.env
+                        .stderr()
+                        .write_all(
+                            format!("Failed to write diff to stdout: {error:?}")
+                                .as_str()
+                                .as_bytes(),
+                        )
+                        .await?;
                 }
 
                 if cmd.check {

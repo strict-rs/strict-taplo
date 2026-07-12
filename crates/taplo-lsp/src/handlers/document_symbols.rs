@@ -19,17 +19,13 @@ pub(crate) async fn document_symbols<E: Environment>(
         return Ok(None);
     };
 
-    let workspaces = context.workspaces.read().await;
-    let ws = workspaces.by_document(&document_uri);
-    let doc = match ws.document(&document_uri) {
-        Ok(d) => d,
-        Err(error) => {
-            tracing::debug!(%error, "failed to get document from workspace");
-            return Ok(None);
-        }
+    let Some(snapshot) = context.document_snapshot(&document_uri).await else {
+        return Ok(None);
     };
 
-    Ok(Some(DocumentSymbolResponse::Nested(create_symbols(doc))))
+    Ok(Some(DocumentSymbolResponse::Nested(create_symbols(
+        &snapshot.document,
+    ))))
 }
 
 pub(crate) fn create_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {

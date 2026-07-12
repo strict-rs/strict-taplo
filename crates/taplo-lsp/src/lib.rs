@@ -20,6 +20,8 @@ use world::{World, WorldState};
 
 mod diagnostics;
 mod handlers;
+#[cfg(test)]
+mod test_support;
 mod uri;
 
 pub mod config;

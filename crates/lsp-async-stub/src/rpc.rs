@@ -87,7 +87,7 @@ impl<T: Serialize + DeserializeOwned> Request<T> {
             jsonrpc: self.jsonrpc,
             method: Some(self.method),
             id: self.id,
-            params: self.params.map(|p| serde_json::to_value(p).unwrap()),
+            params: self.params.and_then(|params| serde_json::to_value(params).ok()),
             result: None,
             error: None,
         }
@@ -148,8 +148,10 @@ impl<R: Serialize + DeserializeOwned> Response<R> {
     pub fn into_result(self) -> Result<R, Error> {
         if let Some(r) = self.result {
             Ok(r)
+        } else if let Some(error) = self.error {
+            Err(error)
         } else {
-            Err(self.error.unwrap())
+            Err(Error::internal_error().with_data("response contains neither result nor error"))
         }
     }
 
@@ -159,7 +161,7 @@ impl<R: Serialize + DeserializeOwned> Response<R> {
             method: None,
             id: Some(self.id),
             params: None,
-            result: self.result.map(|p| serde_json::to_value(p).unwrap()),
+            result: self.result.and_then(|result| serde_json::to_value(result).ok()),
             error: self.error,
         }
     }
@@ -238,7 +240,7 @@ impl Error {
     }
 
     pub fn with_data(mut self, data: impl Serialize) -> Self {
-        self.data = Some(serde_json::to_value(data).unwrap());
+        self.data = serde_json::to_value(data).ok();
         self
     }
 

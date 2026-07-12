@@ -1,4 +1,4 @@
-use lsp_async_stub::{rpc::Error, util::LspExt, Context, Params};
+use lsp_async_stub::{rpc::Error, Context, Params};
 use lsp_types::{DocumentFormattingParams, TextEdit};
 use taplo::formatter;
 use taplo_common::environment::Environment;
@@ -16,15 +16,10 @@ pub(crate) async fn format<E: Environment>(
         return Ok(None);
     };
 
-    let workspaces = context.workspaces.read().await;
-    let ws = workspaces.by_document(&document_uri);
-    let doc = match ws.document(&document_uri) {
-        Ok(d) => d,
-        Err(error) => {
-            tracing::debug!(%error, "failed to get document from workspace");
-            return Ok(None);
-        }
+    let Some(snapshot) = context.document_snapshot(&document_uri).await else {
+        return Ok(None);
     };
+    let doc = &snapshot.document;
 
     let doc_path = context
         .env
@@ -35,9 +30,11 @@ pub(crate) async fn format<E: Environment>(
             ))
         })?;
 
+    let tab_size = usize::try_from(p.options.tab_size)
+        .map_err(|_| Error::invalid_params().with_data("tab size is not representable"))?;
     let mut format_opts = formatter::Options {
         indent_string: if p.options.insert_spaces {
-            " ".repeat(p.options.tab_size as usize)
+            " ".repeat(tab_size)
         } else {
             "\t".into()
         },
@@ -48,22 +45,27 @@ pub(crate) async fn format<E: Environment>(
         format_opts.trailing_newline = v;
     }
 
-    format_opts.update_camel(ws.config.formatter.clone());
+    format_opts.update_camel(snapshot.config.formatter.clone());
 
-    ws.taplo_config
+    snapshot
+        .taplo_config
         .update_format_options(&doc_path, &mut format_opts);
 
-    let scopes = ws.taplo_config.format_scopes(&doc_path);
+    let scopes = snapshot.taplo_config.format_scopes(&doc_path);
     tracing::trace!(
         ?doc_path,
         ?format_opts,
         scopes = ?scopes.clone().collect::<Vec<_>>(),
-        all_rules = ?ws.taplo_config.rule,
-        matched_rules = ?ws.taplo_config.rules_for(&doc_path).collect::<Vec<_>>(),
+        all_rules = ?snapshot.taplo_config.rule,
+        matched_rules = ?snapshot.taplo_config.rules_for(&doc_path).collect::<Vec<_>>(),
     );
 
+    let range = crate::uri::mapper_range_to_lsp(doc.mapper.all_range()).ok_or_else(|| {
+        Error::internal_error().with_data("document range is not representable by LSP")
+    })?;
+
     Ok(Some(vec![TextEdit {
-        range: doc.mapper.all_range().into_lsp(),
+        range,
         new_text: taplo::formatter::format_with_path_scopes(
             doc.dom.clone(),
             format_opts,

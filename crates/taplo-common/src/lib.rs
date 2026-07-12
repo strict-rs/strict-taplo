@@ -21,6 +21,9 @@ pub mod log;
 pub mod schema;
 pub mod util;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub type HashMap<K, V> = std::collections::HashMap<K, V, ahash::RandomState>;
 pub type IndexMap<K, V> = indexmap::IndexMap<K, V, ahash::RandomState>;
 

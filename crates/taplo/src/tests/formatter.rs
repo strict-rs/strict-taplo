@@ -1,4 +1,5 @@
 use difference::Changeset;
+use strict_test_support::{ensure_contains, ensure_eq, TestFailure};
 
 use crate::formatter::{self, Options, OptionsIncomplete};
 
@@ -9,6 +10,50 @@ macro_rules! assert_format {
             panic!("invalid formatting");
         }
     };
+}
+
+#[test]
+fn retained_value_syntax_drives_only_overwidth_array_expansion() -> Result<(), TestFailure> {
+    let options = Options {
+        array_auto_collapse: false,
+        array_auto_expand: true,
+        column_width: 24,
+        ..Options::default()
+    };
+    let expanded = formatter::format("long_key = [1, 2, 3, 4, 5]\n", options.clone());
+    ensure_eq(
+        &expanded.as_str(),
+        &"long_key = [\n  1,\n  2,\n  3,\n  4,\n  5,\n]\n",
+        "an over-width array must be reformatted from its retained value node",
+    )?;
+
+    let compact = formatter::format("key = [1, 2]\n", options);
+    ensure_eq(
+        &compact.as_str(),
+        &"key = [1, 2]\n",
+        "the equivalent short array must remain compact",
+    )
+}
+
+#[test]
+fn malformed_entry_without_value_is_preserved_tolerantly() -> Result<(), TestFailure> {
+    let formatted = formatter::format(
+        "missing =\nnext = 1\n",
+        Options {
+            column_width: 1,
+            ..Options::default()
+        },
+    );
+    ensure_contains(
+        &formatted,
+        "missing =",
+        "a malformed entry without a value node must retain its source text",
+    )?;
+    ensure_contains(
+        &formatted,
+        "next = 1",
+        "forced multiline handling must not consume the following valid entry",
+    )
 }
 
 #[test]

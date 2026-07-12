@@ -8,14 +8,3 @@ macro_rules! with_node {
         }
     };
 }
-
-macro_rules! whitelisted {
-    ($self:expr, $kind:ident, $($content:tt)*) => {
-        {
-            $self.whitelist_token($kind);
-            let res = $($content)*;
-            $self.blacklist_token($kind);
-            res
-        }
-    };
-}

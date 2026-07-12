@@ -4,23 +4,29 @@ use super::{
 };
 use crate::{dom, syntax::SyntaxKind};
 use rowan::TextRange;
-use std::{ops::Range, sync::Arc};
+use std::{cmp::Reverse, ops::Range, sync::Arc};
 use thiserror::Error;
 
 #[derive(Debug)]
 pub struct Rewrite {
     root: Node,
+    source: String,
     patches: Vec<PendingPatch>,
 }
 
 impl Rewrite {
     pub fn new(root: Node) -> Result<Self, Error> {
-        if !matches!(root.syntax().map(|s| s.kind()), Some(SyntaxKind::ROOT)) {
+        let Some(syntax) = root.syntax().and_then(|syntax| syntax.as_node()) else {
+            return Err(Error::RootNodeExpected);
+        };
+        if syntax.kind() != SyntaxKind::ROOT {
             return Err(Error::RootNodeExpected);
         }
+        let source = syntax.to_string();
 
         Ok(Self {
             root,
+            source,
             patches: Default::default(),
         })
     }
@@ -51,7 +57,7 @@ impl Rewrite {
         }
 
         self.patches
-            .sort_by(|a, b| b.range.start().cmp(&a.range.start()));
+            .sort_by_key(|patch| Reverse(patch.range.start()));
 
         Ok(self)
     }
@@ -86,12 +92,15 @@ impl Rewrite {
 
 impl core::fmt::Display for Rewrite {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut s = self.root.syntax().unwrap().to_string();
+        let mut s = self.source.clone();
 
         for patch in &self.patches {
             match &patch.kind {
                 PendingPatchKind::Replace(to) => {
-                    s.replace_range(std_range(patch.range), to);
+                    let Some(range) = std_range(patch.range) else {
+                        return Err(std::fmt::Error);
+                    };
+                    s.replace_range(range, to);
                 }
             }
         }
@@ -129,19 +138,32 @@ pub enum Error {
     Dom(#[from] dom::error::Error),
 }
 
-fn std_range(range: TextRange) -> Range<usize> {
-    let start: usize = u32::from(range.start()) as usize;
-    let end: usize = u32::from(range.end()) as usize;
-    start..end
+fn std_range(range: TextRange) -> Option<Range<usize>> {
+    let start = usize::try_from(u32::from(range.start())).ok()?;
+    let end = usize::try_from(u32::from(range.end())).ok()?;
+    Some(start..end)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Rewrite;
+    use super::{Error, Rewrite};
     use crate::parser::parse;
+    use strict_test_support::{ensure, ensure_eq, ensure_ok, TestFailure};
+
+    fn rewrite(source: &str) -> Result<Rewrite, TestFailure> {
+        let parsed = parse(source);
+        ensure(
+            parsed.errors.is_empty(),
+            "the rewrite fixture must parse cleanly",
+        )?;
+        ensure_ok(
+            Rewrite::new(parsed.into_dom()),
+            "a parsed document root must be rewriteable",
+        )
+    }
 
     #[test]
-    fn rename_keys() {
+    fn rename_keys() -> Result<(), TestFailure> {
         let toml = r#"
 [table.middle.inner]
 [table.middle.inner.inner]
@@ -152,24 +174,35 @@ mod tests {
 [table_new.middle_new.inner_new.inner2_new]
 "#;
 
-        let root = parse(toml).into_dom();
+        let mut patches = rewrite(toml)?;
 
-        let mut patches = Rewrite::new(root).unwrap();
+        ensure_ok(
+            patches.rename_keys("table", "table_new"),
+            "the outer key must be renameable",
+        )?;
+        ensure_ok(
+            patches.rename_keys("table.middle", "middle_new"),
+            "the middle key must be renameable",
+        )?;
+        ensure_ok(
+            patches.rename_keys("table.middle.inner", "inner_new"),
+            "the inner key must be renameable",
+        )?;
+        ensure_ok(
+            patches.rename_keys("table.middle.inner.inner", "inner2_new"),
+            "the deepest key must be renameable",
+        )?;
 
-        patches.rename_keys("table", "table_new").unwrap();
-        patches.rename_keys("table.middle", "middle_new").unwrap();
-        patches
-            .rename_keys("table.middle.inner", "inner_new")
-            .unwrap();
-        patches
-            .rename_keys("table.middle.inner.inner", "inner2_new")
-            .unwrap();
-
-        assert_eq!(expected_toml, patches.to_string());
+        let rendered = patches.to_string();
+        ensure_eq(
+            &rendered.as_str(),
+            &expected_toml,
+            "different-length replacements must render in descending source order",
+        )
     }
 
     #[test]
-    fn rename_keys_array_of_tables() {
+    fn rename_keys_array_of_tables() -> Result<(), TestFailure> {
         let toml = r#"
 [[table.middle.inner]]
 [[table.middle.inner]]
@@ -182,19 +215,60 @@ mod tests {
 [table_new.middle_new.inner_new.inner2_new]
 "#;
 
-        let root = parse(toml).into_dom();
+        let mut patches = rewrite(toml)?;
 
-        let mut patches = Rewrite::new(root).unwrap();
+        ensure_ok(
+            patches.rename_keys("table", "table_new"),
+            "the array-table root key must be renameable",
+        )?;
+        ensure_ok(
+            patches.rename_keys("table.middle", "middle_new"),
+            "the array-table middle key must be renameable",
+        )?;
+        ensure_ok(
+            patches.rename_keys("table.middle.inner", "inner_new"),
+            "the array-table inner key must be renameable",
+        )?;
+        ensure_ok(
+            patches.rename_keys("table.middle.inner.*.inner", "inner2_new"),
+            "the nested array-table key must be renameable",
+        )?;
 
-        patches.rename_keys("table", "table_new").unwrap();
-        patches.rename_keys("table.middle", "middle_new").unwrap();
-        patches
-            .rename_keys("table.middle.inner", "inner_new")
-            .unwrap();
-        patches
-            .rename_keys("table.middle.inner.*.inner", "inner2_new")
-            .unwrap();
+        let rendered = patches.to_string();
+        ensure_eq(
+            &rendered.as_str(),
+            &expected_toml,
+            "all matching array-table ranges must be rewritten",
+        )
+    }
 
-        assert_eq!(expected_toml, patches.to_string());
+    #[test]
+    fn overlapping_replacements_are_rejected() -> Result<(), TestFailure> {
+        let mut patches = rewrite("[table]\nvalue = 1\n")?;
+        ensure_ok(
+            patches.rename_keys("table", "first"),
+            "the first replacement must be accepted",
+        )?;
+        ensure(
+            matches!(patches.rename_keys("table", "second"), Err(Error::Overlap)),
+            "a second replacement over the same source range must be rejected",
+        )
+    }
+
+    #[test]
+    fn non_root_nodes_are_rejected() -> Result<(), TestFailure> {
+        let parsed = parse("value = 1");
+        ensure(
+            parsed.errors.is_empty(),
+            "the non-root fixture must parse cleanly",
+        )?;
+        let value = ensure_ok(
+            parsed.into_dom().try_get("value"),
+            "the fixture value must exist",
+        )?;
+        ensure(
+            matches!(Rewrite::new(value), Err(Error::RootNodeExpected)),
+            "only a root syntax node may own a rewrite",
+        )
     }
 }

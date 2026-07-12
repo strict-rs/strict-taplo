@@ -38,6 +38,7 @@ assert-json-diff = { workspace = true }
 criterion        = { workspace = true }   # criterion -> clap
 difference       = { workspace = true }
 serde_json       = { workspace = true }
+strict-test-support = { workspace = true }
 toml             = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]

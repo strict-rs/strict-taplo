@@ -8,6 +8,7 @@ use futures::{
     SinkExt, Stream, StreamExt,
 };
 use lsp_types::NumberOrString;
+use std::io;
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     select,
@@ -43,14 +44,20 @@ impl<W: Clone + 'static> Server<W> {
                                 )))
                                 .with_method("shutdown")
                                 .into_message(),
-                            output.clone().sink_map_err(|e| panic!("{}", e)),
+                            output.clone().sink_map_err(|error| {
+                                io::Error::new(io::ErrorKind::BrokenPipe, error.to_string())
+                            }),
                         );
 
                         select!{
                             _ = shutdown_signals.next() => {
                                 tracing::warn!("shut down forcibly");
                             },
-                            _ = task_fut => {}
+                            result = task_fut => {
+                                if let Err(error) = result {
+                                    tracing::error!(%error, "external shutdown dispatch failed");
+                                }
+                            }
                         }
 
                         drop(output);
@@ -69,7 +76,9 @@ impl<W: Clone + 'static> Server<W> {
                                 let task_fut = self.handle_message(
                                     world.clone(),
                                     msg,
-                                    output.clone().sink_map_err(|e| panic!("{}", e)),
+                                    output.clone().sink_map_err(|error| {
+                                        io::Error::new(io::ErrorKind::BrokenPipe, error.to_string())
+                                    }),
                                 );
 
                                 tokio::task::spawn_local(async move {

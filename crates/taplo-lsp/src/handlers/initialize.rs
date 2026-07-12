@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use super::{semantic_tokens, update_configuration};
 use crate::config::InitConfig;
-use crate::world::WorkspaceState;
+use crate::world::send_association_notifications;
 use crate::World;
 use lsp_async_stub::{rpc::Error, Context, Params};
 use lsp_types::{
@@ -32,25 +32,33 @@ pub async fn initialize<E: Environment>(
     }
 
     if let Some(workspaces) = p.workspace_folders {
-        let mut wss = context.workspaces.write().await;
         let init_config = context.init_config.load();
+        let mut notifications = Vec::new();
 
         for workspace in workspaces {
             let Some(ws_url) = crate::uri::to_url(&workspace.uri) else {
                 continue;
             };
-            let ws = wss
-                .entry(ws_url.clone())
-                .or_insert(WorkspaceState::new(context.env.clone(), ws_url));
-
-            ws.schemas
+            let (workspace, _) = context.add_workspace_root(ws_url).await;
+            let mut workspace = workspace.write().await;
+            workspace
+                .schemas
                 .cache()
                 .set_cache_path(init_config.cache_path.clone());
-
-            if let Err(error) = ws.initialize(context.clone(), &context.env).await {
-                tracing::error!(?error, "failed to initialize workspace");
+            match workspace
+                .initialize(&context.env, &context.default_config.load())
+                .await
+            {
+                Ok(mut current) => notifications.append(&mut current),
+                Err(error) => tracing::error!(?error, "failed to initialize workspace"),
             }
         }
+        let notification_context = context.clone();
+        context
+            .defer(async move {
+                send_association_notifications(notification_context, notifications).await;
+            })
+            .await;
     }
 
     Ok(InitializeResult {

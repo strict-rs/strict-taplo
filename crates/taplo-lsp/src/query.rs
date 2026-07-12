@@ -6,7 +6,7 @@ use taplo::{
         FromSyntax, KeyOrIndex, Keys, Node,
     },
     rowan::{Direction, TextRange, TextSize},
-    syntax::{SyntaxKind::*, SyntaxNode, SyntaxToken},
+    syntax::{SyntaxElement, SyntaxKind::*, SyntaxNode, SyntaxToken},
     util::join_ranges,
 };
 
@@ -22,17 +22,22 @@ pub struct Query {
 
 impl Query {
     /// Query a DOM root with the given cursor offset.
-    /// Returns [`None`] if the position is out of range.
     ///
-    /// # Panics
-    ///
-    /// Panics if the DOM was not entirely constructed from a syntax tree (e.g. if a node has no associated syntax element).
-    /// Also panics if the given DOM node is not root.
-    ///
-    /// Also the given offset must be within the tree.
+    /// Syntaxless/non-root DOM values and offsets outside the syntax tree produce an empty query.
     #[must_use]
     pub fn at(root: &Node, offset: TextSize) -> Self {
-        let syntax = root.syntax().cloned().unwrap().into_node().unwrap();
+        let Some(syntax) = root.syntax().cloned().and_then(SyntaxElement::into_node) else {
+            return Self {
+                offset,
+                ..Self::default()
+            };
+        };
+        if syntax.kind() != ROOT || offset > syntax.text_range().end() {
+            return Self {
+                offset,
+                ..Self::default()
+            };
+        }
 
         Query {
             offset,
@@ -69,6 +74,22 @@ impl Query {
 }
 
 impl Query {
+    /// Select the first cursor-adjacent position matching `predicate`, preferring `before`.
+    #[must_use]
+    pub fn first_matching(
+        &self,
+        predicate: impl Fn(&PositionInfo) -> bool,
+    ) -> Option<&PositionInfo> {
+        self.before
+            .as_ref()
+            .filter(|position| predicate(position))
+            .or_else(|| {
+                self.after
+                    .as_ref()
+                    .filter(|position| predicate(position))
+            })
+    }
+
     #[must_use]
     pub fn in_table_header(&self) -> bool {
         match (&self.before, &self.after) {
@@ -180,32 +201,37 @@ impl Query {
 
     #[must_use]
     pub fn entry_key(&self) -> Option<SyntaxNode> {
-        let syntax = match self.before.as_ref().or(self.after.as_ref()) {
-            Some(p) => &p.syntax,
-            None => return None,
-        };
-
-        let keys = syntax
-            .parent_ancestors()
-            .find(|n| n.kind() == ENTRY)
-            .and_then(|entry| entry.children().find(|c| c.kind() == KEY))?;
-
-        Some(keys)
+        self.entry_child(KEY)
     }
 
     #[must_use]
     pub fn entry_value(&self) -> Option<SyntaxNode> {
-        let syntax = match self.before.as_ref().or(self.after.as_ref()) {
-            Some(p) => &p.syntax,
-            None => return None,
-        };
+        self.entry_child(VALUE)
+    }
 
-        let value = syntax
+    /// Find a child of the cursor's nearest entry.
+    fn entry_child(&self, kind: taplo::syntax::SyntaxKind) -> Option<SyntaxNode> {
+        let syntax = &self.before.as_ref().or(self.after.as_ref())?.syntax;
+        syntax
             .parent_ancestors()
             .find(|n| n.kind() == ENTRY)
-            .and_then(|entry| entry.children().find(|c| c.kind() == VALUE))?;
+            .and_then(|entry| entry.children().find(|child| child.kind() == kind))
+    }
 
-        Some(value)
+    /// Return an identifier token's zero-based segment index within its table header.
+    #[must_use]
+    pub fn header_identifier_index(&self, token: &SyntaxToken) -> Option<usize> {
+        if token.kind() != IDENT {
+            return None;
+        }
+        let header = token
+            .parent_ancestors()
+            .find(|node| matches!(node.kind(), TABLE_HEADER | TABLE_ARRAY_HEADER))?;
+        let key = header.descendants().find(|node| node.kind() == KEY)?;
+        key.descendants_with_tokens()
+            .filter_map(SyntaxElement::into_token)
+            .filter(|candidate| candidate.kind() == IDENT)
+            .position(|candidate| candidate == *token)
     }
 
     #[must_use]
@@ -215,11 +241,10 @@ impl Query {
             None => return (Keys::empty(), root.clone()),
         };
 
-        let last_header = root
-            .syntax()
-            .unwrap()
-            .as_node()
-            .unwrap()
+        let Some(root_syntax) = root.syntax().and_then(|syntax| syntax.as_node()) else {
+            return (Keys::empty(), root.clone());
+        };
+        let last_header = root_syntax
             .descendants()
             .skip(1)
             .filter(|n| matches!(n.kind(), TABLE_HEADER | TABLE_ARRAY_HEADER))
@@ -230,14 +255,13 @@ impl Query {
             return (Keys::empty(), root.clone());
         };
 
-        let keys = Keys::from_syntax(
-            last_header
-                .descendants()
-                .find(|n| n.kind() == KEY)
-                .unwrap()
-                .into(),
-        );
-        let node = root.path(&keys).unwrap();
+        let Some(key_syntax) = last_header.descendants().find(|node| node.kind() == KEY) else {
+            return (Keys::empty(), root.clone());
+        };
+        let keys = Keys::from_syntax(key_syntax.into());
+        let Some(node) = root.path(&keys) else {
+            return (Keys::empty(), root.clone());
+        };
 
         (keys, node)
     }
@@ -464,4 +488,184 @@ fn full_range(keys: &Keys, node: &Node) -> TextRange {
     };
 
     join_ranges(last_key.chain(node.text_ranges(true)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Query;
+    use strict_test_support::{ensure, ensure_eq, ensure_ok, ensure_some, TestFailure};
+    use taplo::{
+        dom::{node::DomNode, Node},
+        rowan::{TextSize, TokenAtOffset},
+        syntax::SyntaxKind::{BOOL, IDENT, INTEGER, PERIOD},
+    };
+
+    /// Parse one source fixture into its tolerant DOM.
+    fn dom(source: &str) -> Node {
+        taplo::parser::parse(source).into_dom()
+    }
+
+    #[test]
+    fn cursor_selection_prefers_before_then_falls_back_after() -> Result<(), TestFailure> {
+        let before_dom = dom("key = 1\n");
+        let before_query = Query::at(&before_dom, TextSize::from(3));
+        let before = ensure_some(
+            before_query.first_matching(|position| position.syntax.kind() == IDENT),
+            "an identifier immediately before the cursor must match",
+        )?;
+        ensure_eq(
+            &before.syntax.text(),
+            &"key",
+            "the before candidate must take precedence",
+        )?;
+
+        let after_dom = dom(" key = 1\n");
+        let after_query = Query::at(&after_dom, TextSize::from(1));
+        ensure(
+            after_query
+                .before
+                .as_ref()
+                .is_some_and(|position| position.syntax.kind() != IDENT),
+            "the fallback fixture must have a nonmatching before token",
+        )?;
+        let after = ensure_some(
+            after_query.first_matching(|position| position.syntax.kind() == IDENT),
+            "a matching after token must be selected when before does not match",
+        )?;
+        ensure_eq(
+            &after.syntax.text(),
+            &"key",
+            "the after candidate must retain its identifier",
+        )?;
+        ensure(
+            after_query
+                .first_matching(|position| position.syntax.kind() == BOOL)
+                .is_none(),
+            "cursor-adjacent nonboolean syntax must produce no boolean candidate",
+        )
+    }
+
+    #[test]
+    fn entry_lookup_and_header_identifier_index_are_total() -> Result<(), TestFailure> {
+        let entry_dom = dom("alpha = 1\n");
+        let entry_query = Query::at(&entry_dom, TextSize::from(8));
+        let key = ensure_some(entry_query.entry_key(), "an entry query must find its key")?;
+        let value = ensure_some(entry_query.entry_value(), "an entry query must find its value")?;
+        ensure(
+            key.kind() == taplo::syntax::SyntaxKind::KEY,
+            "the entry key helper must return the key node rather than an identifier token",
+        )?;
+        ensure_eq(
+            &entry_query.entry_keys().to_string().as_str(),
+            &"alpha",
+            "entry keys must normalize layout trivia away",
+        )?;
+        ensure_eq(
+            &value.to_string().trim(),
+            &"1",
+            "entry value child text must retain its primitive value",
+        )?;
+
+        let header_dom = dom("[alpha.beta]\n");
+        let header_query = Query::at(&header_dom, TextSize::from(8));
+        let beta = ensure_some(
+            header_query.first_matching(|position| position.syntax.text() == "beta"),
+            "the dotted header fixture must expose its second identifier",
+        )?;
+        ensure(
+            header_query.header_identifier_index(&beta.syntax) == Some(1),
+            "the second dotted identifier must have index one",
+        )?;
+
+        let header_syntax = ensure_some(
+            header_dom.syntax().and_then(|syntax| syntax.as_node()),
+            "the parsed header must retain root syntax",
+        )?;
+        let period = ensure_some(
+            header_syntax
+                .descendants_with_tokens()
+                .filter_map(taplo::syntax::SyntaxElement::into_token)
+                .find(|token| token.kind() == PERIOD),
+            "the dotted header must contain a period token",
+        )?;
+        ensure(
+            header_query.header_identifier_index(&period).is_none(),
+            "a nonidentifier header token must not receive a segment index",
+        )?;
+
+        let entry_syntax = ensure_some(
+            entry_dom.syntax().and_then(|syntax| syntax.as_node()),
+            "the parsed entry must retain root syntax",
+        )?;
+        let entry_identifier = match entry_syntax.token_at_offset(TextSize::from(1)) {
+            TokenAtOffset::Single(token) | TokenAtOffset::Between(_, token) => Some(token),
+            TokenAtOffset::None => None,
+        };
+        ensure(
+            ensure_some(entry_identifier, "the entry identifier must be addressable")?
+                .kind()
+                == IDENT,
+            "the out-of-header fixture must use an identifier token",
+        )?;
+        ensure(
+            header_query
+                .header_identifier_index(&ensure_some(
+                    match entry_syntax.token_at_offset(TextSize::from(1)) {
+                        TokenAtOffset::Single(token) | TokenAtOffset::Between(_, token) => {
+                            Some(token)
+                        }
+                        TokenAtOffset::None => None,
+                    },
+                    "the entry identifier must remain addressable",
+                )?)
+                .is_none(),
+            "an identifier outside a table header must not receive a header index",
+        )?;
+
+        let outside_entry = Query::at(&header_dom, TextSize::from(2));
+        ensure(
+            outside_entry.entry_key().is_none() && outside_entry.entry_value().is_none(),
+            "a table header query must not invent entry children",
+        )?;
+        ensure(
+            value.kind() == taplo::syntax::SyntaxKind::VALUE,
+            "the entry value helper must return the value node rather than its primitive token",
+        )?;
+        ensure(
+            entry_query
+                .first_matching(|position| position.syntax.kind() == INTEGER)
+                .is_some(),
+            "the value-side cursor must still expose its integer token",
+        )
+    }
+
+    #[test]
+    fn syntaxless_and_out_of_range_queries_return_empty_fallbacks() -> Result<(), TestFailure> {
+        let syntaxless: Node = ensure_ok(
+            serde_json::from_value(serde_json::json!({ "value": 1 })),
+            "the syntaxless DOM fixture must deserialize",
+        )?;
+        let syntaxless_query = Query::at(&syntaxless, TextSize::from(0));
+        ensure(
+            syntaxless_query.before.is_none() && syntaxless_query.after.is_none(),
+            "syntaxless DOM input must return an empty query",
+        )?;
+        let (keys, parent) = syntaxless_query.parent_table_or_array_table(&syntaxless);
+        ensure(keys.is_empty(), "syntaxless parent lookup must use empty keys")?;
+        ensure_eq(
+            &ensure_ok(
+                serde_json::to_value(parent),
+                "the fallback parent DOM must serialize",
+            )?,
+            &serde_json::json!({ "value": 1 }),
+            "syntaxless parent lookup must return the supplied root",
+        )?;
+
+        let parsed = dom("value = 1\n");
+        let outside = Query::at(&parsed, TextSize::new(u32::MAX));
+        ensure(
+            outside.before.is_none() && outside.after.is_none(),
+            "an unusable offset must return an empty query instead of panicking",
+        )
+    }
 }

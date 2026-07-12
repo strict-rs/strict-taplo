@@ -1,5 +1,10 @@
+//! Workspace-folder topology updates with open-document redistribution.
+
 use super::update_configuration;
-use crate::world::{WorkspaceState, World};
+use crate::{
+    diagnostics,
+    world::{send_association_notifications, World},
+};
 use lsp_async_stub::{Context, Params};
 use lsp_types::DidChangeWorkspaceFoldersParams;
 use taplo_common::environment::Environment;
@@ -8,37 +13,47 @@ pub async fn workspace_change<E: Environment>(
     context: Context<World<E>>,
     params: Params<DidChangeWorkspaceFoldersParams>,
 ) {
-    let p = match params.optional() {
-        None => return,
-        Some(p) => p,
+    let Some(params) = params.optional() else {
+        return;
     };
+    let mut moved_documents = Vec::new();
 
-    let mut workspaces = context.workspaces.write().await;
-    let init_config = context.init_config.load();
-
-    for removed in p.event.removed {
-        if let Some(url) = crate::uri::to_url(&removed.uri) {
-            workspaces.shift_remove(&url);
-        }
-    }
-
-    for added in p.event.added {
-        let Some(added_url) = crate::uri::to_url(&added.uri) else {
+    for removed in params.event.removed {
+        let Some(root) = crate::uri::to_url(&removed.uri) else {
             continue;
         };
-        let ws = workspaces
-            .entry(added_url.clone())
-            .or_insert(WorkspaceState::new(context.env.clone(), added_url));
+        moved_documents.extend(context.remove_workspace_root(&root).await);
+    }
 
-        ws.schemas
+    let init_config = context.init_config.load_full();
+    let default_config = context.default_config.load_full();
+    let mut notifications = Vec::new();
+    for added in params.event.added {
+        let Some(root) = crate::uri::to_url(&added.uri) else {
+            continue;
+        };
+        let (workspace, moved) = context.add_workspace_root(root).await;
+        moved_documents.extend(moved);
+        let mut workspace = workspace.write().await;
+        workspace
+            .schemas
             .cache()
             .set_cache_path(init_config.cache_path.clone());
-
-        if let Err(error) = ws.initialize(context.clone(), &context.env).await {
-            tracing::error!(?error, "failed to initialize workspace");
+        match workspace.initialize(&context.env, &default_config).await {
+            Ok(mut current) => notifications.append(&mut current),
+            Err(error) => tracing::error!(%error, "failed to initialize workspace"),
         }
     }
 
-    drop(workspaces);
+    for handle in context.all_workspace_handles().await {
+        notifications.extend(handle.read().await.association_notifications());
+    }
+    send_association_notifications(context.clone(), notifications).await;
+    moved_documents.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    moved_documents.dedup();
+    for document in moved_documents {
+        diagnostics::publish_diagnostics(context.clone(), document).await;
+    }
+
     update_configuration(context).await;
 }

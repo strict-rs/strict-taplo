@@ -5,7 +5,10 @@ use serde_json::Value;
 use std::path::PathBuf;
 use taplo_common::{
     config::Rule,
-    schema::{associations::DEFAULT_CATALOGS, cache::DEFAULT_LRU_CACHE_EXPIRATION_TIME},
+    schema::{
+        associations::DEFAULT_CATALOGS,
+        cache::{DEFAULT_CACHE_EXPIRATION_TIME, DEFAULT_LRU_CACHE_EXPIRATION_TIME},
+    },
     HashMap,
 };
 
@@ -94,7 +97,13 @@ impl Default for SchemaConfig {
             associations: Default::default(),
             catalogs: DEFAULT_CATALOGS
                 .iter()
-                .map(|c| c.parse().unwrap())
+                .filter_map(|catalog| match catalog.parse() {
+                    Ok(url) => Some(url),
+                    Err(error) => {
+                        tracing::error!(%error, %catalog, "invalid built-in schema catalog URL");
+                        None
+                    }
+                })
                 .collect(),
             links: false,
             cache: Default::default(),
@@ -113,7 +122,7 @@ impl Default for SchemaCacheConfig {
     fn default() -> Self {
         Self {
             memory_expiration: DEFAULT_LRU_CACHE_EXPIRATION_TIME.as_secs(),
-            disk_expiration: DEFAULT_LRU_CACHE_EXPIRATION_TIME.as_secs(),
+            disk_expiration: DEFAULT_CACHE_EXPIRATION_TIME.as_secs(),
         }
     }
 }

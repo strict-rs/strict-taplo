@@ -1,9 +1,9 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use taplo::{
-    dom::Node,
-    formatter::{format, format_syntax, Options},
-    parser::parse,
-};
+use criterion::{criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
+use taplo::{formatter::{format, format_syntax, Options}, parser::parse};
+
+#[cfg(feature = "serde")]
+use taplo::dom::Node;
 
 pub fn parsing(c: &mut Criterion) {
     let source = include_str!("../../../test-data/example.toml");
@@ -33,6 +33,7 @@ pub fn formatting(c: &mut Criterion) {
     });
 }
 
+#[cfg(feature = "serde")]
 pub fn conversion(c: &mut Criterion) {
     let source = include_str!("../../../test-data/example.toml");
     let v: serde_json::Value = toml::from_str(source).unwrap();
@@ -46,5 +47,8 @@ pub fn conversion(c: &mut Criterion) {
     });
 }
 
+#[cfg(feature = "serde")]
 criterion_group!(benches, parsing, formatting, conversion);
+#[cfg(not(feature = "serde"))]
+criterion_group!(benches, parsing, formatting);
 criterion_main!(benches);

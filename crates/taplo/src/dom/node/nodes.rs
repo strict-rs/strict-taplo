@@ -87,10 +87,10 @@ impl Table {
     pub(crate) fn add_entry(&self, key: Key, node: Node) {
         self.inner.entries.update(|entries| {
             if let Some((existing_key, value)) = entries.lookup.get_key_value(&key) {
-                // Merge the two pseudo-tables together.
-                if let (Node::Table(existing_table), Node::Table(new_table)) = (value, &node) {
-                    if existing_table.inner.kind == TableKind::Pseudo
-                        && new_table.inner.kind == TableKind::Pseudo
+                match (value, &node) {
+                    (Node::Table(existing_table), Node::Table(new_table))
+                        if existing_table.inner.kind == TableKind::Pseudo
+                            && new_table.inner.kind == TableKind::Pseudo =>
                     {
                         let new_entries = new_table.entries().read();
                         for (k, n) in new_entries.iter() {
@@ -104,6 +104,7 @@ impl Table {
                         }
                         return;
                     }
+                    _ => {}
                 }
 
                 self.inner.errors.update(|errors| {
@@ -773,5 +774,141 @@ impl Invalid {
         } else {
             Err(self.errors())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Key, Node};
+    use crate::{
+        dom::{error::Error, node::DomNode, Keys},
+        parser::parse,
+    };
+    use strict_test_support::{ensure, ensure_eq, ensure_ok, ensure_some, TestFailure};
+
+    fn clean_dom(source: &str) -> Result<Node, TestFailure> {
+        let parsed = parse(source);
+        ensure(
+            parsed.errors.is_empty(),
+            "the DOM insertion fixture must parse cleanly",
+        )?;
+        Ok(parsed.into_dom())
+    }
+
+    fn path(root: &Node, dotted: &str) -> Result<Node, TestFailure> {
+        let keys = ensure_ok(
+            dotted.parse::<Keys>(),
+            "the test path must be valid dotted keys",
+        )?;
+        ensure_some(root.path(&keys), "the expected DOM path must exist")
+    }
+
+    fn conflict_count(root: &Node) -> usize {
+        match root.validate() {
+            Ok(()) => 0,
+            Err(errors) => errors
+                .filter(|error| matches!(error, Error::ConflictingKeys { .. }))
+                .count(),
+        }
+    }
+
+    #[test]
+    fn shared_pseudo_tables_merge_entries_and_source_ranges() -> Result<(), TestFailure> {
+        let root = clean_dom("a.b.c = 1\na.b.d = 2\n")?;
+        ensure(
+            matches!(path(&root, "a.b.c")?, Node::Integer(_)),
+            "the first dotted-key leaf must survive the pseudo-table merge",
+        )?;
+        ensure(
+            matches!(path(&root, "a.b.d")?, Node::Integer(_)),
+            "the second dotted-key leaf must survive the pseudo-table merge",
+        )?;
+
+        let Node::Table(root_table) = &root else {
+            return ensure(false, "a parsed document root must be a table");
+        };
+        let entries = root_table.entries().read();
+        let root_key = ensure_some(
+            entries.iter().next().map(|(key, _)| key),
+            "the root pseudo-table key must exist",
+        )?;
+        ensure_eq(
+            &root_key.text_ranges().count(),
+            &2,
+            "the shared root key must retain both source occurrences",
+        )?;
+
+        let Node::Table(a_table) = path(&root, "a")? else {
+            return ensure(false, "the shared root path must remain a table");
+        };
+        let a_entries = a_table.entries().read();
+        let b_key = ensure_some(
+            a_entries.iter().next().map(|(key, _)| key),
+            "the nested pseudo-table key must exist",
+        )?;
+        ensure_eq(
+            &b_key.text_ranges().count(),
+            &2,
+            "the shared nested key must retain both source occurrences",
+        )?;
+        ensure_eq(
+            &conflict_count(&root),
+            &0,
+            "compatible pseudo tables must not create conflicts",
+        )
+    }
+
+    #[test]
+    fn incompatible_collisions_report_conflicts_and_keep_history() -> Result<(), TestFailure> {
+        let value_one = path(&clean_dom("a = 1\n")?, "a")?;
+        let value_two = path(&clean_dom("a = 2\n")?, "a")?;
+        let pseudo_table = path(&clean_dom("a.b = 1\n")?, "a")?;
+        let regular_table = path(&clean_dom("[a]\n")?, "a")?;
+
+        for (existing, incoming) in [
+            (pseudo_table.clone(), value_two.clone()),
+            (regular_table, value_two.clone()),
+            (value_one, value_two),
+        ] {
+            let Node::Table(root_table) = clean_dom("")? else {
+                return ensure(false, "an empty document root must be a table");
+            };
+            root_table.add_entry(Key::new("collision"), existing);
+            root_table.add_entry(Key::new("collision"), incoming.clone());
+            let root = Node::Table(root_table.clone());
+            ensure(
+                conflict_count(&root) > 0,
+                "every incompatible collision kind must report a key conflict",
+            )?;
+            ensure_eq(
+                &root_table.entries().read().len(),
+                &2,
+                "replacement must retain insertion history alongside the lookup winner",
+            )?;
+            let incoming_syntax = incoming.syntax().map(ToString::to_string);
+            let lookup_syntax = root_table
+                .get("collision")
+                .and_then(|node| node.syntax().map(ToString::to_string));
+            ensure(
+                lookup_syntax == incoming_syntax,
+                "the incoming value must become the lookup winner",
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn nonconflicting_insertion_is_clean() -> Result<(), TestFailure> {
+        let root = clean_dom("a = 1\nb = 2\n")?;
+        ensure_eq(
+            &conflict_count(&root),
+            &0,
+            "distinct keys must not create a conflict",
+        )?;
+        ensure(
+            matches!(path(&root, "a")?, Node::Integer(_))
+                && matches!(path(&root, "b")?, Node::Integer(_)),
+            "both distinct entries must remain addressable",
+        )
     }
 }

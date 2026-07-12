@@ -1,10 +1,10 @@
-use crate::environment::WasmEnvironment;
+use crate::environment::{js_io_error, WasmEnvironment};
 use futures::Sink;
 use js_sys::Function;
 use lsp_async_stub::{rpc, Server};
 use std::{io, sync::Arc};
 use taplo_lsp::world::WorldState;
-use wasm_bindgen::prelude::*;
+use wasm_bindgen::{prelude::*, JsCast};
 use wasm_bindgen_futures::spawn_local;
 
 #[wasm_bindgen]
@@ -35,15 +35,15 @@ impl TaploWasmLsp {
 
 #[derive(Clone)]
 pub(crate) struct WasmLspInterface {
-    js_on_message: Function,
+    js_on_message: Option<Function>,
 }
 
 impl From<JsValue> for WasmLspInterface {
     fn from(val: JsValue) -> Self {
         Self {
             js_on_message: js_sys::Reflect::get(&val, &JsValue::from_str("js_on_message"))
-                .unwrap()
-                .into(),
+                .ok()
+                .and_then(|callback| callback.dyn_into().ok()),
         }
     }
 }
@@ -62,10 +62,16 @@ impl Sink<rpc::Message> for WasmLspInterface {
         self: std::pin::Pin<&mut Self>,
         message: rpc::Message,
     ) -> Result<(), Self::Error> {
+        let callback = self.js_on_message.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "lsp interface does not provide a callable js_on_message",
+            )
+        })?;
+        let message = serde_wasm_bindgen::to_value(&message)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let this = JsValue::null();
-        self.js_on_message
-            .call1(&this, &serde_wasm_bindgen::to_value(&message).unwrap())
-            .unwrap();
+        callback.call1(&this, &message).map_err(js_io_error)?;
         Ok(())
     }
 

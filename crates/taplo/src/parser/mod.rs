@@ -7,7 +7,6 @@ use crate::{
 };
 use logos::{Lexer, Logos};
 use rowan::{GreenNode, GreenNodeBuilder, TextRange, TextSize};
-use std::convert::TryInto;
 
 #[macro_use]
 mod macros;
@@ -24,7 +23,7 @@ pub struct Error {
 
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} ({:?})", &self.message, &self.range)
+        write!(f, "{} ({:?})", self.message, self.range)
     }
 }
 impl std::error::Error for Error {}
@@ -53,21 +52,8 @@ pub(crate) struct Parser<'p> {
     key_pattern_syntax: bool,
     current_token: Option<SyntaxKind>,
 
-    // These tokens are not consumed on errors.
-    //
-    // The syntax error is still reported,
-    // but the the surrounding context can still
-    // be parsed.
-    // FIXME(bit_flags):
-    //      This is VERY wrong, as the members of the
-    //      enums are not proper bit flags.
-    //
-    //      However this incorrect behavior marks fewer tokens
-    //      as errors making the parser more fault-tolerant.
-    //      Instead of fixing this it would probably be better to
-    //      remove the ERROR token altogether, or reserving it for
-    //      special cases.
-    error_whitelist: u16,
+    /// Tokens that delimit the active recovery scopes and must not be consumed by a first error.
+    recovery_tokens: Vec<SyntaxKind>,
 
     lexer: Lexer<'p, SyntaxKind>,
     builder: GreenNodeBuilder<'p>,
@@ -104,7 +90,7 @@ impl<'p> Parser<'p> {
             current_token: None,
             skip_whitespace: true,
             key_pattern_syntax: false,
-            error_whitelist: 0,
+            recovery_tokens: Vec::new(),
             lexer: SyntaxKind::lexer(source),
             builder: Default::default(),
             errors: Default::default(),
@@ -121,13 +107,8 @@ impl<'p> Parser<'p> {
     }
 
     fn error(&mut self, message: &str) -> ParserResult<()> {
-        let span = self.lexer.span();
-
         let err = Error {
-            range: TextRange::new(
-                TextSize::from(span.start as u32),
-                TextSize::from(span.end as u32),
-            ),
+            range: self.current_range(),
             message: message.into(),
         };
 
@@ -138,20 +119,15 @@ impl<'p> Parser<'p> {
             .unwrap_or(false);
 
         if !same_error {
-            self.add_error(&Error {
-                range: TextRange::new(
-                    TextSize::from(span.start as u32),
-                    TextSize::from(span.end as u32),
-                ),
-                message: message.into(),
-            });
-            if let Some(t) = self.current_token {
-                if !self.whitelisted(t) {
-                    self.token_as(ERROR).ok();
-                }
+            self.add_error(&err);
+            if self
+                .current_token
+                .is_some_and(|token| !self.is_recovery_token(token))
+            {
+                let _ = self.token_as(ERROR);
             }
         } else {
-            self.token_as(ERROR).ok();
+            let _ = self.token_as(ERROR);
         }
 
         Err(())
@@ -159,40 +135,67 @@ impl<'p> Parser<'p> {
 
     // report error without consuming the current the token
     fn report_error(&mut self, message: &str) -> ParserResult<()> {
-        let span = self.lexer.span();
         self.add_error(&Error {
-            range: TextRange::new(
-                TextSize::from(span.start as u32),
-                TextSize::from(span.end as u32),
-            ),
+            range: self.current_range(),
             message: message.into(),
         });
         Err(())
     }
 
     fn add_error(&mut self, e: &Error) {
-        if let Some(last_err) = self.errors.last_mut() {
-            if last_err == e {
-                return;
-            }
+        if self.errors.last().is_some_and(|last_error| last_error == e) {
+            return;
         }
 
         self.errors.push(e.clone());
     }
 
-    #[inline]
-    fn whitelist_token(&mut self, token: SyntaxKind) {
-        self.error_whitelist |= token as u16;
+    /// Convert the current lexer span into Rowan's coordinate space without truncation or panic.
+    fn current_range(&self) -> TextRange {
+        Self::range(self.lexer.span())
     }
 
-    #[inline]
-    fn blacklist_token(&mut self, token: SyntaxKind) {
-        self.error_whitelist &= !(token as u16);
+    /// Saturate diagnostic coordinates that cannot be represented by Rowan's 32-bit offsets.
+    fn text_size(offset: usize) -> TextSize {
+        TextSize::try_from(offset).unwrap_or_else(|_| TextSize::new(u32::MAX))
     }
 
-    #[inline]
-    fn whitelisted(&self, token: SyntaxKind) -> bool {
-        self.error_whitelist & token as u16 != 0
+    /// Convert a lexer span into Rowan's coordinate space without truncation or panic.
+    fn range(span: std::ops::Range<usize>) -> TextRange {
+        TextRange::new(Self::text_size(span.start), Self::text_size(span.end))
+    }
+
+    /// Construct a zero-width diagnostic range relative to the current lexer token.
+    fn relative_range(&self, relative_offset: usize) -> TextRange {
+        let absolute_offset = self.lexer.span().start.saturating_add(relative_offset);
+        let offset = Self::text_size(absolute_offset);
+        TextRange::new(offset, offset)
+    }
+
+    /// Record one diagnostic at an offset within the current lexer token.
+    fn add_relative_error(&mut self, relative_offset: usize, message: &str) {
+        self.add_error(&Error {
+            range: self.relative_range(relative_offset),
+            message: message.into(),
+        });
+    }
+
+    /// Run `operation` with exact recovery delimiters, restoring the enclosing scope afterward.
+    fn with_recovery_tokens<T>(
+        &mut self,
+        tokens: &[SyntaxKind],
+        operation: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let previous_len = self.recovery_tokens.len();
+        self.recovery_tokens.extend_from_slice(tokens);
+        let result = operation(self);
+        self.recovery_tokens.truncate(previous_len);
+        result
+    }
+
+    /// Whether `token` belongs to any active recovery scope.
+    fn is_recovery_token(&self, token: SyntaxKind) -> bool {
+        self.recovery_tokens.contains(&token)
     }
 
     fn insert_token(&mut self, kind: SyntaxKind, s: &str) {
@@ -210,10 +213,7 @@ impl<'p> Parser<'p> {
             }
             Err(_) => {
                 self.add_error(&Error {
-                    range: TextRange::new(
-                        self.lexer.span().start.try_into().unwrap(),
-                        self.lexer.span().end.try_into().unwrap(),
-                    ),
+                    range: self.current_range(),
                     message: "unexpected EOF".into(),
                 });
                 Err(())
@@ -273,13 +273,7 @@ impl<'p> Parser<'p> {
                         Ok(_) => {}
                         Err(err_indices) => {
                             for e in err_indices {
-                                self.add_error(&Error {
-                                    range: TextRange::new(
-                                        (self.lexer.span().start + e).try_into().unwrap(),
-                                        (self.lexer.span().start + e).try_into().unwrap(),
-                                    ),
-                                    message: "invalid character in comment".into(),
-                                });
+                                self.add_relative_error(e, "invalid character in comment");
                             }
                         }
                     };
@@ -296,12 +290,8 @@ impl<'p> Parser<'p> {
                 }
                 ERROR => {
                     self.insert_token(token, self.lexer.slice());
-                    let span = self.lexer.span();
                     self.add_error(&Error {
-                        range: TextRange::new(
-                            span.start.try_into().unwrap(),
-                            span.end.try_into().unwrap(),
-                        ),
+                        range: self.current_range(),
                         message: "unexpected token".into(),
                     })
                 }
@@ -345,21 +335,21 @@ impl<'p> Parser<'p> {
                     not_newline = true;
 
                     if self.lexer.remainder().starts_with('[') {
-                        let _ = whitelisted!(
-                            self,
-                            NEWLINE,
+                        let _ = self.with_recovery_tokens(&[NEWLINE], |parser| {
                             with_node!(
-                                self.builder,
+                                parser.builder,
                                 TABLE_ARRAY_HEADER,
-                                self.parse_table_array_header()
+                                parser.parse_table_array_header()
                             )
-                        );
+                        });
                     } else {
-                        let _ = whitelisted!(
-                            self,
-                            NEWLINE,
-                            with_node!(self.builder, TABLE_HEADER, self.parse_table_header())
-                        );
+                        let _ = self.with_recovery_tokens(&[NEWLINE], |parser| {
+                            with_node!(
+                                parser.builder,
+                                TABLE_HEADER,
+                                parser.parse_table_header()
+                            )
+                        });
                     }
                 }
                 NEWLINE => {
@@ -381,7 +371,7 @@ impl<'p> Parser<'p> {
                     not_newline = true;
                     self.builder.start_node(ENTRY.into());
                     entry_started = true;
-                    let _ = whitelisted!(self, NEWLINE, self.parse_entry());
+                    let _ = self.with_recovery_tokens(&[NEWLINE], Self::parse_entry);
                 }
             }
         }
@@ -520,13 +510,10 @@ impl<'p> Parser<'p> {
                     Ok(_) => {}
                     Err(err_indices) => {
                         for e in err_indices {
-                            self.add_error(&Error {
-                                range: TextRange::new(
-                                    (self.lexer.span().start + e).try_into().unwrap(),
-                                    (self.lexer.span().start + e).try_into().unwrap(),
-                                ),
-                                message: "invalid control character in string literal".into(),
-                            });
+                            self.add_relative_error(
+                                e,
+                                "invalid control character in string literal",
+                            );
                         }
                     }
                 };
@@ -538,13 +525,7 @@ impl<'p> Parser<'p> {
                     Ok(_) => {}
                     Err(err_indices) => {
                         for e in err_indices {
-                            self.add_error(&Error {
-                                range: TextRange::new(
-                                    (self.lexer.span().start + e).try_into().unwrap(),
-                                    (self.lexer.span().start + e).try_into().unwrap(),
-                                ),
-                                message: "invalid character in string".into(),
-                            });
+                            self.add_relative_error(e, "invalid character in string");
                         }
                     }
                 };
@@ -553,13 +534,7 @@ impl<'p> Parser<'p> {
                     Ok(_) => self.token_as(IDENT),
                     Err(err_indices) => {
                         for e in err_indices {
-                            self.add_error(&Error {
-                                range: TextRange::new(
-                                    (self.lexer.span().start + e).try_into().unwrap(),
-                                    (self.lexer.span().start + e).try_into().unwrap(),
-                                ),
-                                message: "invalid escape sequence".into(),
-                            });
+                            self.add_relative_error(e, "invalid escape sequence");
                         }
 
                         // We proceed normally even if
@@ -651,11 +626,12 @@ impl<'p> Parser<'p> {
                     return self.token_as(TIME);
                 }
 
-                let int_slice = if self.lexer.slice().contains('.') {
-                    self.lexer.slice().split('.').next().unwrap()
-                } else {
-                    self.lexer.slice().split('e').next().unwrap()
-                };
+                let int_slice = self
+                    .lexer
+                    .slice()
+                    .split(['.', 'e', 'E'])
+                    .next()
+                    .unwrap_or(self.lexer.slice());
 
                 if (int_slice.starts_with('0') && int_slice != "0")
                     || (int_slice.starts_with("+0") && int_slice != "+0")
@@ -673,13 +649,10 @@ impl<'p> Parser<'p> {
                     Ok(_) => {}
                     Err(err_indices) => {
                         for e in err_indices {
-                            self.add_error(&Error {
-                                range: TextRange::new(
-                                    (self.lexer.span().start + e).try_into().unwrap(),
-                                    (self.lexer.span().start + e).try_into().unwrap(),
-                                ),
-                                message: "invalid control character in string literal".into(),
-                            });
+                            self.add_relative_error(
+                                e,
+                                "invalid control character in string literal",
+                            );
                         }
                     }
                 };
@@ -690,13 +663,7 @@ impl<'p> Parser<'p> {
                     Ok(_) => {}
                     Err(err_indices) => {
                         for e in err_indices {
-                            self.add_error(&Error {
-                                range: TextRange::new(
-                                    (self.lexer.span().start + e).try_into().unwrap(),
-                                    (self.lexer.span().start + e).try_into().unwrap(),
-                                ),
-                                message: "invalid character in string".into(),
-                            });
+                            self.add_relative_error(e, "invalid character in string");
                         }
                     }
                 };
@@ -707,13 +674,7 @@ impl<'p> Parser<'p> {
                     Ok(_) => {}
                     Err(err_indices) => {
                         for e in err_indices {
-                            self.add_error(&Error {
-                                range: TextRange::new(
-                                    (self.lexer.span().start + e).try_into().unwrap(),
-                                    (self.lexer.span().start + e).try_into().unwrap(),
-                                ),
-                                message: "invalid character in string".into(),
-                            });
+                            self.add_relative_error(e, "invalid character in string");
                         }
                     }
                 };
@@ -722,13 +683,7 @@ impl<'p> Parser<'p> {
                     Ok(_) => self.token(),
                     Err(err_indices) => {
                         for e in err_indices {
-                            self.add_error(&Error {
-                                range: TextRange::new(
-                                    (self.lexer.span().start + e).try_into().unwrap(),
-                                    (self.lexer.span().start + e).try_into().unwrap(),
-                                ),
-                                message: "invalid escape sequence".into(),
-                            });
+                            self.add_relative_error(e, "invalid escape sequence");
                         }
 
                         // We proceed normally even if
@@ -743,13 +698,7 @@ impl<'p> Parser<'p> {
                     Ok(_) => {}
                     Err(err_indices) => {
                         for e in err_indices {
-                            self.add_error(&Error {
-                                range: TextRange::new(
-                                    (self.lexer.span().start + e).try_into().unwrap(),
-                                    (self.lexer.span().start + e).try_into().unwrap(),
-                                ),
-                                message: "invalid character in string".into(),
-                            });
+                            self.add_relative_error(e, "invalid character in string");
                         }
                     }
                 };
@@ -758,13 +707,7 @@ impl<'p> Parser<'p> {
                     Ok(_) => self.token(),
                     Err(err_indices) => {
                         for e in err_indices {
-                            self.add_error(&Error {
-                                range: TextRange::new(
-                                    (self.lexer.span().start + e).try_into().unwrap(),
-                                    (self.lexer.span().start + e).try_into().unwrap(),
-                                ),
-                                message: "invalid escape sequence".into(),
-                            });
+                            self.add_relative_error(e, "invalid escape sequence");
                         }
 
                         // We proceed normally even if
@@ -779,11 +722,6 @@ impl<'p> Parser<'p> {
             }
             BRACE_START => {
                 with_node!(self.builder, INLINE_TABLE, self.parse_inline_table())
-            }
-            IDENT | BRACE_END => {
-                // FIXME(bit_flags): This branch is just a workaround.
-                self.report_error("expected value").ok();
-                Ok(())
             }
             _ => self.error("expected value"),
         }
@@ -812,19 +750,18 @@ impl<'p> Parser<'p> {
                 COMMA => {
                     if !expect_comma_or_end {
                         let _ = self.error(r#"unexpected ",""#);
+                    } else {
+                        self.add_token()?;
                     }
-                    self.add_token()?;
                     expect_comma_or_end = false;
                 }
                 _ => {
                     if expect_comma_or_end {
-                        let _ = self.error(r#"expected "," or "}""#);
+                        let _ = self.report_error(r#"expected "," or "}""#);
                     }
-                    let _ = whitelisted!(
-                        self,
-                        COMMA,
-                        with_node!(self.builder, ENTRY, self.parse_entry())
-                    );
+                    let _ = self.with_recovery_tokens(&[COMMA, BRACE_END], |parser| {
+                        with_node!(parser.builder, ENTRY, parser.parse_entry())
+                    });
                     expect_comma_or_end = true;
                 }
             }
@@ -855,18 +792,18 @@ impl<'p> Parser<'p> {
                 COMMA => {
                     if first || comma_last {
                         let _ = self.error(r#"unexpected ",""#);
+                    } else {
+                        self.token()?;
                     }
-                    self.token()?;
                     comma_last = true;
                 }
                 _ => {
                     if !comma_last && !first {
-                        let _ = self.error(r#"expected ",""#);
+                        let _ = self.report_error(r#"expected ",""#);
                     }
-                    let _ = whitelisted!(
-                        self,
-                        COMMA,
-                        with_node!(self.builder, VALUE, self.parse_value())
+                    let _ = self.with_recovery_tokens(
+                        &[COMMA, BRACKET_END, NEWLINE],
+                        |parser| with_node!(parser.builder, VALUE, parser.parse_value()),
                     );
                     comma_last = false;
                 }
@@ -883,7 +820,7 @@ fn check_underscores(s: &str, radix: u32) -> bool {
         return false;
     }
 
-    let mut last_char = 0 as char;
+    let mut last_char = '\0';
 
     for c in s.chars() {
         if c == '_' && !last_char.is_digit(radix) {
@@ -919,5 +856,219 @@ impl Parse {
     /// in the returned DOM node.
     pub fn into_dom(self) -> dom::node::Node {
         dom::Node::from_syntax(self.into_syntax().into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse, Error, Parser};
+    use crate::syntax::SyntaxKind::{BRACKET_END, COMMA, ENTRY, ERROR, NEWLINE, ROOT, VALUE};
+    use rowan::{TextRange, TextSize};
+    use strict_test_support::{ensure, ensure_eq, TestFailure};
+
+    fn error_count(source: &str, message: &str) -> usize {
+        parse(source)
+            .errors
+            .iter()
+            .filter(|error| error.message == message)
+            .count()
+    }
+
+    fn syntax_kind_count(source: &str, kind: crate::syntax::SyntaxKind) -> usize {
+        parse(source)
+            .into_syntax()
+            .descendants_with_tokens()
+            .filter(|element| element.kind() == kind)
+            .count()
+    }
+
+    #[test]
+    fn missing_array_comma_preserves_following_value() -> Result<(), TestFailure> {
+        let invalid = "a = [1 2]";
+        ensure_eq(
+            &error_count(invalid, r#"expected ",""#),
+            &1,
+            "one missing array separator must be reported",
+        )?;
+        ensure_eq(
+            &syntax_kind_count(invalid, VALUE),
+            &3,
+            "the entry value and both array values must remain parsed",
+        )?;
+
+        let valid = "a = [1, 2]";
+        ensure_eq(
+            &error_count(valid, r#"expected ",""#),
+            &0,
+            "a valid array separator must not be diagnosed",
+        )
+    }
+
+    #[test]
+    fn missing_inline_table_comma_preserves_following_entry() -> Result<(), TestFailure> {
+        let invalid = "a = { b = 1 c = 2 }";
+        ensure_eq(
+            &error_count(invalid, r#"expected "," or "}""#),
+            &1,
+            "one missing inline-table separator must be reported",
+        )?;
+        ensure_eq(
+            &syntax_kind_count(invalid, ENTRY),
+            &3,
+            "the outer entry and both inline-table entries must remain parsed",
+        )?;
+
+        let valid = "a = { b = 1, c = 2 }";
+        ensure_eq(
+            &error_count(valid, r#"expected "," or "}""#),
+            &0,
+            "a valid inline-table separator must not be diagnosed",
+        )
+    }
+
+    #[test]
+    fn consecutive_commas_consume_only_the_offending_delimiter() -> Result<(), TestFailure> {
+        let array = "a = [1,,2]";
+        ensure_eq(
+            &syntax_kind_count(array, ERROR),
+            &1,
+            "one consecutive array comma must become one error token",
+        )?;
+        ensure_eq(
+            &syntax_kind_count(array, VALUE),
+            &3,
+            "the value following the bad array comma must remain parsed",
+        )?;
+
+        let inline = "a = { b = 1,, c = 2 }";
+        ensure_eq(
+            &syntax_kind_count(inline, ERROR),
+            &1,
+            "one consecutive inline-table comma must become one error token",
+        )?;
+        ensure_eq(
+            &syntax_kind_count(inline, ENTRY),
+            &3,
+            "the entry following the bad inline-table comma must remain parsed",
+        )
+    }
+
+    #[test]
+    fn recovery_boundaries_survive_missing_values() -> Result<(), TestFailure> {
+        let closing_boundary = "a = { b = }\nc = 2";
+        let closing_syntax = parse(closing_boundary).into_syntax();
+        ensure(
+            closing_syntax.to_string().contains("}\nc = 2"),
+            "a closing brace and following entry must survive value recovery",
+        )?;
+        ensure_eq(
+            &closing_syntax
+                .descendants_with_tokens()
+                .filter(|element| element.kind() == ERROR)
+                .count(),
+            &0,
+            "a structural recovery boundary must not be rewritten as an error token",
+        )?;
+
+        let invalid_value = "a = nope\nb = 2";
+        ensure_eq(
+            &syntax_kind_count(invalid_value, ERROR),
+            &1,
+            "a bare identifier in value position must become an error token",
+        )?;
+        ensure_eq(
+            &syntax_kind_count(invalid_value, ENTRY),
+            &2,
+            "a non-boundary invalid value must not consume the following entry",
+        )
+    }
+
+    #[test]
+    fn nested_recovery_scopes_restore_outer_tokens() -> Result<(), TestFailure> {
+        let mut parser = Parser::new("");
+        parser.with_recovery_tokens(&[COMMA], |outer| -> Result<(), TestFailure> {
+            ensure(
+                outer.is_recovery_token(COMMA),
+                "the outer recovery token must be active",
+            )?;
+            outer.with_recovery_tokens(
+                &[COMMA, NEWLINE],
+                |inner| -> Result<(), TestFailure> {
+                    ensure(
+                        inner.is_recovery_token(COMMA),
+                        "a duplicate inner recovery token must be active",
+                    )?;
+                    ensure(
+                        inner.is_recovery_token(NEWLINE),
+                        "the inner-only recovery token must be active",
+                    )
+                },
+            )?;
+            ensure(
+                outer.is_recovery_token(COMMA),
+                "leaving the inner scope must retain the outer duplicate",
+            )?;
+            ensure(
+                !outer.is_recovery_token(NEWLINE),
+                "leaving the inner scope must remove its unique token",
+            )
+        })?;
+        ensure(
+            !parser.is_recovery_token(COMMA),
+            "leaving the outer scope must restore the empty recovery stack",
+        )
+    }
+
+    #[test]
+    fn repeated_same_range_recovery_forces_progress() -> Result<(), TestFailure> {
+        let mut parser = Parser::new("]");
+        parser.builder.start_node(ROOT.into());
+        let token = parser.get_token().ok();
+        ensure(
+            token == Some(BRACKET_END),
+            "the fixture must lex as a closing delimiter",
+        )?;
+
+        parser.with_recovery_tokens(&[BRACKET_END], |scoped| {
+            let _ = scoped.error("expected value");
+            let _ = scoped.error("expected value");
+        });
+
+        ensure_eq(
+            &parser.errors.len(),
+            &1,
+            "the same range and message must be recorded once",
+        )?;
+        ensure(
+            parser.get_token().is_err(),
+            "the second same-range failure must consume the boundary and advance",
+        )
+    }
+
+    #[test]
+    fn error_collection_suppresses_only_exact_adjacent_duplicates() -> Result<(), TestFailure> {
+        let mut parser = Parser::new("");
+        let first = Error {
+            range: TextRange::new(TextSize::new(0), TextSize::new(1)),
+            message: "first".into(),
+        };
+        let distinct_message = Error {
+            range: first.range,
+            message: "second".into(),
+        };
+        let distinct_range = Error {
+            range: TextRange::new(TextSize::new(1), TextSize::new(2)),
+            message: "first".into(),
+        };
+
+        parser.add_error(&first);
+        parser.add_error(&first);
+        parser.add_error(&distinct_message);
+        parser.add_error(&distinct_range);
+
+        ensure(
+            parser.errors == [first, distinct_message, distinct_range],
+            "only an exact adjacent duplicate may be suppressed",
+        )
     }
 }

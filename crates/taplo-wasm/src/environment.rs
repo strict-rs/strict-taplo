@@ -14,6 +14,11 @@ use url::Url;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 
+/// Convert a JavaScript exception or rejected promise into the shared I/O error contract.
+pub(crate) fn js_io_error(error: JsValue) -> io::Error {
+    io::Error::other(format!("{error:?}"))
+}
+
 pub(crate) struct JsAsyncRead {
     fut: Option<JsFuture>,
     f: Function,
@@ -36,10 +41,7 @@ impl AsyncRead for JsAsyncRead {
             let ret: JsValue = match self.f.call1(&this, &JsValue::from(buf.remaining())) {
                 Ok(val) => val,
                 Err(error) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("{:?}", error),
-                    )));
+                    return Poll::Ready(Err(js_io_error(error)));
                 }
             };
 
@@ -58,7 +60,7 @@ impl AsyncRead for JsAsyncRead {
 
                             Ok(())
                         }
-                        Err(err) => Err(io::Error::new(io::ErrorKind::Other, format!("{:?}", err))),
+                        Err(error) => Err(js_io_error(error)),
                     };
 
                     self.fut = None;
@@ -68,7 +70,9 @@ impl AsyncRead for JsAsyncRead {
                 task::Poll::Pending => Poll::Pending,
             }
         } else {
-            unreachable!()
+            Poll::Ready(Err(io::Error::other(
+                "JavaScript read future was not initialized",
+            )))
         }
     }
 }
@@ -96,10 +100,7 @@ impl AsyncWrite for JsAsyncWrite {
             let ret: JsValue = match self.f.call1(&this, &Uint8Array::from(buf).into()) {
                 Ok(val) => val,
                 Err(error) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("{:?}", error),
-                    )));
+                    return Poll::Ready(Err(js_io_error(error)));
                 }
             };
 
@@ -110,11 +111,9 @@ impl AsyncWrite for JsAsyncWrite {
             match fut.poll_unpin(cx) {
                 task::Poll::Ready(val) => {
                     let res = match val {
-                        Ok(num_written) => {
-                            let n = num_written.as_f64().unwrap_or(0.0).floor() as usize;
-                            Ok(n)
-                        }
-                        Err(err) => Err(io::Error::new(io::ErrorKind::Other, format!("{:?}", err))),
+                        Ok(num_written) => serde_wasm_bindgen::from_value(num_written)
+                            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
+                        Err(error) => Err(js_io_error(error)),
                     };
 
                     self.fut = None;
@@ -124,7 +123,9 @@ impl AsyncWrite for JsAsyncWrite {
                 task::Poll::Pending => Poll::Pending,
             }
         } else {
-            unreachable!()
+            Poll::Ready(Err(io::Error::other(
+                "JavaScript write future was not initialized",
+            )))
         }
     }
 
