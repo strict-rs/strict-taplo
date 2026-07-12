@@ -268,7 +268,7 @@ impl core::fmt::Display for Key {
 
         if !matches!(
             Lexer::<SyntaxKind>::new(self.value()).next(),
-            Some(SyntaxKind::IDENT) | None
+            Some(Ok(SyntaxKind::IDENT)) | None
         ) {
             f.write_char('\'')?;
             self.value().fmt(f)?;

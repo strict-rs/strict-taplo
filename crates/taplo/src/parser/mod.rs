@@ -264,6 +264,9 @@ impl<'p> Parser<'p> {
     fn step(&mut self) {
         self.current_token = None;
         while let Some(token) = self.lexer.next() {
+            // logos 0.16 yields `Err(())` for unrecognized input; map it to the ERROR
+            // node kind so error-tolerant parsing still produces a tree plus a syntax error.
+            let token = token.unwrap_or(ERROR);
             match token {
                 COMMENT => {
                     match allowed_chars::comment(self.lexer.slice()) {

@@ -12,9 +12,13 @@ pub(crate) async fn format<E: Environment>(
 ) -> Result<Option<Vec<TextEdit>>, Error> {
     let p = params.required()?;
 
+    let Some(document_uri) = crate::uri::to_url(&p.text_document.uri) else {
+        return Ok(None);
+    };
+
     let workspaces = context.workspaces.read().await;
-    let ws = workspaces.by_document(&p.text_document.uri);
-    let doc = match ws.document(&p.text_document.uri) {
+    let ws = workspaces.by_document(&document_uri);
+    let doc = match ws.document(&document_uri) {
         Ok(d) => d,
         Err(error) => {
             tracing::debug!(%error, "failed to get document from workspace");
@@ -24,11 +28,10 @@ pub(crate) async fn format<E: Environment>(
 
     let doc_path = context
         .env
-        .to_file_path_normalized(&p.text_document.uri)
+        .to_file_path_normalized(&document_uri)
         .ok_or_else(|| {
             Error::invalid_request().with_data(format!(
-                "invalid (non-local) uri for file: {}",
-                p.text_document.uri
+                "invalid (non-local) uri for file: {document_uri}"
             ))
         })?;
 

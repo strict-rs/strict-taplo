@@ -18,7 +18,9 @@ pub async fn prepare_rename<E: Environment>(
     params: Params<TextDocumentPositionParams>,
 ) -> Result<Option<PrepareRenameResponse>, Error> {
     let p = params.required()?;
-    let document_uri = p.text_document.uri;
+    let Some(document_uri) = crate::uri::to_url(&p.text_document.uri) else {
+        return Ok(None);
+    };
 
     let workspaces = context.workspaces.write().await;
     let ws = workspaces.by_document(&document_uri);
@@ -72,7 +74,10 @@ pub async fn rename<E: Environment>(
     params: Params<RenameParams>,
 ) -> Result<Option<WorkspaceEdit>, Error> {
     let p = params.required()?;
-    let document_uri = p.text_document_position.text_document.uri;
+    let Some(document_uri) = crate::uri::to_url(&p.text_document_position.text_document.uri)
+    else {
+        return Ok(None);
+    };
 
     let workspaces = context.workspaces.write().await;
     let ws = workspaces.by_document(&document_uri);
@@ -143,7 +148,7 @@ pub async fn rename<E: Environment>(
 
     Ok(Some(WorkspaceEdit {
         changes: Some(HashMap::from([(
-            document_uri,
+            crate::uri::to_uri(&document_uri),
             rewrite
                 .patches()
                 .iter()

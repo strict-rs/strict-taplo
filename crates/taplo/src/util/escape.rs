@@ -45,11 +45,10 @@ pub enum Escape {
     #[regex(r#"\\U[0-9A-Fa-f_][0-9A-Fa-f_][0-9A-Fa-f_][0-9A-Fa-f_][0-9A-Fa-f_][0-9A-Fa-f_][0-9A-Fa-f_][0-9A-Fa-f_]"#)]
     UnicodeLarge,
 
-    #[regex(r#"\\."#)]
+    // Catch-all for an unrecognized escape (`\` + any char); lower priority than the
+    // specific escape tokens above so those win when both match the same two characters.
+    #[regex(r#"\\."#, priority = 2)]
     Unknown,
-
-    #[error]
-    UnEscaped,
 }
 use Escape::*;
 
@@ -83,7 +82,13 @@ pub fn unescape(s: &str) -> Result<String, usize> {
     let mut lexer: Lexer<Escape> = Lexer::new(s);
 
     while let Some(t) = lexer.next() {
-        match t {
+        // logos 0.16 yields `Err(())` for unrecognized (non-escape) input; it is passed
+        // through verbatim, which is what the old `UnEscaped` error variant did.
+        let Ok(escape) = t else {
+            new_s += lexer.slice();
+            continue;
+        };
+        match escape {
             Backspace => new_s += "\u{0008}",
             Tab => new_s += "\u{0009}",
             LineFeed => new_s += "\u{000A}",
@@ -107,9 +112,6 @@ pub fn unescape(s: &str) -> Result<String, usize> {
                 .to_string();
             }
             Unknown => return Err(lexer.span().end),
-            UnEscaped => {
-                new_s += lexer.slice();
-            }
         }
     }
 
@@ -123,7 +125,11 @@ pub fn check_escape(s: &str) -> Result<(), Vec<usize>> {
     let mut invalid = Vec::new();
 
     while let Some(t) = lexer.next() {
-        match t {
+        // `Err(())` is unrecognized (non-escape) input — not an escape error (was `UnEscaped`).
+        let Ok(escape) = t else {
+            continue;
+        };
+        match escape {
             Backspace => {}
             Tab => {}
             LineFeed => {}
@@ -165,7 +171,6 @@ pub fn check_escape(s: &str) -> Result<(), Vec<usize>> {
                 };
             }
             Unknown => invalid.push(lexer.span().start),
-            UnEscaped => {}
         }
     }
 

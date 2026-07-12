@@ -1,5 +1,6 @@
-use lsp_types::{request::Request, Url};
+use lsp_types::request::Request;
 use serde::{Deserialize, Serialize};
+use url::Url;
 use serde_json::Value;
 
 /// Serialize a TOML text to JSON.

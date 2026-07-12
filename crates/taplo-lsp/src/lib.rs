@@ -20,6 +20,7 @@ use world::{World, WorldState};
 
 mod diagnostics;
 mod handlers;
+mod uri;
 
 pub mod config;
 pub mod lsp_ext;

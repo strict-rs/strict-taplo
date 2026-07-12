@@ -144,7 +144,9 @@ impl Node {
     }
 
     /// Validate the node and then all children recursively.
-    pub fn validate(&self) -> Result<(), impl Iterator<Item = Error> + core::fmt::Debug> {
+    // `+ use<>`: the returned iterator owns the collected errors and does not borrow `self`
+    // (edition 2024 would otherwise capture `&self`).
+    pub fn validate(&self) -> Result<(), impl Iterator<Item = Error> + core::fmt::Debug + use<>> {
         let mut errors = Vec::new();
         self.validate_all_impl(&mut errors);
         if errors.is_empty() {
@@ -244,7 +246,12 @@ impl Node {
         Ok(all.into_iter())
     }
 
-    pub fn text_ranges(&self, include_children: bool) -> impl ExactSizeIterator<Item = TextRange> {
+    // `+ use<>`: returns an owned iterator over collected ranges; must not capture `&self`
+    // (edition 2024), since callers invoke it on temporary nodes (e.g. `node.get(key).text_ranges(..)`).
+    pub fn text_ranges(
+        &self,
+        include_children: bool,
+    ) -> impl ExactSizeIterator<Item = TextRange> + use<> {
         let mut ranges = Vec::with_capacity(1);
 
         match self {

@@ -1,3 +1,5 @@
+<!-- Do not edit; generated file. -->
+
 # Change Log
 
 ## 0.10.0

@@ -28,7 +28,10 @@ pub async fn completion<E: Environment>(
 ) -> Result<Option<CompletionResponse>, Error> {
     let p = params.required()?;
 
-    let document_uri = p.text_document_position.text_document.uri;
+    let Some(document_uri) = crate::uri::to_url(&p.text_document_position.text_document.uri)
+    else {
+        return Ok(None);
+    };
 
     let workspaces = context.workspaces.read().await;
     let ws = workspaces.by_document(&document_uri);

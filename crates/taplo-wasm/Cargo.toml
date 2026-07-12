@@ -14,7 +14,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 lsp-async-stub = { workspace = true }
-taplo          = { workspace = true }
+taplo          = { workspace = true, features = ["serde"] }
 taplo-cli      = { workspace = true, optional = true, default-features = false }
 taplo-common   = { workspace = true, default-features = false, features = ["rustls-tls", "schema", "reqwest"] }
 taplo-lsp      = { workspace = true, optional = true, default-features = false }
@@ -24,7 +24,7 @@ async-trait              = { workspace = true }
 clap                     = { workspace = true, features = ["derive"] }
 console_error_panic_hook = { workspace = true }
 futures                  = { workspace = true }
-getrandom                = { workspace = true, features = ["js"] }
+getrandom                = { workspace = true, features = ["wasm_js"] }
 indexmap                 = { workspace = true }
 serde                    = { workspace = true, features = ["derive"] }
 serde-wasm-bindgen       = { workspace = true }

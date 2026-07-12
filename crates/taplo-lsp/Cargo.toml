@@ -41,6 +41,7 @@ tap         = { workspace = true }
 time        = { workspace = true, features = ["formatting", "parsing"] }
 toml        = { workspace = true }
 tracing     = { workspace = true }
+url         = { workspace = true, features = ["serde"] }
 
 [package.metadata.auto-tag]
 enabled = true

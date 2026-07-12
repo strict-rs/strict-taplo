@@ -386,7 +386,10 @@ impl FromSyntax for Comment {
     }
 }
 
-pub(crate) fn keys_from_syntax(syntax: &SyntaxElement) -> impl ExactSizeIterator<Item = Key> {
+// `+ use<>`: the returned iterator owns its rowan cursors and does not borrow `syntax`.
+// Edition 2024 would otherwise capture the argument lifetime, breaking callers that pass a
+// temporary (see `array_from_syntax` / `table_from_syntax`).
+pub(crate) fn keys_from_syntax(syntax: &SyntaxElement) -> impl ExactSizeIterator<Item = Key> + use<> {
     assert!(syntax.kind() == KEY);
 
     syntax

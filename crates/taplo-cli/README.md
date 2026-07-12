@@ -1,3 +1,5 @@
+<!-- Do not edit; generated file. -->
+
 # Taplo CLI
 
 A command line tool for linting and formatting TOML files.

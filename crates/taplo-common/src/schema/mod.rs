@@ -2,19 +2,17 @@ use self::{associations::SchemaAssociations, builtins::builtin_schema, cache::Ca
 use crate::{environment::Environment, util::ArcHashValue, LruCache};
 use anyhow::{anyhow, Context};
 use async_recursion::async_recursion;
-use futures::{stream::FuturesUnordered, StreamExt};
 use itertools::Itertools;
 use json_value_merge::Merge;
-use jsonschema::{error::ValidationErrorKind, JSONSchema, SchemaResolver, ValidationError};
+use jsonschema::{error::ValidationErrorKind, Retrieve, Validator};
 use parking_lot::Mutex;
 use regex::Regex;
 use serde_json::Value;
-use std::{borrow::Cow, num::NonZeroUsize, sync::Arc};
+use std::{collections::HashSet, num::NonZeroUsize, sync::Arc};
 use taplo::{
     dom::{self, node::Key, KeyOrIndex, Keys},
     rowan::TextRange,
 };
-use thiserror::Error;
 use tokio::sync::Semaphore;
 use url::Url;
 
@@ -50,7 +48,7 @@ pub struct Schemas<E: Environment> {
     associations: SchemaAssociations<E>,
     concurrent_requests: Arc<Semaphore>,
     http: reqwest::Client,
-    validators: Arc<Mutex<LruCache<Url, Arc<JSONSchema>>>>,
+    validators: Arc<Mutex<LruCache<Url, Arc<Validator>>>>,
     cache: Cache<E>,
 }
 
@@ -106,81 +104,32 @@ impl<E: Environment> Schemas<E> {
         &self,
         schema_url: &Url,
         value: &Value,
-    ) -> Result<Vec<ValidationError<'static>>, anyhow::Error> {
-        let validator = match self.get_validator(schema_url) {
-            Some(s) => s,
-            None => {
-                let schema = self
-                    .load_schema(schema_url)
-                    .await
-                    .with_context(|| format!("failed to load schema {schema_url}"))?;
-                self.add_schema(schema_url, schema.clone()).await;
-                self.add_validator(schema_url.clone(), &schema)
-                    .with_context(|| format!("invalid schema {schema_url}"))?
-            }
-        };
-
-        self.validate_impl(&validator, value).await
+    ) -> Result<Vec<SchemaValidationError>, anyhow::Error> {
+        // External `$ref`s are resolved eagerly when the validator is built
+        // (see `create_validator`), so validation itself is a pure, synchronous pass.
+        let validator = self.get_or_build_validator(schema_url).await?;
+        Ok(validator
+            .iter_errors(value)
+            .map(SchemaValidationError::from_jsonschema)
+            .collect())
     }
 
-    async fn validate_impl(
+    async fn get_or_build_validator(
         &self,
-        validator: &JSONSchema,
-        value: &Value,
-    ) -> Result<Vec<ValidationError<'static>>, anyhow::Error> {
-        // The following loop is required for retrieving external schemas.
-        //
-        // We don't know if any external schemas are required until we reach
-        // a validation path that requires it, so we might have to loop many times
-        // to fully validate according to a schema that has many nested references.
-        loop {
-            match validator.validate(value) {
-                Ok(()) => return Ok(Vec::new()),
-                Err(errors) => {
-                    let errors: Vec<_> = errors
-                        .map(|err| ValidationError {
-                            instance: Cow::Owned(err.instance.into_owned()),
-                            kind: err.kind,
-                            instance_path: err.instance_path,
-                            schema_path: err.schema_path,
-                        })
-                        .collect();
-
-                    // We check whether there were any external schema errors,
-                    // and retrieve the schemas accordingly.
-                    let mut external_schema_requests: FuturesUnordered<_> = errors
-                        .iter()
-                        .filter_map(|err| {
-                            if let ValidationErrorKind::Resolver { url, .. } = &err.kind {
-                                Some(async {
-                                    let value = self.load_schema(url).await?;
-                                    drop(self.cache.store(url.clone(), value));
-                                    Result::<(), anyhow::Error>::Ok(())
-                                })
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-
-                    // There are no external schemas to retrieve,
-                    // return the errors as-is.
-                    if external_schema_requests.is_empty() {
-                        drop(external_schema_requests);
-                        return Ok(errors);
-                    }
-
-                    // Retrieve external schemas, and return on the first failure.
-                    while let Some(external_schema_result) = external_schema_requests.next().await {
-                        external_schema_result?;
-                    }
-
-                    // Try validation again, now with external schemas
-                    // resolved and cached.
-                    continue;
-                }
-            };
+        schema_url: &Url,
+    ) -> Result<Arc<Validator>, anyhow::Error> {
+        if let Some(validator) = self.get_validator(schema_url) {
+            return Ok(validator);
         }
+
+        let schema = self
+            .load_schema(schema_url)
+            .await
+            .with_context(|| format!("failed to load schema {schema_url}"))?;
+        self.add_schema(schema_url, schema.clone()).await;
+        self.add_validator(schema_url.clone(), &schema)
+            .await
+            .with_context(|| format!("invalid schema {schema_url}"))
     }
 
     pub async fn add_schema(&self, schema_url: &Url, schema: Arc<Value>) {
@@ -217,7 +166,7 @@ impl<E: Environment> Schemas<E> {
         Ok(schema)
     }
 
-    fn get_validator(&self, schema_url: &Url) -> Option<Arc<JSONSchema>> {
+    fn get_validator(&self, schema_url: &Url) -> Option<Arc<Validator>> {
         if self.cache().lru_expired() {
             self.validators.lock().clear();
         }
@@ -225,12 +174,12 @@ impl<E: Environment> Schemas<E> {
         self.validators.lock().get(schema_url).cloned()
     }
 
-    fn add_validator(
+    async fn add_validator(
         &self,
         schema_url: Url,
         schema: &Value,
-    ) -> Result<Arc<JSONSchema>, anyhow::Error> {
-        let v = Arc::new(self.create_validator(schema)?);
+    ) -> Result<Arc<Validator>, anyhow::Error> {
+        let v = Arc::new(self.create_validator(schema).await?);
         self.validators.lock().put(schema_url, v.clone());
         Ok(v)
     }
@@ -257,15 +206,51 @@ impl<E: Environment> Schemas<E> {
         }
     }
 
-    fn create_validator(&self, schema: &Value) -> Result<JSONSchema, anyhow::Error> {
-        JSONSchema::options()
-            .with_resolver(CacheSchemaResolver {
-                cache: self.cache().clone(),
-            })
-            .with_format("semver", formats::semver)
-            .with_format("semver-requirement", formats::semver_req)
-            .compile(schema)
-            .map_err(|err| anyhow!("invalid schema: {err}"))
+    /// Compile a validator, resolving external `$ref`s at build time.
+    ///
+    /// `jsonschema` resolves references synchronously through the [`Retrieve`] trait, but our
+    /// schema fetching is async (network / `Environment` I/O). `CacheRetriever` therefore serves
+    /// only the in-memory cache and records any reference it could not satisfy; when the build
+    /// fails on a missing reference we fetch it asynchronously, cache it, and rebuild. The
+    /// `attempted` set guarantees progress (and termination) for genuinely unresolvable refs.
+    async fn create_validator(&self, schema: &Value) -> Result<Validator, anyhow::Error> {
+        let mut attempted: HashSet<Url> = HashSet::new();
+
+        loop {
+            let missing = Arc::new(Mutex::new(Vec::new()));
+            let retriever = CacheRetriever {
+                store: self.cache().memory_store(),
+                missing: missing.clone(),
+            };
+
+            let build_result = jsonschema::options()
+                .with_retriever(retriever)
+                .with_format("semver", formats::semver)
+                .with_format("semver-requirement", formats::semver_req)
+                .should_validate_formats(true)
+                .build(schema);
+
+            match build_result {
+                Ok(validator) => return Ok(validator),
+                Err(err) => {
+                    let requested = std::mem::take(&mut *missing.lock());
+                    let fresh: Vec<Url> = requested
+                        .into_iter()
+                        .filter(|url| attempted.insert(url.clone()))
+                        .collect();
+
+                    if fresh.is_empty() {
+                        return Err(anyhow!("invalid schema: {err}"));
+                    }
+
+                    for url in fresh {
+                        self.load_schema(&url)
+                            .await
+                            .with_context(|| format!("failed to load referenced schema {url}"))?;
+                    }
+                }
+            }
+        }
     }
 
     async fn fetch_external(&self, schema_url: &Url) -> Result<Value, anyhow::Error> {
@@ -648,54 +633,101 @@ impl ValueExt for Value {
     }
 }
 
-struct CacheSchemaResolver<E: Environment> {
-    cache: Cache<E>,
+/// A synchronous [`Retrieve`] that serves only the in-memory schema cache.
+///
+/// `jsonschema` resolves `$ref`s synchronously while building a validator, but our schema
+/// fetching is async. Any reference not already cached is recorded in `missing` and reported as
+/// an error; [`Schemas::create_validator`] uses that list to fetch the schema and rebuild.
+struct CacheRetriever {
+    store: Arc<Mutex<LruCache<Url, Arc<Value>>>>,
+    missing: Arc<Mutex<Vec<Url>>>,
 }
 
-impl<E: Environment> SchemaResolver for CacheSchemaResolver<E> {
-    fn resolve(
+impl Retrieve for CacheRetriever {
+    fn retrieve(
         &self,
-        _root_schema: &serde_json::Value,
-        url: &Url,
-        _original_ref: &str,
-    ) -> Result<Arc<serde_json::Value>, jsonschema::SchemaResolverError> {
-        self.cache
-            .get_schema(url)
-            .ok_or_else(|| WouldBlockError.into())
+        uri: &jsonschema::Uri<String>,
+    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        let url = Url::parse(uri.as_str())?;
+        match self.store.lock().get(&url).cloned() {
+            Some(schema) => Ok((*schema).clone()),
+            None => {
+                self.missing.lock().push(url);
+                Err(format!("schema `{uri}` is not cached yet").into())
+            }
+        }
     }
 }
 
-#[derive(Debug, Error)]
-#[error("retrieving the schema requires external operations")]
-struct WouldBlockError;
+/// An owned schema-validation error, decoupled from the `jsonschema` error types.
+#[derive(Debug, Clone)]
+pub struct SchemaValidationError {
+    /// The offending property names when this is an "additional/unexpected properties" error.
+    pub additional_properties: Option<Vec<String>>,
+    /// The instance location that failed validation.
+    pub instance_path: Vec<PathSegment>,
+    /// A human-readable description of the error.
+    pub message: String,
+}
 
-/// A validation error that contains text ranges as well.
+/// A single segment of a JSON instance path.
+#[derive(Debug, Clone)]
+pub enum PathSegment {
+    Property(String),
+    Index(usize),
+}
+
+impl SchemaValidationError {
+    fn from_jsonschema(error: jsonschema::ValidationError<'_>) -> Self {
+        let additional_properties = match error.kind() {
+            ValidationErrorKind::AdditionalProperties { unexpected } => Some(unexpected.clone()),
+            _ => None,
+        };
+
+        let instance_path = error
+            .instance_path()
+            .into_iter()
+            .map(|segment| match segment {
+                jsonschema::paths::LocationSegment::Property(p) => {
+                    PathSegment::Property(p.to_string())
+                }
+                jsonschema::paths::LocationSegment::Index(i) => PathSegment::Index(i),
+            })
+            .collect();
+
+        Self {
+            additional_properties,
+            instance_path,
+            message: error.to_string(),
+        }
+    }
+}
+
+/// A validation error resolved to a DOM node and its text ranges.
 #[derive(Debug)]
 pub struct NodeValidationError {
     pub keys: Keys,
     pub node: dom::Node,
-    pub error: ValidationError<'static>,
+    pub message: String,
+    additional_properties: bool,
 }
 
 impl NodeValidationError {
-    fn new(root: &dom::Node, error: ValidationError<'static>) -> Result<Self, anyhow::Error> {
+    fn new(root: &dom::Node, error: SchemaValidationError) -> Result<Self, anyhow::Error> {
         let mut keys = Keys::empty();
         let mut node = root.clone();
 
-        match &error.kind {
-            ValidationErrorKind::AdditionalProperties { unexpected } => {
-                keys = keys.extend(unexpected.iter().map(Key::from).map(KeyOrIndex::Key));
-            }
-            _ => {}
+        if let Some(unexpected) = &error.additional_properties {
+            keys = keys.extend(unexpected.iter().map(Key::from).map(KeyOrIndex::Key));
         }
 
-        'outer: for path in &error.instance_path {
-            match path {
-                jsonschema::paths::PathChunk::Property(p) => match node {
+        'outer: for segment in &error.instance_path {
+            match segment {
+                PathSegment::Property(p) => match node {
                     dom::Node::Table(t) => {
                         let entries = t.entries().read();
                         for (k, entry) in entries.iter() {
-                            if k.value() == &**p {
+                            if k.value() == p.as_str() {
                                 keys = keys.join(k.clone());
                                 node = entry.clone();
                                 continue 'outer;
@@ -705,35 +737,38 @@ impl NodeValidationError {
                     }
                     _ => return Err(anyhow!("invalid key")),
                 },
-                jsonschema::paths::PathChunk::Index(idx) => {
+                PathSegment::Index(idx) => {
                     node = node.try_get(*idx).map_err(|_| anyhow!("invalid index"))?;
                     keys = keys.join(*idx);
                 }
-                jsonschema::paths::PathChunk::Keyword(_) => {}
             }
         }
 
-        Ok(Self { keys, node, error })
+        Ok(Self {
+            additional_properties: error.additional_properties.is_some(),
+            keys,
+            node,
+            message: error.message,
+        })
     }
 
     #[must_use]
     pub fn text_ranges(&self) -> Box<dyn Iterator<Item = TextRange> + '_> {
-        match self.error.kind {
-            ValidationErrorKind::AdditionalProperties { .. } => {
-                let include_children = false;
+        if self.additional_properties {
+            let include_children = false;
 
-                if self.keys.is_empty() {
-                    return Box::new(self.node.text_ranges(include_children));
-                }
-
-                Box::new(
-                    self.keys
-                        .clone()
-                        .into_iter()
-                        .flat_map(move |key| self.node.get(key).text_ranges(include_children)),
-                )
+            if self.keys.is_empty() {
+                return Box::new(self.node.text_ranges(include_children));
             }
-            _ => Box::new(self.node.text_ranges(true)),
+
+            Box::new(
+                self.keys
+                    .clone()
+                    .into_iter()
+                    .flat_map(move |key| self.node.get(key).text_ranges(include_children)),
+            )
+        } else {
+            Box::new(self.node.text_ranges(true))
         }
     }
 }

@@ -2,9 +2,10 @@ use crate::world::{DocumentState, WorkspaceState, World};
 use lsp_async_stub::{util::LspExt, Context, RequestWriter};
 use lsp_types::{
     notification, Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, Location,
-    PublishDiagnosticsParams, Url,
+    PublishDiagnosticsParams,
 };
 use taplo::dom::Node;
+use url::Url;
 use taplo_common::environment::Environment;
 
 #[tracing::instrument(skip_all)]
@@ -29,7 +30,7 @@ pub(crate) async fn publish_diagnostics<E: Environment>(
 
     context
         .write_notification::<notification::PublishDiagnostics, _>(Some(PublishDiagnosticsParams {
-            uri: document_url.clone(),
+            uri: crate::uri::to_uri(&document_url),
             diagnostics: diags.clone(),
             version: None,
         }))
@@ -56,7 +57,7 @@ pub(crate) async fn publish_diagnostics<E: Environment>(
 
     context
         .write_notification::<notification::PublishDiagnostics, _>(Some(PublishDiagnosticsParams {
-            uri: document_url.clone(),
+            uri: crate::uri::to_uri(&document_url),
             diagnostics: diags.clone(),
             version: None,
         }))
@@ -81,7 +82,7 @@ pub(crate) async fn publish_diagnostics<E: Environment>(
 
     context
         .write_notification::<notification::PublishDiagnostics, _>(Some(PublishDiagnosticsParams {
-            uri: document_url.clone(),
+            uri: crate::uri::to_uri(&document_url),
             diagnostics: diags.clone(),
             version: None,
         }))
@@ -96,7 +97,7 @@ pub(crate) async fn clear_diagnostics<E: Environment>(
 ) {
     context
         .write_notification::<notification::PublishDiagnostics, _>(Some(PublishDiagnosticsParams {
-            uri: document_url,
+            uri: crate::uri::to_uri(&document_url),
             diagnostics: Vec::new(),
             version: None,
         }))
@@ -152,7 +153,7 @@ fn collect_dom_errors(
                         message: error.to_string(),
                         related_information: Some(Vec::from([DiagnosticRelatedInformation {
                             location: Location {
-                                uri: document_url.clone(),
+                                uri: crate::uri::to_uri(&document_url),
                                 range: other_range,
                             },
                             message: "other key defined here".into(),
@@ -167,7 +168,7 @@ fn collect_dom_errors(
                         message: error.to_string(),
                         related_information: Some(Vec::from([DiagnosticRelatedInformation {
                             location: Location {
-                                uri: document_url.clone(),
+                                uri: crate::uri::to_uri(&document_url),
                                 range,
                             },
                             message: "other key defined here".into(),
@@ -198,7 +199,7 @@ fn collect_dom_errors(
                         message: error.to_string(),
                         related_information: Some(Vec::from([DiagnosticRelatedInformation {
                             location: Location {
-                                uri: document_url.clone(),
+                                uri: crate::uri::to_uri(&document_url),
                                 range: other_range,
                             },
                             message: "required by this key".into(),
@@ -213,7 +214,7 @@ fn collect_dom_errors(
                         message: error.to_string(),
                         related_information: Some(Vec::from([DiagnosticRelatedInformation {
                             location: Location {
-                                uri: document_url.clone(),
+                                uri: crate::uri::to_uri(&document_url),
                                 range,
                             },
                             message: "table defined here".into(),
@@ -244,7 +245,7 @@ fn collect_dom_errors(
                         message: error.to_string(),
                         related_information: Some(Vec::from([DiagnosticRelatedInformation {
                             location: Location {
-                                uri: document_url.clone(),
+                                uri: crate::uri::to_uri(&document_url),
                                 range: other_range,
                             },
                             message: "required by this key".into(),
@@ -259,7 +260,7 @@ fn collect_dom_errors(
                         message: error.to_string(),
                         related_information: Some(Vec::from([DiagnosticRelatedInformation {
                             location: Location {
-                                uri: document_url.clone(),
+                                uri: crate::uri::to_uri(&document_url),
                                 range,
                             },
                             message: "array of tables defined here".into(),
@@ -316,7 +317,7 @@ async fn collect_schema_errors<E: Environment>(
                 range,
                 severity: Some(DiagnosticSeverity::ERROR),
                 source: Some("Even Better TOML".into()),
-                message: error.error.to_string(),
+                message: error.message.clone(),
                 ..Default::default()
             });
         }

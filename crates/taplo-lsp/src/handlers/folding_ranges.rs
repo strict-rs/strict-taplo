@@ -25,9 +25,13 @@ pub(crate) async fn folding_ranges<E: Environment>(
 ) -> Result<Option<Vec<FoldingRange>>, Error> {
     let p = params.required()?;
 
+    let Some(document_uri) = crate::uri::to_url(&p.text_document.uri) else {
+        return Ok(None);
+    };
+
     let workspaces = context.workspaces.read().await;
-    let ws = workspaces.by_document(&p.text_document.uri);
-    let doc = match ws.document(&p.text_document.uri) {
+    let ws = workspaces.by_document(&document_uri);
+    let doc = match ws.document(&document_uri) {
         Ok(d) => d,
         Err(error) => {
             tracing::debug!(%error, "failed to get document from workspace");
@@ -70,6 +74,7 @@ pub fn create_folding_ranges(syntax: &SyntaxNode, mapper: &Mapper) -> Vec<Foldin
                     header_starts.retain(|(k, h)| {
                         if k == &key || !key.starts_with(k) {
                             folding_ranges.push(FoldingRange {
+                                collapsed_text: None,
                                 start_line: mapper.position(h.start()).unwrap().line as u32,
                                 start_character: None,
                                 end_line: mapper
@@ -120,6 +125,7 @@ pub fn create_folding_ranges(syntax: &SyntaxNode, mapper: &Mapper) -> Vec<Foldin
                                             .unwrap();
 
                                         folding_ranges.push(FoldingRange {
+                                collapsed_text: None,
                                             start_line: start.line as u32,
                                             start_character: Some(start.character as u32),
                                             end_line: end.line as u32,
@@ -142,6 +148,7 @@ pub fn create_folding_ranges(syntax: &SyntaxNode, mapper: &Mapper) -> Vec<Foldin
                                             .unwrap();
 
                                         folding_ranges.push(FoldingRange {
+                                collapsed_text: None,
                                             start_line: start.line as u32,
                                             start_character: Some(start.character as u32),
                                             end_line: end.line as u32,
@@ -178,6 +185,7 @@ pub fn create_folding_ranges(syntax: &SyntaxNode, mapper: &Mapper) -> Vec<Foldin
 
         if !is_comment && last_comment.is_some() {
             folding_ranges.push(FoldingRange {
+                                collapsed_text: None,
                 start_line: mapper
                     .position(comments_start.unwrap().start())
                     .unwrap()
@@ -195,6 +203,7 @@ pub fn create_folding_ranges(syntax: &SyntaxNode, mapper: &Mapper) -> Vec<Foldin
     if let Some(e) = &last_non_header {
         for (_, h) in header_starts {
             folding_ranges.push(FoldingRange {
+                                collapsed_text: None,
                 start_line: mapper.position(h.start()).unwrap().line as u32,
                 start_character: None,
                 end_line: mapper
@@ -210,6 +219,7 @@ pub fn create_folding_ranges(syntax: &SyntaxNode, mapper: &Mapper) -> Vec<Foldin
     if let Some(c) = comments_start {
         if let Some(l) = last_comment {
             folding_ranges.push(FoldingRange {
+                                collapsed_text: None,
                 start_line: mapper.position(c.start()).unwrap().line as u32,
                 start_character: None,
                 end_line: mapper.position(l.start()).unwrap().line as u32,

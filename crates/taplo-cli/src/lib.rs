@@ -14,6 +14,9 @@ pub mod args;
 pub mod commands;
 pub mod printing;
 
+#[cfg(test)]
+mod tests;
+
 pub struct Taplo<E: Environment> {
     env: E,
     colors: bool,

@@ -67,7 +67,7 @@ impl CancelToken {
         self.cancelled.load(Ordering::SeqCst)
     }
 
-    pub fn as_err(&mut self) -> CancelTokenErr {
+    pub fn as_err(&mut self) -> CancelTokenErr<'_> {
         CancelTokenErr(self)
     }
 }
@@ -309,12 +309,15 @@ impl<W: Clone> Server<W> {
         }
     }
 
-    pub fn handle_message(
+    // `+ use<W, T>`: the returned future owns `self.inner.clone()` and does not borrow `&self`.
+    // Edition 2024 would otherwise capture `&self`, making the future non-`'static` and unusable
+    // with `spawn_local` (see `listen`).
+    pub fn handle_message<T: MessageWriter + Clone + 'static>(
         &self,
         world: W,
         message: rpc::Message,
-        writer: impl MessageWriter + Clone + 'static,
-    ) -> impl Future<Output = Result<(), io::Error>> {
+        writer: T,
+    ) -> impl Future<Output = Result<(), io::Error>> + use<W, T> {
         let inner = self.inner.clone();
 
         async move {

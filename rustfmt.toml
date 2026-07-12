@@ -1,6 +1,3 @@
-# Taplo's specific rustfmt config, keep!
-force_explicit_abi = false
-
 # rustfmt config for this workspace.
 #
 # Several keys below are nightly-only (`imports_granularity`, `group_imports`,

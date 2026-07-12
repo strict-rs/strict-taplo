@@ -108,7 +108,7 @@ impl Normalize for PathBuf {
     }
 }
 
-pub(crate) fn normalize_str(s: &str) -> Cow<str> {
+pub(crate) fn normalize_str(s: &str) -> Cow<'_, str> {
     let Some(percent_decoded) = percent_decode_str(s).decode_utf8().ok() else {
         return s.into();
     };
@@ -160,6 +160,14 @@ pub fn get_reqwest_client(timeout: std::time::Duration) -> Result<reqwest::Clien
     ) -> reqwest::ClientBuilder {
         tracing::error!(?path, "Could not load certs, taplo was built without TLS");
         builder
+    }
+
+    // reqwest's `rustls-no-provider` feature builds against rustls without bundling a crypto
+    // provider, so we install ring as the process default before constructing any client. This
+    // is process-global and idempotent (subsequent calls return `Err`, which is ignored).
+    #[cfg(feature = "rustls-tls")]
+    {
+        let _ = rustls::crypto::ring::default_provider().install_default();
     }
 
     let mut builder = reqwest::Client::builder().timeout(timeout);

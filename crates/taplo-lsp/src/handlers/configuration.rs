@@ -44,7 +44,7 @@ pub async fn update_configuration<E: Environment>(context: Context<World<E>>) {
                 None
             } else {
                 Some(ConfigurationItem {
-                    scope_uri: Some(url.clone()),
+                    scope_uri: Some(crate::uri::to_uri(url)),
                     section: Some(init_config.configuration_section.clone()),
                 })
             }
@@ -83,8 +83,9 @@ pub async fn update_configuration<E: Environment>(context: Context<World<E>>) {
                         }
                     }
                 } else if config.is_object() {
-                    let ws_url = config_items.get(i - 1).unwrap().scope_uri.as_ref().unwrap();
-                    let ws = workspaces.get_mut(ws_url).unwrap();
+                    let ws_uri = config_items.get(i - 1).unwrap().scope_uri.as_ref().unwrap();
+                    let ws_url = crate::uri::to_url(ws_uri).unwrap();
+                    let ws = workspaces.get_mut(&ws_url).unwrap();
                     if let Err(error) = ws.config.update_from_json(&config) {
                         tracing::error!(?error, "invalid configuration");
                     }

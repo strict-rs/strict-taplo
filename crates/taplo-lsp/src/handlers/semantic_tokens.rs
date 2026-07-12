@@ -25,14 +25,18 @@ pub(crate) async fn semantic_tokens<E: Environment>(
 ) -> Result<Option<SemanticTokensResult>, Error> {
     let p = params.required()?;
 
+    let Some(document_uri) = crate::uri::to_url(&p.text_document.uri) else {
+        return Ok(None);
+    };
+
     let workspaces = context.workspaces.read().await;
-    let ws = workspaces.by_document(&p.text_document.uri);
+    let ws = workspaces.by_document(&document_uri);
 
     if !ws.config.syntax.semantic_tokens {
         return Ok(None);
     }
 
-    let doc = match ws.document(&p.text_document.uri) {
+    let doc = match ws.document(&document_uri) {
         Ok(d) => d,
         Err(error) => {
             tracing::debug!(%error, "failed to get document from workspace");

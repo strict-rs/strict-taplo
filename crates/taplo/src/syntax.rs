@@ -14,7 +14,8 @@ pub enum SyntaxKind {
     #[regex(r"(\n|\r\n)+")]
     NEWLINE,
 
-    #[regex(r"#[^\n\r]*")]
+    // A comment runs to the end of the line; the greedy match to EOL is intended.
+    #[regex(r"#[^\n\r]*", allow_greedy = true)]
     COMMENT,
 
     #[regex(r"[A-Za-z0-9_-]+", priority = 2)]
@@ -22,7 +23,10 @@ pub enum SyntaxKind {
 
     /// Not part of the regular TOML syntax, only used to allow
     /// glob patterns in keys.
-    #[regex(r"[*?A-Za-z0-9_-]+")]
+    ///
+    /// Lower priority than `IDENT` so a plain identifier (no `*`/`?`) lexes as `IDENT`;
+    /// this variant only wins when the extra glob characters are present.
+    #[regex(r"[*?A-Za-z0-9_-]+", priority = 1)]
     IDENT_WITH_GLOB,
 
     #[token(".")]
@@ -88,7 +92,9 @@ pub enum SyntaxKind {
     #[token("}")]
     BRACE_END,
 
-    #[error]
+    // Emitted as `Err(())` by the logos lexer for unrecognized input (logos 0.16
+    // removed the `#[error]` variant attribute); the parser maps that error back to
+    // this node kind. It is also a plain rowan node kind, so it carries no lexer rule.
     ERROR,
 
     // composite types

@@ -1,5 +1,6 @@
-use lsp_types::{notification::Notification, Url};
+use lsp_types::notification::Notification;
 use serde::{Deserialize, Serialize};
+use url::Url;
 use serde_json::Value;
 
 pub enum MessageWithOutput {}

@@ -57,6 +57,9 @@ tokio = { workspace = true, features = ["sync", "fs", "time", "io-std", "rt-mult
 [target.'cfg(target_family = "wasm")'.dependencies]
 tokio = { workspace = true, features = ["sync", "parking_lot", "io-util"] }
 
+[dev-dependencies]
+strict-test-support = { workspace = true }
+
 [package.metadata.auto-tag]
 enabled = true
 

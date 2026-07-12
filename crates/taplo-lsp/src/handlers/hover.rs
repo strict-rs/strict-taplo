@@ -27,7 +27,11 @@ pub(crate) async fn hover<E: Environment>(
 ) -> Result<Option<Hover>, Error> {
     let p = params.required()?;
 
-    let document_uri = p.text_document_position_params.text_document.uri;
+    let Some(document_uri) =
+        crate::uri::to_url(&p.text_document_position_params.text_document.uri)
+    else {
+        return Ok(None);
+    };
 
     let workspaces = context.workspaces.read().await;
     let ws = workspaces.by_document(&document_uri);

@@ -10,14 +10,16 @@ license      = { workspace = true }
 repository   = { workspace = true }
 
 [features]
-# default-tls enables native-tls but without enabling native-tls specific features.
-native-tls = ["reqwest/default-tls"]
-rustls-tls = ["reqwest/rustls-tls"]
+native-tls = ["reqwest/native-tls"]
+# reqwest 0.13 dropped the `rustls-tls` feature; `rustls-no-provider` builds against
+# rustls without bundling aws-lc-rs, so we install the ring CryptoProvider ourselves
+# (see `util::get_reqwest_client`).
+rustls-tls = ["reqwest/rustls-no-provider", "dep:rustls"]
 schema     = []
 reqwest    = ["dep:reqwest"]
 
 [dependencies]
-taplo = { workspace = true, features = ["schema"] }
+taplo = { workspace = true, features = ["schema", "serde"] }
 
 ahash              = { workspace = true, features = ["serde"] }
 anyhow             = { workspace = true }
@@ -37,7 +39,7 @@ parking_lot        = { workspace = true }
 percent-encoding   = { workspace = true }
 regex              = { workspace = true }
 reqwest            = { workspace = true, features = ["json"], optional = true }
-schemars           = { workspace = true, features = ["url"] }
+schemars           = { workspace = true, features = ["url2"] }
 semver             = { workspace = true, features = ["serde"] }
 serde              = { workspace = true, features = ["derive"] }
 serde_json         = { workspace = true, features = ["preserve_order"] }
@@ -50,7 +52,8 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 url                = { workspace = true, features = ["serde"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokio = { workspace = true, features = ["fs", "io-std", "io-util", "parking_lot", "rt", "sync", "time"] }
+rustls = { workspace = true, optional = true }
+tokio  = { workspace = true, features = ["fs", "io-std", "io-util", "parking_lot", "rt", "sync", "time"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tokio = { workspace = true, features = ["io-util", "parking_lot", "sync"] }

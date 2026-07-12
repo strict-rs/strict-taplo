@@ -17,13 +17,18 @@ pub async fn workspace_change<E: Environment>(
     let init_config = context.init_config.load();
 
     for removed in p.event.removed {
-        workspaces.shift_remove(&removed.uri);
+        if let Some(url) = crate::uri::to_url(&removed.uri) {
+            workspaces.shift_remove(&url);
+        }
     }
 
     for added in p.event.added {
+        let Some(added_url) = crate::uri::to_url(&added.uri) else {
+            continue;
+        };
         let ws = workspaces
-            .entry(added.uri.clone())
-            .or_insert(WorkspaceState::new(context.env.clone(), added.uri));
+            .entry(added_url.clone())
+            .or_insert(WorkspaceState::new(context.env.clone(), added_url));
 
         ws.schemas
             .cache()

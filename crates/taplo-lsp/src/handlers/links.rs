@@ -2,7 +2,8 @@ use crate::world::World;
 use lsp_async_stub::rpc::Error;
 use lsp_async_stub::util::LspExt;
 use lsp_async_stub::{Context, Params};
-use lsp_types::{DocumentLink, DocumentLinkParams, Url};
+use lsp_types::{DocumentLink, DocumentLinkParams};
+use url::Url;
 use taplo::dom::KeyOrIndex;
 use taplo_common::environment::Environment;
 use taplo_common::schema::ext::schema_ext_of;
@@ -14,14 +15,18 @@ pub async fn links<E: Environment>(
 ) -> Result<Option<Vec<DocumentLink>>, Error> {
     let p = params.required()?;
 
+    let Some(document_uri) = crate::uri::to_url(&p.text_document.uri) else {
+        return Ok(None);
+    };
+
     let workspaces = context.workspaces.write().await;
-    let ws = workspaces.by_document(&p.text_document.uri);
+    let ws = workspaces.by_document(&document_uri);
 
     if !ws.config.schema.enabled || !ws.config.schema.links {
         return Ok(None);
     }
 
-    let doc = match ws.document(&p.text_document.uri) {
+    let doc = match ws.document(&document_uri) {
         Ok(d) => d,
         Err(error) => {
             tracing::debug!(%error, "failed to get document from workspace");
@@ -34,7 +39,7 @@ pub async fn links<E: Environment>(
     if let Some(schema_association) = ws
         .schemas
         .associations()
-        .association_for(&p.text_document.uri)
+        .association_for(&document_uri)
     {
         tracing::debug!(
             schema.url = %schema_association.url,
@@ -85,7 +90,7 @@ pub async fn links<E: Environment>(
 
                     links.extend(last_key.text_ranges().map(|range| DocumentLink {
                         range: doc.mapper.range(range).unwrap().into_lsp(),
-                        target: Some(url.clone()),
+                        target: Some(crate::uri::to_uri(&url)),
                         tooltip: None,
                         data: None,
                     }));

@@ -1,0 +1,229 @@
+# ════════════════════════════════════════════════════════════════════════════
+# .cargo/mutants.toml — configuration for `cargo xtask mutants` (cargo-mutants).
+#
+#   Docs:   https://mutants.rs/
+#   Schema: `cargo mutants --emit-schema config`   (every key + its JSON type)
+#   Lints:  https://mutants.rs/lints.html           (the cap_lints rationale below)
+#
+# WHAT MUTATION TESTING IS, AND WHY THIS FILE MATTERS
+# ----------------------------------------------------
+# cargo-mutants copies the source tree to a scratch dir, rewrites it one mutation
+# at a time (e.g. a function body → `vec![]` / `Ok(())`, `==` → `!=`), and reruns
+# the test suite. A mutant the suite catches (some test fails) is good; a mutant
+# that SURVIVES (all tests still pass) is code a test reached without actually
+# checking — a missing assertion or a missing negative-polarity test that line /
+# region / branch coverage cannot see. It is the anti-"filler-test" gate.
+#
+# THIS IS A TEMPLATE REPO. Every value here is a default inherited by the repos
+# generated from it, whose crates / features / packages / build needs are NOT
+# knowable in advance. So the ACTIVE settings deliberately mirror exactly what
+# `just test` runs (`cargo nextest run --workspace --all-targets --all-features`),
+# so a mutant is judged by the SAME suite the consumer's own tests run; otherwise
+# feature-gated code, cross-crate tests, or tests in extra targets are silently
+# skipped and reported as false "survivors" — a quietly broken gate.
+#
+# The OPTIONAL section documents every remaining knob (commented out) — its
+# mechanism, default, when to reach for it, trade-offs, and an example — so a
+# downstream maintainer can see the whole menu and enable what their repo needs.
+# ════════════════════════════════════════════════════════════════════════════
+
+
+# ═══════════════════════════════ ACTIVE ════════════════════════════════════
+
+# all_features --------------------------------------------------------------
+# Activate ALL Cargo features when building and testing mutants.
+#   Default: false (only the `default` feature set is active).
+#   Why active here: `just test` runs `--all-features`; a consumer WILL add
+#     features, and without this any feature-gated code AND its tests are never
+#     built or run, so every mutant in that code falsely "survives".
+#   Precedence: a CLI `--all-features` wins over config; `features` lists from CLI
+#     and config are UNIONED. To select features precisely instead, comment this
+#     out and use `features` / `no_default_features` (see OPTIONAL).
+all_features = true
+
+# test_workspace ------------------------------------------------------------
+# Run the tests of EVERY workspace package against the baseline and each mutant.
+#   Default: false — cargo-mutants runs only the *mutated* package's tests.
+#   Why active here: `just test` runs `--workspace`. With the default, a crate
+#     whose behavior is exercised by ANOTHER crate's tests (a dedicated
+#     integration-test crate, a workspace-level test crate) would show false
+#     survivors, because the catching tests never run for that mutant.
+#   Cost: slower — the whole suite runs per mutant. Do NOT narrow this to go
+#     faster; instead scope the *mutants* with `--in-diff <file>` (PR runs) or
+#     `-f <glob>`, which leaves test coverage intact. Overrides `test_package`.
+test_workspace = true
+
+# additional_cargo_test_args ------------------------------------------------
+# Extra arguments appended to the test command (here: `cargo nextest run`).
+#   Default: [] — the runner's own default target set (lib + integration + bin).
+#   Why active here: `just test` runs `--all-targets`, so forward it to also build
+#     and run tests living in example / bench targets. Verified to reach the
+#     `cargo nextest run` invocation (it appears in cargo-mutants' own logs).
+#   vs `additional_cargo_args`: that one affects EVERY cargo phase (build, check,
+#     test); this affects only the test phase.
+additional_cargo_test_args = ["--all-targets"]
+
+# copy_vcs ------------------------------------------------------------------
+# Copy VCS metadata (`.git`, `.hg`, `.jj`, `.bzr`, `.svn`, `_darcs`, `.pijul`)
+# into the scratch build tree.
+#   Default: false — VCS dirs are excluded from the copy.
+#   Why active here: robustness for an unknown consumer whose build script or
+#     tests read VCS state — embedded commit SHA, `git describe`, `vergen`,
+#     dirty-tree checks. Without `.git` those would fail in the scratch build.
+#   Cost: copies the VCS dir (a large `.git` is copied per build dir). A repo
+#     with no VCS dependency in its build can set this `false` for speed.
+copy_vcs = true
+
+# cap_lints -----------------------------------------------------------------
+# Pass `--cap-lints=allow` to rustc while building mutants.
+#   Default: false.
+#   Why REQUIRED here: this workspace sets `unused = "deny"` (and many more). A
+#     deletion mutant — a body replaced with `vec![]` / `Ok(())` — leaves the
+#     function's parameters unused, which under `deny(unused)` fails to COMPILE.
+#     cargo-mutants then discards it as "unviable" (didn't build) instead of
+#     testing it. The result: nearly every mutant is unviable and the gate
+#     reports "all caught" while having tested almost nothing. This is
+#     cargo-mutants' documented fix (https://mutants.rs/lints.html).
+#   Scope: applies ONLY to the builds cargo-mutants runs in its scratch dir; the
+#     real `just lint` / `just check` / CI lint policy is completely untouched.
+#   Trade-off: `--cap-lints` caps ALL lints, so it also turns off a few genuine
+#     rustc diagnostics (notably long-running const-eval detection). If a mutant
+#     build ever hangs because of that, enable `build_timeout_multiplier` (below).
+#     (The narrower alternative, source-level `#![cfg_attr(not(mutants),
+#     deny(...))]`, does not fit this repo's Cargo.toml `[workspace.lints]`.)
+cap_lints = true
+
+# minimum_test_timeout ------------------------------------------------------
+# Floor (seconds) under the auto-set per-mutant TEST timeout. cargo-mutants sets
+# the timeout to `max(timeout_multiplier × baseline_test_time, minimum_test_timeout)`
+# (default multiplier 5.0, default floor 20s); a mutant that hangs (e.g. a mutated
+# loop condition) hits it and is reported as a `timeout`.
+#   Why active here: this workspace's full `--workspace --all-targets --all-features`
+#     nextest suite has a wall-clock of ~18-20s, which sits right on the default 20s
+#     floor. A mutant that does NOT fail fast lets the whole suite run, trips the
+#     floor, and is misreported as a `timeout` instead of its true `caught` / `missed`
+#     outcome. Raising the floor to 30s gives headroom so a `timeout` means a genuine
+#     hang, not a suite that merely ran long.
+#   Tuning: 30s is the starting value. If a full `just mutants` sweep still shows
+#     floor-artifact timeouts (mutants that should be caught/missed), raise this
+#     (60 → 120) until only genuine infinite-loop hangs remain. `timeout_multiplier`
+#     cannot help — with a ~1s measured baseline, 5× is below the floor — so the
+#     floor is the correct knob.
+#   Scope: applies only to cargo-mutants' own per-mutant test runs in its scratch
+#     dir; the real `just test` is untouched.
+minimum_test_timeout = 30
+
+# ═══════════════ OPTIONAL — uncomment & tune for your repo ══════════════════
+#
+# (Defaults below are cargo-mutants' own; values shown are illustrative.)
+
+# ── Set by the `mutants` command, not here ─────────────────────────────────
+# test_tool : the command passes `--test-tool=nextest` so runs use the
+#   workspace's nextest runner (cargo-mutants' own default is `cargo` = `cargo
+#   test`). Pin it here too if you want a DIRECT `cargo mutants` (bypassing
+#   `just mutants`) to also use nextest:
+#     test_tool = "nextest"
+# output : the command passes `-o <dir>` (default `.`), so reports land in
+#   `./mutants.out/` (git-ignored). Override the default dir here if you prefer:
+#     output = "target/mutants"
+
+# ── Choose WHICH FILES are mutated (globs over paths from the tree root) ────
+# Glob syntax: `**` matches any number of directories; `/` is a path separator;
+# a bare name with no `/` matches in any directory; you must include `.rs` to
+# match sources — `-f network` matches `src/network/mod.rs` but NOT
+# `src/network.rs`. Excluded files are still parsed for their `mod` statements,
+# so module discovery is not broken.
+#
+# examine_globs NARROWS what gets mutated. By default cargo-mutants mutates every
+# source file — in this template that is ALREADY everything under `crates/` and
+# `xtask/` (the only workspace members), so the default run covers both your
+# crates and the xtask tooling. Set this only to mutate a SUBSET. Caveat: it acts
+# as a floor — a CLI `-f <glob>` is UNIONED onto it, not a replacement, so if these
+# globs already cover everything, `-f` can no longer scope a run down (it stays
+# full). To narrow a one-off run, use `-f` with NO examine_globs set, or `--in-diff`
+# (which filters on top of any globs). Example — restrict the default run to just
+# your crates, skipping the shared xtask tooling:
+#   examine_globs = ["crates/**/*.rs"]
+# Skip files entirely — generated, vendored, or genuinely not worth mutating:
+#   exclude_globs = ["**/generated/**/*.rs", "src/bin/*.rs"]
+
+# ── Choose WHICH MUTANTS run (regex over the mutant's full name) ────────────
+# The "full name" looks like `src/foo.rs:42:3: replace is_empty -> bool with
+# true`. Regex is a substring match, applied AFTER the file globs above.
+#
+# Keep only mutants whose name matches:
+#   examine_re = ["replace .* with Default::default\\(\\)"]
+# Drop mutants whose name matches (finer than excluding a whole file):
+#   exclude_re = ["<impl Display>::fmt", "replace .*::drop ->"]
+
+# ── Generate MORE / DIFFERENT mutants ──────────────────────────────────────
+# error_values: also generate mutants that `return Err(<expr>)` from
+#   Result-returning functions, to expose functions whose error path is never
+#   asserted. By default cargo-mutants tries `Ok(Default::default())` for Result
+#   returns but does NOT inject Err variants. Each expr must evaluate to the
+#   error type AT THE MUTATION SITE and be valid there; do NOT wrap it in `Err(…)`
+#   (cargo-mutants adds that); values that don't compile are silently dropped.
+#     error_values = ["crate::error::XtaskError::ParseFailed"]
+#
+# skip_calls / skip_calls_defaults: do NOT mutate the ARGUMENTS passed to calls
+#   of the named functions/methods (matched on the final path component, ignoring
+#   type parameters). This affects call-argument mutations only — not those
+#   functions' bodies — and is distinct from the `#[mutants::skip]` source
+#   attribute. The built-in default set skips `with_capacity` (so e.g.
+#   `Vec::with_capacity(4 * n)` capacity arithmetic is left alone). Your entries
+#   are ADDED to the defaults; disable the defaults with `skip_calls_defaults =
+#   false`.
+#     skip_calls = ["with_capacity", "assert_eq", "trace"]
+#     skip_calls_defaults = true
+
+# ── Narrow FEATURES / PACKAGES (alternatives to the all-* actives above) ────
+# Activate only these features (instead of `all_features = true`); unioned with
+# any CLI `--features`:
+#   features = ["foo", "bar"]
+# Don't activate the crate's `default` feature (default: false):
+#   no_default_features = true
+# Run only these packages' tests for every mutant (default: just the mutated
+# package; overridden by `test_workspace = true`):
+#   test_package = ["my-core", "my-cli"]
+
+# ── BUILD / EXECUTION ──────────────────────────────────────────────────────
+# Extra args on EVERY cargo invocation (build, check, AND test). Reaches both the
+# build and the test runner. Example: pin the lockfile — but note this template
+# git-ignores `Cargo.lock`, so `--locked` would fail on a fresh checkout; enable
+# it only in a repo that commits its lockfile:
+#   additional_cargo_args = ["--locked"]
+# Build mutants under a named cargo profile (default: `test` — debug on,
+# optimizations off). A custom profile can speed up the sweep, since most mutant
+# runs are expected to fail fast and don't need full debug info:
+#   profile = "mutants"      # with [profile.mutants] inherits="test", debug="none"
+# Copy `/target` into each build dir so mutant builds are INCREMENTAL — a large
+# speedup on a full sweep — at the risk of stale-artifact flakiness and copying a
+# multi-GB target dir. Default: false (target is excluded):
+#   copy_target = true
+# When copying the tree, also exclude paths matched by `.gitignore` (faster copy
+# on trees with many ignored binaries). Default: false. Note `/target` is
+# excluded by default regardless, and a git-ignored `Cargo.lock` would be skipped
+# too:
+#   gitignore = true
+
+# ── TIMEOUTS ───────────────────────────────────────────────────────────────
+# The per-mutant TEST timeout is auto-set to `max(timeout_multiplier × baseline,
+# minimum_test_timeout)` (defaults 5.0 and 20s). This template sets
+# `minimum_test_timeout` in the ACTIVE section above; the other two knobs stay off:
+#
+# Test timeout as a multiple of the baseline `cargo test` time (default 5.0).
+# Lowering it risks FALSE timeouts on merely-slow mutants; raise it for a suite
+# with legitimately long tests:
+#   timeout_multiplier = 8.0
+# BUILD timeout as a multiple of the baseline build time. OFF by default (build
+# times are inherently flaky). Enable it mainly if `cap_lints` above (which
+# disables long-running const-eval detection) ever lets a mutant build hang:
+#   build_timeout_multiplier = 3.0
+
+# ── CI SHARDING (when running with `--shard i/k` across parallel runners) ───
+# "slice" (DEFAULT): shard 0 gets the first n/k mutants, shard 1 the next, etc.
+#   Related files mutate together, so incremental builds are reused — faster
+#   builds — but shard runtimes can be uneven.
+# "round-robin": mutant i goes to shard i % k. Even load balancing (shards finish
+#   at similar times) but it loses build locality, so builds are slower.
+#   sharding = "round-robin"

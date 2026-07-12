@@ -130,7 +130,7 @@ pub async fn lint(env: JsValue, toml: String, config: JsValue) -> Result<JsValue
                 .into_iter()
                 .map(|err| LintError {
                     range: None,
-                    error: err.to_string(),
+                    error: err.message,
                 })
                 .collect(),
         })?);

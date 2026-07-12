@@ -43,6 +43,14 @@ impl<E: Environment> Cache<E> {
         self.schemas.lock().get(url).cloned()
     }
 
+    /// A `Send + Sync` handle to the in-memory schema store, independent of the `Environment`.
+    ///
+    /// Used by the schema validator's synchronous `Retrieve` implementation so it can read cached
+    /// schemas without holding the (possibly `!Send`) environment.
+    pub(crate) fn memory_store(&self) -> Arc<Mutex<LruCache<Url, Arc<Value>>>> {
+        self.schemas.clone()
+    }
+
     pub fn contains_schema(&self, url: &Url) -> bool {
         self.schemas.lock().contains(url)
     }

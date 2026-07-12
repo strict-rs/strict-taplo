@@ -5,7 +5,7 @@ use crate::{
 use anyhow::anyhow;
 use arc_swap::ArcSwap;
 use lsp_async_stub::{rpc, util::Mapper, Context, RequestWriter};
-use lsp_types::Url;
+use url::Url;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::json;
@@ -108,7 +108,7 @@ impl<E: Environment> WorldState<E> {
 
 pub struct WorkspaceState<E: Environment> {
     pub(crate) root: Url,
-    pub(crate) documents: HashMap<lsp_types::Url, DocumentState>,
+    pub(crate) documents: HashMap<Url, DocumentState>,
     pub(crate) taplo_config: Config,
     pub(crate) schemas: Schemas<E>,
     pub(crate) config: LspConfig,

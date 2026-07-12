@@ -24,10 +24,14 @@ pub(crate) async fn document_open<E: Environment>(
         Some(p) => p,
     };
 
-    let mut workspaces = context.workspaces.write().await;
-    let ws = workspaces.by_document_mut(&p.text_document.uri);
+    let Some(document_url) = crate::uri::to_url(&p.text_document.uri) else {
+        return;
+    };
 
-    if let Some(pth) = context.env.to_file_path_normalized(&p.text_document.uri) {
+    let mut workspaces = context.workspaces.write().await;
+    let ws = workspaces.by_document_mut(&document_url);
+
+    if let Some(pth) = context.env.to_file_path_normalized(&document_url) {
         if !ws.taplo_config.is_included(&pth) {
             drop(workspaces);
             context
@@ -64,7 +68,7 @@ pub(crate) async fn document_open<E: Environment>(
             .associations()
             .retain(|(rule, assoc)| match rule {
                 AssociationRule::Url(u) => {
-                    !(u == &p.text_document.uri
+                    !(u == &document_url
                         && (assoc.meta["source"] != source::DIRECTIVE
                             || assoc.meta["source"] != source::SCHEMA_FIELD))
                 }
@@ -72,18 +76,18 @@ pub(crate) async fn document_open<E: Environment>(
             });
         ws.schemas
             .associations()
-            .add_from_document(&p.text_document.uri, &dom);
+            .add_from_document(&document_url, &dom);
         ws.emit_associations(context.clone()).await;
     }
 
     ws.documents.insert(
-        p.text_document.uri.clone(),
+        document_url.clone(),
         DocumentState { parse, dom, mapper },
     );
 
     let ws_root = ws.root.clone();
     drop(workspaces);
-    diagnostics::publish_diagnostics(context.clone(), ws_root, p.text_document.uri).await;
+    diagnostics::publish_diagnostics(context.clone(), ws_root, document_url).await;
 }
 
 #[tracing::instrument(skip_all)]
@@ -102,10 +106,14 @@ pub(crate) async fn document_change<E: Environment>(
         Some(c) => c,
     };
 
-    let mut workspaces = context.workspaces.write().await;
-    let ws = workspaces.by_document_mut(&p.text_document.uri);
+    let Some(document_url) = crate::uri::to_url(&p.text_document.uri) else {
+        return;
+    };
 
-    if let Some(pth) = context.env.to_file_path_normalized(&p.text_document.uri) {
+    let mut workspaces = context.workspaces.write().await;
+    let ws = workspaces.by_document_mut(&document_url);
+
+    if let Some(pth) = context.env.to_file_path_normalized(&document_url) {
         if !ws.taplo_config.is_included(&pth) {
             drop(workspaces);
             context
@@ -140,18 +148,18 @@ pub(crate) async fn document_change<E: Environment>(
     if ws.config.schema.enabled {
         ws.schemas
             .associations()
-            .add_from_document(&p.text_document.uri, &dom);
+            .add_from_document(&document_url, &dom);
         ws.emit_associations(context.clone()).await;
     }
 
     ws.documents.insert(
-        p.text_document.uri.clone(),
+        document_url.clone(),
         DocumentState { parse, dom, mapper },
     );
 
     let ws_root = ws.root.clone();
     drop(workspaces);
-    diagnostics::publish_diagnostics(context.clone(), ws_root, p.text_document.uri).await;
+    diagnostics::publish_diagnostics(context.clone(), ws_root, document_url).await;
 }
 
 #[tracing::instrument(skip_all)]
@@ -172,14 +180,18 @@ pub(crate) async fn document_close<E: Environment>(
         Some(p) => p,
     };
 
-    let mut workspaces = context.workspaces.write().await;
-    let ws = workspaces.by_document_mut(&p.text_document.uri);
+    let Some(document_url) = crate::uri::to_url(&p.text_document.uri) else {
+        return;
+    };
 
-    ws.documents.remove(&p.text_document.uri);
+    let mut workspaces = context.workspaces.write().await;
+    let ws = workspaces.by_document_mut(&document_url);
+
+    ws.documents.remove(&document_url);
     drop(workspaces);
 
     context.env.spawn_local(diagnostics::clear_diagnostics(
         context.clone(),
-        p.text_document.uri,
+        document_url,
     ));
 }

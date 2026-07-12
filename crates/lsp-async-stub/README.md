@@ -1,3 +1,5 @@
+<!-- Do not edit; generated file. -->
+
 # LSP Async Stub
 
 This library provides utilities and a basic server stub for asynchronous LSP communication with JSON RPC.

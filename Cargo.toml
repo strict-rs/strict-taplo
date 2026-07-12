@@ -11,8 +11,8 @@ version = "0.15.0"
 publish = false
 license      = "MIT"
 license-file = "LICENSE"
-rust-version = "1.96"
-homepage     = "hhttps://github.com/strict-rs/strict-taplo"
+rust-version = "1.97"
+homepage     = "https://github.com/strict-rs/strict-taplo"
 repository   = "https://github.com/strict-rs/strict-taplo"
 
 [workspace.dependencies]
@@ -38,7 +38,7 @@ itertools          = { version = "0.15.0" }
 lsp-types          = { version = "0.97.0" }
 once_cell          = { version = "1.21" }
 parking_lot        = { version = "0.12.5" }
-regex              = { version = "1.12" }
+regex              = { version = "1.13" }
 reqwest            = { version = "0.13.4", default-features = false }
 rowan              = { version = "0.16.1" }
 schemars           = { version = "1.2.1" }
@@ -63,9 +63,10 @@ clap_complete = { version = "4.6.7" }
 prettydiff    = { version = "0.9.0", default-features = false }               # `prettydiff` is also a CLI that pulls in `clap` by default
 async-recursion    = { version = "1.1.1" }
 json_value_merge   = { version = "2.0.1" }
-jsonschema         = { version = "0.46.10", default-features = false }
-lru                = { version = "0.18.0" }
+jsonschema         = { version = "0.47.0", default-features = false }
+lru                = { version = "0.18.1" }
 percent-encoding   = { version = "2.3.2" }
+rustls             = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 semver             = { version = "1.0.28", features = ["serde"] }
 figment     = { version = "0.10.19", features = ["json"] }
 console_error_panic_hook = { version = "0.1.7" }
@@ -79,7 +80,7 @@ wasm-bindgen-futures = { version = "0.4.76" }
 assert-json-diff = { version = "2" }
 criterion        = { version = "0.8" }   # criterion -> clap
 difference       = { version = "2.0.0" }
-pprof = { version = "0.15", features = ["flamegraph", "criterion"] } # pprof -> criterion -> clap
+pprof = { version = "0.16", features = ["flamegraph", "criterion"], git = "ssh://git@github.com/strict-rs/strict-pprof-rs.git", branch = "upgrade" } # pprof -> criterion -> clap
 
 agents-md = { version = "0.1.0", git = "ssh://git@github.com/earthlings-dev/agents-md-rs.git", branch = "main" }
 bpaf = { git = "ssh://git@github.com/strict-rs/strict-bpaf.git", branch = "sync", version = "0.10", default-features = false }
@@ -99,35 +100,37 @@ snapbox = { version = "1.2", features = ["diff"], default-features = false }
 
 [patch.crates-io]
 
+pprof = { git = "ssh://git@github.com/strict-rs/strict-pprof-rs.git", branch = "upgrade", version = "0.16" }
+
 # strict-proptest (comment out if unused, do not remove)
-proptest = { version = "1.11.0", git = "ssh://git@github.com/strict-rs/strict-proptest.git", branch = "upgrade" }
-proptest-macro = { version = "0.5.0", git = "ssh://git@github.com/strict-rs/strict-proptest.git", branch = "upgrade" }
-proptest-state-machine = { version = "0.8", git = "ssh://git@github.com/strict-rs/strict-proptest.git", branch = "upgrade" }
-proptest-derive = { version = "0.8", git = "ssh://git@github.com/strict-rs/strict-proptest.git", branch = "upgrade" }
+# proptest = { version = "1.11.0", git = "ssh://git@github.com/strict-rs/strict-proptest.git", branch = "upgrade" }
+# proptest-macro = { version = "0.5.0", git = "ssh://git@github.com/strict-rs/strict-proptest.git", branch = "upgrade" }
+# proptest-state-machine = { version = "0.8", git = "ssh://git@github.com/strict-rs/strict-proptest.git", branch = "upgrade" }
+# proptest-derive = { version = "0.8", git = "ssh://git@github.com/strict-rs/strict-proptest.git", branch = "upgrade" }
 
 # strict-trybuild (comment out if unused, do not remove)
-trybuild = { git = "ssh://git@github.com/strict-rs/strict-trybuild.git", branch = "strict", version = "1" }
+# trybuild = { git = "ssh://git@github.com/strict-rs/strict-trybuild.git", branch = "strict", version = "1" }
 
 # strict-bpaf (comment out if unused, do not remove)
 bpaf = { git = "ssh://git@github.com/strict-rs/strict-bpaf.git", branch = "sync", version = "0.10" }
-bpaf_derive = { git = "ssh://git@github.com/strict-rs/strict-bpaf.git", branch = "sync", version = "0.10.0" }
-bpaf_cauwugo = { git = "ssh://git@github.com/strict-rs/strict-bpaf.git", branch = "sync", version = "0.10.0" }
+# bpaf_derive = { git = "ssh://git@github.com/strict-rs/strict-bpaf.git", branch = "sync", version = "0.10.0" }
+# bpaf_cauwugo = { git = "ssh://git@github.com/strict-rs/strict-bpaf.git", branch = "sync", version = "0.10.0" }
 
 # strict-tracing (comment out if unused, do not remove)
 tracing = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.1.44" }
-tracing-appender = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.2.5" }
+# tracing-appender = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.2.5" }
 tracing-attributes = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.1.31" }
 tracing-core = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.1.36" }
-tracing-error = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.2.1" }
-tracing-flame = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.2.0" }
-tracing-futures = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.2.5" }
-tracing-journald = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.3.2" }
+# tracing-error = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.2.1" }
+# tracing-flame = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.2.0" }
+# tracing-futures = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.2.5" }
+# tracing-journald = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.3.2" }
 tracing-log = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.2.0" }
-tracing-mock = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.1.0-beta.3" }
-tracing-serde = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.2.0" }
+# tracing-mock = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.1.0-beta.3" }
+# tracing-serde = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.2.0" }
 tracing-subscriber = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.3.23" }
-tracing-test = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.1.0" }
-tracing-tower = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.1.0" }
+# tracing-test = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.1.0" }
+# tracing-tower = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.1.0" }
 
 # Original Taplo Release Profile
 # [profile.release]
@@ -982,7 +985,7 @@ reason   = "changed tests or behavior where missed assertions are plausible"
 [[workspace.metadata.config.gates.rules]]
 id       = "guidance"
 when-any = ["glob:fragments/**", "glob:docs/fragments/**", "path:AGENTS.md", "glob:**/AGENTS.md", "path:README.md", "glob:**/README.md", "path:CLAUDE.md"]
-command  = "just gen-agent-guidance"
+command  = "just gen-md"
 reason   = "changed generated-doc fragments or generated doc targets"
 fallout  = ["Generated Markdown docs may be rewritten."]
 

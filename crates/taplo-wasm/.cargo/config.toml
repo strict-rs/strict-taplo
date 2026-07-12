@@ -1,6 +1,10 @@
 [build]
 target = "wasm32-unknown-unknown"
 
+# getrandom 0.4 selects the JS/web backend via this cfg (plus the `wasm_js` feature).
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']
+
 [profile.release]
 lto       = true
 opt-level = 's'

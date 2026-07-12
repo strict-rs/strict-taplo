@@ -36,9 +36,12 @@ pub async fn initialize<E: Environment>(
         let init_config = context.init_config.load();
 
         for workspace in workspaces {
+            let Some(ws_url) = crate::uri::to_url(&workspace.uri) else {
+                continue;
+            };
             let ws = wss
-                .entry(workspace.uri.clone())
-                .or_insert(WorkspaceState::new(context.env.clone(), workspace.uri));
+                .entry(ws_url.clone())
+                .or_insert(WorkspaceState::new(context.env.clone(), ws_url));
 
             ws.schemas
                 .cache()

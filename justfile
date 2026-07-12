@@ -223,3 +223,13 @@ x *args:
 # Print the bpaf-rendered xtask command help.
 help:
     cargo xtask help
+# Split existing Markdown doc(s) into consumer fragments and regenerate them
+# in place: `just migrate-md [PATH]`. PATH may be a file or a directory
+# (recursive); with no PATH it self-heals legacy fragment layouts instead.
+migrate-md *args:
+    cargo xtask migrate-md --from "{{invocation_directory()}}" {{args}}
+
+# Regenerate generated Markdown docs from configured fragments.
+gen-md *args:
+    cargo xtask gen-md {{args}}
+

@@ -1,0 +1,4 @@
+[submodule ".agents/plugins/rust-template-core"]
+	path = .agents/plugins/rust-template-core
+	url = git@github.com:earthlings-dev/agent-plugin-rust-template.git
+	branch = main
