@@ -1,6 +1,6 @@
 [package]
 name         = "taplo-wasm"
-version      = "0.2.1"
+version      = { workspace = true }
 publish      = false
 rust-version = { workspace = true }
 authors      = { workspace = true }

@@ -16,11 +16,11 @@ homepage     = "https://github.com/strict-rs/strict-taplo"
 repository   = "https://github.com/strict-rs/strict-taplo"
 
 [workspace.dependencies]
-lsp-async-stub = { version = "0.7.0", path = "crates/lsp-async-stub", default-features = false }
-taplo        = { version = "0.14.0", path = "crates/taplo", default-features = false }
-taplo-cli      = { version = "0.10.0", path = "crates/taplo-cli", default-features = false }
-taplo-common = { version = "0.6.0", path = "crates/taplo-common", default-features = false }
-taplo-lsp    = { version = "0.8.0", path = "crates/taplo-lsp", default-features = false }
+lsp-async-stub = { version = "0.15.0", path = "crates/lsp-async-stub", default-features = false }
+taplo        = { version = "0.15.0", path = "crates/taplo", default-features = false }
+taplo-cli      = { version = "0.15.0", path = "crates/taplo-cli", default-features = false }
+taplo-common = { version = "0.15.0", path = "crates/taplo-common", default-features = false }
+taplo-lsp    = { version = "0.15.0", path = "crates/taplo-lsp", default-features = false }
 
 ahash              = { version = "0.8.12" }
 anyhow             = { version = "1.0.103" }

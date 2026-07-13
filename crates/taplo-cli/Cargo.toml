@@ -1,7 +1,7 @@
 [package]
 name         = "taplo-cli"
 description  = "A CLI for Taplo TOML toolkit"
-version      = "0.10.0"
+version      = { workspace = true }
 categories   = ["development-tools", "command-line-utilities"]
 keywords     = ["toml", "linter", "formatter"]
 rust-version = { workspace = true }
