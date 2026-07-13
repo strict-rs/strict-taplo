@@ -40,7 +40,7 @@ once_cell          = { version = "1.21" }
 parking_lot        = { version = "0.12.5" }
 regex              = { version = "1.13" }
 reqwest            = { version = "0.13.4", default-features = false }
-rowan              = { version = "0.16.1" }
+rowan              = { version = "0.17.0", git = "ssh://git@github.com/strict-rs/strict-rowan.git", branch = "upgrade" }
 schemars           = { version = "1.2.1" }
 serde              = { version = "1" }
 serde_json         = { version = "1.0.150" }
@@ -50,8 +50,8 @@ thiserror          = { version = "2.0.18" }
 time               = { version = "0.3.53" }
 tokio              = { version = "1.52.3", default-features = false }
 toml               = { version = "1.1" }
-tracing            = { version = "0.1.44" }
-tracing-subscriber = { version = "0.3.23" }
+tracing            = { version = "0.1.44", git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict" }
+tracing-subscriber = { version = "0.3.23", git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict" }
 url                = { version = "2.5.8" }
 
 # Consolidated
@@ -131,6 +131,13 @@ tracing-log = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branc
 tracing-subscriber = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.3.23" }
 # tracing-test = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.1.0" }
 # tracing-tower = { git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.1.0" }
+
+# lsp-async-stub = { version = "0.15.0", git = "ssh://git@github.com/strict-rs/strict-taplo.git", branch = "upgrade" }
+# taplo        = { version = "0.15.0", git = "ssh://git@github.com/strict-rs/strict-taplo.git", branch = "upgrade" }
+# taplo-cli      = { version = "0.15.0", git = "ssh://git@github.com/strict-rs/strict-taplo.git", branch = "upgrade" }
+# taplo-common = { version = "0.15.0", git = "ssh://git@github.com/strict-rs/strict-taplo.git", branch = "upgrade" }
+# taplo-lsp    = { version = "0.15.0", git = "ssh://git@github.com/strict-rs/strict-taplo.git", branch = "upgrade" }
+# taplo-wasm    = { version = "0.15.0", git = "ssh://git@github.com/strict-rs/strict-taplo.git", branch = "upgrade" }
 
 # Original Taplo Release Profile
 # [profile.release]

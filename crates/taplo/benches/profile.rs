@@ -1,20 +1,22 @@
-use criterion::{criterion_group, criterion_main, Criterion};
 use std::hint::black_box;
+
+use criterion::Criterion;
+use criterion::criterion_group;
+use criterion::criterion_main;
+#[cfg(unix)]
+use pprof::criterion::Output;
+#[cfg(unix)]
+use pprof::criterion::PProfProfiler;
 use taplo::parser::parse;
 
-#[cfg(unix)]
-use pprof::criterion::{Output, PProfProfiler};
-
 pub fn syntax(c: &mut Criterion) {
-    let source = include_str!("../../../test-data/example.toml");
-    c.bench_function("parse-toml", |b| b.iter(|| parse(black_box(source))));
+  let source = include_str!("../../../test-data/example.toml");
+  c.bench_function("parse-toml", |b| b.iter(|| parse(black_box(source))));
 }
 
 pub fn dom(c: &mut Criterion) {
-    let source = include_str!("../../../test-data/example.toml");
-    c.bench_function("toml-dom", |b| {
-        b.iter(|| parse(black_box(source)).into_dom())
-    });
+  let source = include_str!("../../../test-data/example.toml");
+  c.bench_function("toml-dom", |b| b.iter(|| parse(black_box(source)).into_dom()));
 }
 
 #[cfg(unix)]

@@ -30,8 +30,7 @@
 //!
 //! ```
 //! use taplo::parser::parse;
-//! const SOURCE: &str =
-//! "value = 1
+//! const SOURCE: &str = "value = 1
 //! value = 2
 //!
 //! [table]
@@ -65,5 +64,5 @@ pub type HashSet<V> = ahash::AHashSet<V>;
 mod tests;
 
 mod private {
-    pub trait Sealed {}
+  pub trait Sealed {}
 }

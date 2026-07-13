@@ -20,7 +20,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 [[package]]
 name = "agents-md"
 version = "0.1.0"
-source = "git+ssh://git@github.com/earthlings-dev/agents-md-rs.git?branch=main#0f3cfac1d54a35833bafa104a5647de8a5801e77"
+source = "git+ssh://git@github.com/earthlings-dev/agents-md-rs.git?branch=main#8f2023f6babd86120dd7e03352e35bbca84f7d61"
 
 [[package]]
 name = "ahash"
@@ -1637,14 +1637,14 @@ dependencies = [
 
 [[package]]
 name = "lsp-async-stub"
-version = "0.7.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "futures",
  "getrandom 0.4.3",
  "lsp-types",
- "rowan 0.16.1",
+ "rowan 0.17.0",
  "serde",
  "serde_json",
  "strict-test-support",
@@ -2297,19 +2297,18 @@ dependencies = [
  "countme",
  "hashbrown 0.14.5",
  "memoffset",
- "rustc-hash",
+ "rustc-hash 1.1.0",
  "text-size",
 ]
 
 [[package]]
 name = "rowan"
-version = "0.16.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "417a3a9f582e349834051b8a10c8d71ca88da4211e4093528e36b9845f6b5f21"
+version = "0.17.0"
+source = "git+ssh://git@github.com/strict-rs/strict-rowan.git?branch=upgrade#c58b6860c156aa96143a63a219381bada03ebd8f"
 dependencies = [
  "countme",
- "hashbrown 0.14.5",
- "rustc-hash",
+ "hashbrown 0.17.1",
+ "rustc-hash 2.1.3",
  "text-size",
 ]
 
@@ -2324,6 +2323,12 @@ name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
+
+[[package]]
+name = "rustc-hash"
+version = "2.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
 
 [[package]]
 name = "rustc_version"
@@ -2691,7 +2696,7 @@ dependencies = [
 [[package]]
 name = "strict-xtask-agents-md"
 version = "0.1.0"
-source = "git+ssh://git@github.com/earthlings-dev/strict-xtask-agents-md-rs.git?branch=main#ef0291246f9405e4538ef39b70ebba69a16beff6"
+source = "git+ssh://git@github.com/earthlings-dev/strict-xtask-agents-md-rs.git?branch=main#725cb2167c5af57b6fbbbc6eae9a94ce90613ebb"
 dependencies = [
  "ignore",
  "strict-xtask-core",
@@ -2701,7 +2706,7 @@ dependencies = [
 [[package]]
 name = "strict-xtask-cargo"
 version = "0.1.0"
-source = "git+ssh://git@github.com/earthlings-dev/strict-xtask-cargo-rs.git?branch=main#ed2994bc64242535cf54a44a9276fde5eb7d8ad8"
+source = "git+ssh://git@github.com/earthlings-dev/strict-xtask-cargo-rs.git?branch=main#892ddcc93c1883710e6410a0a96d74558a491ac1"
 dependencies = [
  "bpaf",
  "cargo_metadata",
@@ -2713,7 +2718,7 @@ dependencies = [
  "strict-xtask-agents-md",
  "strict-xtask-core",
  "syn 2.0.118",
- "taplo 0.14.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "taplo 0.14.0",
  "thiserror 2.0.18",
  "toml",
  "toml_edit",
@@ -2817,32 +2822,6 @@ checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
 [[package]]
 name = "taplo"
 version = "0.14.0"
-dependencies = [
- "ahash",
- "arc-swap",
- "assert-json-diff",
- "criterion",
- "difference",
- "either",
- "globset",
- "itertools 0.15.0",
- "logos 0.16.1",
- "once_cell",
- "pprof",
- "rowan 0.16.1",
- "schemars",
- "serde",
- "serde_json",
- "strict-test-support",
- "thiserror 2.0.18",
- "time",
- "toml",
- "tracing",
-]
-
-[[package]]
-name = "taplo"
-version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c221a50eef1a5493074f11ca1ed62bef28c05a4d925002944cc686b2e783a5b3"
 dependencies = [
@@ -2862,8 +2841,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "taplo"
+version = "0.15.0"
+dependencies = [
+ "ahash",
+ "arc-swap",
+ "assert-json-diff",
+ "criterion",
+ "difference",
+ "either",
+ "globset",
+ "itertools 0.15.0",
+ "logos 0.16.1",
+ "once_cell",
+ "pprof",
+ "rowan 0.17.0",
+ "schemars",
+ "serde",
+ "serde_json",
+ "strict-test-support",
+ "thiserror 2.0.18",
+ "time",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "taplo-cli"
-version = "0.10.0"
+version = "0.15.0"
 dependencies = [
  "ansi_term",
  "anyhow",
@@ -2884,7 +2889,7 @@ dependencies = [
  "serde",
  "serde_json",
  "strict-test-support",
- "taplo 0.14.0",
+ "taplo 0.15.0",
  "taplo-common",
  "taplo-lsp",
  "time",
@@ -2897,7 +2902,7 @@ dependencies = [
 
 [[package]]
 name = "taplo-common"
-version = "0.6.0"
+version = "0.15.0"
 dependencies = [
  "ahash",
  "anyhow",
@@ -2925,7 +2930,7 @@ dependencies = [
  "sha1",
  "strict-test-support",
  "tap",
- "taplo 0.14.0",
+ "taplo 0.15.0",
  "thiserror 2.0.18",
  "time",
  "tokio",
@@ -2936,7 +2941,7 @@ dependencies = [
 
 [[package]]
 name = "taplo-lsp"
-version = "0.8.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2956,7 +2961,7 @@ dependencies = [
  "serde_json",
  "strict-test-support",
  "tap",
- "taplo 0.14.0",
+ "taplo 0.15.0",
  "taplo-common",
  "time",
  "tokio",
@@ -2967,7 +2972,7 @@ dependencies = [
 
 [[package]]
 name = "taplo-wasm"
-version = "0.2.1"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2981,7 +2986,7 @@ dependencies = [
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
- "taplo 0.14.0",
+ "taplo 0.15.0",
  "taplo-cli",
  "taplo-common",
  "taplo-lsp",
@@ -3401,9 +3406,9 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "uuid"
-version = "1.23.4"
+version = "1.23.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf80a72845275afea99e7f2b434723d3bc7e38470fcd1c7ed39a599c73319a53"
+checksum = "ea5fab0d6c3c01ae70085a09cb03d4c7a1d6314e2b3e075392783396d724ca0a"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
@@ -3860,6 +3865,6 @@ dependencies = [
 
 [[package]]
 name = "zmij"
-version = "1.0.21"
+version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
+checksum = "bd2f034a4bebf216c9e4b7083603e024cf930873fd67830cfb083c9fa33129d9"

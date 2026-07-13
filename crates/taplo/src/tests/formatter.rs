@@ -1,65 +1,68 @@
 use difference::Changeset;
-use strict_test_support::{ensure_contains, ensure_eq, TestFailure};
+use strict_test_support::TestFailure;
+use strict_test_support::ensure_contains;
+use strict_test_support::ensure_eq;
 
-use crate::formatter::{self, Options, OptionsIncomplete};
+use crate::formatter::Options;
+use crate::formatter::OptionsIncomplete;
+use crate::formatter::{
+  self,
+};
 
 macro_rules! assert_format {
-    ($expected:expr, $actual:expr) => {
-        if $expected != $actual {
-            println!("{}", Changeset::new($actual, $expected, "\n"));
-            panic!("invalid formatting");
-        }
-    };
+  ($expected:expr, $actual:expr) => {
+    if $expected != $actual {
+      println!("{}", Changeset::new($actual, $expected, "\n"));
+      panic!("invalid formatting");
+    }
+  };
 }
 
 #[test]
 fn retained_value_syntax_drives_only_overwidth_array_expansion() -> Result<(), TestFailure> {
-    let options = Options {
-        array_auto_collapse: false,
-        array_auto_expand: true,
-        column_width: 24,
-        ..Options::default()
-    };
-    let expanded = formatter::format("long_key = [1, 2, 3, 4, 5]\n", options.clone());
-    ensure_eq(
-        &expanded.as_str(),
-        &"long_key = [\n  1,\n  2,\n  3,\n  4,\n  5,\n]\n",
-        "an over-width array must be reformatted from its retained value node",
-    )?;
+  let options = Options {
+    array_auto_collapse: false,
+    array_auto_expand: true,
+    column_width: 24,
+    ..Options::default()
+  };
+  let expanded = formatter::format("long_key = [1, 2, 3, 4, 5]\n", options.clone());
+  ensure_eq(
+    &expanded.as_str(),
+    &"long_key = [\n  1,\n  2,\n  3,\n  4,\n  5,\n]\n",
+    "an over-width array must be reformatted from its retained value node",
+  )?;
 
-    let compact = formatter::format("key = [1, 2]\n", options);
-    ensure_eq(
-        &compact.as_str(),
-        &"key = [1, 2]\n",
-        "the equivalent short array must remain compact",
-    )
+  let compact = formatter::format("key = [1, 2]\n", options);
+  ensure_eq(
+    &compact.as_str(),
+    &"key = [1, 2]\n",
+    "the equivalent short array must remain compact",
+  )
 }
 
 #[test]
 fn malformed_entry_without_value_is_preserved_tolerantly() -> Result<(), TestFailure> {
-    let formatted = formatter::format(
-        "missing =\nnext = 1\n",
-        Options {
-            column_width: 1,
-            ..Options::default()
-        },
-    );
-    ensure_contains(
-        &formatted,
-        "missing =",
-        "a malformed entry without a value node must retain its source text",
-    )?;
-    ensure_contains(
-        &formatted,
-        "next = 1",
-        "forced multiline handling must not consume the following valid entry",
-    )
+  let formatted = formatter::format("missing =\nnext = 1\n", Options {
+    column_width: 1,
+    ..Options::default()
+  });
+  ensure_contains(
+    &formatted,
+    "missing =",
+    "a malformed entry without a value node must retain its source text",
+  )?;
+  ensure_contains(
+    &formatted,
+    "next = 1",
+    "forced multiline handling must not consume the following valid entry",
+  )
 }
 
 #[test]
 fn comment_indentation() {
-    let formatted = crate::formatter::format(
-        r#"# aaasd
+  let formatted = crate::formatter::format(
+    r#"# aaasd
 
 [profile]
 
@@ -78,13 +81,13 @@ asd = ""
     debug = 0          # Set this to 1 or 2 to get more useful backtraces in debugger.
 
     # asd"#,
-        formatter::Options {
-            indent_tables: true,
-            ..Default::default()
-        },
-    );
+    formatter::Options {
+      indent_tables: true,
+      ..Default::default()
+    },
+  );
 
-    let expected = r#"# aaasd
+  let expected = r#"# aaasd
 
 [profile]
 
@@ -104,24 +107,24 @@ asd = ""
 
   # asd
 "#;
-    assert_format!(expected, &formatted);
+  assert_format!(expected, &formatted);
 }
 
 #[test]
 fn comment_after_entry() {
-    let expected = r#"incremental = true
+  let expected = r#"incremental = true
 
 debug = 0 # Set this to 1 or 2 to get more useful backtraces in debugger.
 "#;
 
-    let formatted = crate::formatter::format(expected, formatter::Options::default());
+  let formatted = crate::formatter::format(expected, formatter::Options::default());
 
-    assert_format!(expected, &formatted);
+  assert_format!(expected, &formatted);
 }
 
 #[test]
 fn comment_before_entry() {
-    let expected = r#"
+  let expected = r#"
 
 # hello
 [lib]
@@ -129,14 +132,14 @@ fn comment_before_entry() {
 incremental = true
 "#;
 
-    let formatted = crate::formatter::format(expected, formatter::Options::default());
+  let formatted = crate::formatter::format(expected, formatter::Options::default());
 
-    assert_format!(expected, &formatted);
+  assert_format!(expected, &formatted);
 }
 
 #[test]
 fn align_composite_entries() {
-    let src = r#"k1 = 1                                                      # 111
+  let src = r#"k1 = 1                                                      # 111
 k2 = false                                                  # 222
 k3 = "public"                                               # 333
 k4 = ["/home/www", "/var/lib/www"] # 4444444444444444444444
@@ -144,15 +147,12 @@ k6 = {a="yes", table="yes"} # 4444444444444444444444
 k5 = false                                                  # 555
 "#;
 
-    let formatted = crate::formatter::format(
-        src,
-        formatter::Options {
-            align_entries: true,
-            ..Default::default()
-        },
-    );
+  let formatted = crate::formatter::format(src, formatter::Options {
+    align_entries: true,
+    ..Default::default()
+  });
 
-    let expected = r#"k1 = 1                             # 111
+  let expected = r#"k1 = 1                             # 111
 k2 = false                         # 222
 k3 = "public"                      # 333
 k4 = ["/home/www", "/var/lib/www"] # 4444444444444444444444
@@ -160,12 +160,12 @@ k6 = { a = "yes", table = "yes" }  # 4444444444444444444444
 k5 = false                         # 555
 "#;
 
-    assert_format!(expected, &formatted);
+  assert_format!(expected, &formatted);
 }
 
 #[test]
 fn test_space_in_line() {
-    let src = r#" 
+  let src = r#" 
 [foo]
  
 foo = "bar"
@@ -180,15 +180,12 @@ bar = "foo"
 [bar]
 foo = "bar"
 "#;
-    let formatted = crate::formatter::format(
-        src,
-        formatter::Options {
-            align_entries: true,
-            ..Default::default()
-        },
-    );
+  let formatted = crate::formatter::format(src, formatter::Options {
+    align_entries: true,
+    ..Default::default()
+  });
 
-    let expected = r#"
+  let expected = r#"
 [foo]
 
 foo = "bar"
@@ -200,12 +197,12 @@ bar = "foo"
 foo = "bar"
 "#;
 
-    assert_format!(expected, &formatted);
+  assert_format!(expected, &formatted);
 }
 
 #[test]
 fn test_comment_in_array() {
-    let expected = r#"
+  let expected = r#"
 [features]
 myfeature = [
   "feature1",
@@ -214,20 +211,17 @@ myfeature = [
 ] # comment2
 nextfeature = []
 "#;
-    let formatted = crate::formatter::format(
-        expected,
-        formatter::Options {
-            align_entries: false,
-            ..Default::default()
-        },
-    );
+  let formatted = crate::formatter::format(expected, formatter::Options {
+    align_entries: false,
+    ..Default::default()
+  });
 
-    assert_format!(expected, &formatted);
+  assert_format!(expected, &formatted);
 }
 
 #[test]
 fn test_comments_in_array() {
-    let expected = r#"
+  let expected = r#"
 [main]
 my_array = [
   #Items
@@ -249,19 +243,16 @@ my_array = [
 ]
 "#;
 
-    let formatted = crate::formatter::format(
-        expected,
-        formatter::Options {
-            ..Default::default()
-        },
-    );
+  let formatted = crate::formatter::format(expected, formatter::Options {
+    ..Default::default()
+  });
 
-    assert_format!(expected, &formatted);
+  assert_format!(expected, &formatted);
 }
 
 #[test]
 fn test_align_comments() {
-    let src = r#"
+  let src = r#"
 entry1 = "string"  # trailing comment
 entry2 = "longer_string"  # trailing comment
 
@@ -275,7 +266,7 @@ my_array = [
 ]
 "#;
 
-    let expected = r#"
+  let expected = r#"
 entry1 = "string"        # trailing comment
 entry2 = "longer_string" # trailing comment
 
@@ -289,72 +280,63 @@ my_array = [
 ]
 "#;
 
-    let formatted = crate::formatter::format(
-        src,
-        formatter::Options {
-            align_comments: true,
-            ..Default::default()
-        },
-    );
+  let formatted = crate::formatter::format(src, formatter::Options {
+    align_comments: true,
+    ..Default::default()
+  });
 
-    assert_format!(expected, &formatted);
+  assert_format!(expected, &formatted);
 }
 
 #[test]
 fn test_more_comment_alignments() {
-    let src = r#"
+  let src = r#"
 entry1asdasd = "string"     # trailing comment
 entry2asd = "longer_string" # trailing comment
 a = "longer_string_hm"      # trailing comment
 "#;
 
-    let expected = r#"
+  let expected = r#"
 entry1asdasd = "string"     # trailing comment
 entry2asd = "longer_string" # trailing comment
 a = "longer_string_hm"      # trailing comment
 "#;
 
-    let formatted = crate::formatter::format(
-        src,
-        formatter::Options {
-            align_comments: true,
-            align_entries: false,
-            ..Default::default()
-        },
-    );
+  let formatted = crate::formatter::format(src, formatter::Options {
+    align_comments: true,
+    align_entries: false,
+    ..Default::default()
+  });
 
-    assert_format!(expected, &formatted);
+  assert_format!(expected, &formatted);
 }
 
 #[test]
 fn test_align_entries_no_comments() {
-    let src = r#"
+  let src = r#"
 entry1asdasd =  "string"     # trailing comment
 entry2asd   = "longer_string"        # trailing comment
 a         = "longer_string_hm" # trailing comment
 "#;
 
-    let expected = r#"
+  let expected = r#"
 entry1asdasd = "string" # trailing comment
 entry2asd    = "longer_string" # trailing comment
 a            = "longer_string_hm" # trailing comment
 "#;
 
-    let formatted = crate::formatter::format(
-        src,
-        formatter::Options {
-            align_comments: false,
-            align_entries: true,
-            ..Default::default()
-        },
-    );
+  let formatted = crate::formatter::format(src, formatter::Options {
+    align_comments: false,
+    align_entries: true,
+    ..Default::default()
+  });
 
-    assert_format!(expected, &formatted);
+  assert_format!(expected, &formatted);
 }
 
 #[test]
 fn test_nested_arrays() {
-    let src = r#"
+  let src = r#"
 my_array = [
     [
         "my_value",
@@ -362,7 +344,7 @@ my_array = [
 ]
 "#;
 
-    let expected = r#"
+  let expected = r#"
 my_array = [
     [
         "my_value",
@@ -370,70 +352,61 @@ my_array = [
 ]
 "#;
 
-    let formatted = crate::formatter::format(
-        src,
-        formatter::Options {
-            align_comments: false,
-            align_entries: true,
-            array_auto_collapse: false,
-            indent_string: "    ".into(),
-            ..Default::default()
-        },
-    );
+  let formatted = crate::formatter::format(src, formatter::Options {
+    align_comments: false,
+    align_entries: true,
+    array_auto_collapse: false,
+    indent_string: "    ".into(),
+    ..Default::default()
+  });
 
-    assert_format!(expected, &formatted);
+  assert_format!(expected, &formatted);
 }
 
 #[test]
 fn test_too_long_array() {
-    let src = r#"
+  let src = r#"
 array_is_just_right = ["this_line_is_exactly_80_characters_long", "filler_data"]
 "#;
 
-    let expected = r#"
+  let expected = r#"
 array_is_just_right = ["this_line_is_exactly_80_characters_long", "filler_data"]
 "#;
 
-    let formatted = crate::formatter::format(
-        src,
-        formatter::Options {
-            array_auto_collapse: false,
-            array_auto_expand: true,
-            indent_string: "    ".into(),
-            ..Default::default()
-        },
-    );
+  let formatted = crate::formatter::format(src, formatter::Options {
+    array_auto_collapse: false,
+    array_auto_expand: true,
+    indent_string: "    ".into(),
+    ..Default::default()
+  });
 
-    assert_format!(expected, &formatted);
+  assert_format!(expected, &formatted);
 
-    let src = r#"
+  let src = r#"
 array_is_a_bit_too_long = ["this_line_is_exactly_80_characters_long", "filler_data"]
 "#;
 
-    let expected = r#"
+  let expected = r#"
 array_is_a_bit_too_long = [
     "this_line_is_exactly_80_characters_long",
     "filler_data",
 ]
 "#;
 
-    let formatted = crate::formatter::format(
-        src,
-        formatter::Options {
-            array_auto_collapse: false,
-            array_auto_expand: true,
-            column_width: 80,
-            indent_string: "    ".into(),
-            ..Default::default()
-        },
-    );
+  let formatted = crate::formatter::format(src, formatter::Options {
+    array_auto_collapse: false,
+    array_auto_expand: true,
+    column_width: 80,
+    indent_string: "    ".into(),
+    ..Default::default()
+  });
 
-    assert_format!(expected, &formatted);
+  assert_format!(expected, &formatted);
 }
 
 #[test]
 fn test_cargo_toml() {
-    let src = r#"
+  let src = r#"
 [package]
 authors = ["tamasfe"]
 categories = ["parser-implementations", "parsing"]
@@ -487,23 +460,20 @@ difference = "2.0.0"
 features = ["serde", "schema", "chrono", "rewrite"]
 "#;
 
-    let formatted = crate::formatter::format(
-        src,
-        formatter::Options {
-            array_auto_collapse: false,
-            array_auto_expand: true,
-            column_width: 90,
-            indent_string: "    ".into(),
-            ..Default::default()
-        },
-    );
+  let formatted = crate::formatter::format(src, formatter::Options {
+    array_auto_collapse: false,
+    array_auto_expand: true,
+    column_width: 90,
+    indent_string: "    ".into(),
+    ..Default::default()
+  });
 
-    assert_format!(src, &formatted);
+  assert_format!(src, &formatted);
 }
 
 #[test]
 fn test_very_nested_arrays() {
-    let src = r#"
+  let src = r#"
 my_array = [
     [
         [
@@ -529,21 +499,18 @@ my_array = [
 ]
 "#;
 
-    let formatted = crate::formatter::format(
-        src,
-        formatter::Options {
-            array_auto_collapse: false,
-            indent_string: "    ".into(),
-            ..Default::default()
-        },
-    );
+  let formatted = crate::formatter::format(src, formatter::Options {
+    array_auto_collapse: false,
+    indent_string: "    ".into(),
+    ..Default::default()
+  });
 
-    assert_format!(src, &formatted);
+  assert_format!(src, &formatted);
 }
 
 #[test]
 fn array_collapse() {
-    let src = r#"
+  let src = r#"
 my_array = [
     [
         [
@@ -555,96 +522,84 @@ my_array = [
 ]
 "#;
 
-    let expected = r#"
+  let expected = r#"
 my_array = [[[["my_value"]]]]
 "#;
 
-    let formatted = crate::formatter::format(
-        src,
-        formatter::Options {
-            array_auto_collapse: true,
-            compact_arrays: true,
-            indent_string: "    ".into(),
-            ..Default::default()
-        },
-    );
+  let formatted = crate::formatter::format(src, formatter::Options {
+    array_auto_collapse: true,
+    compact_arrays: true,
+    indent_string: "    ".into(),
+    ..Default::default()
+  });
 
-    assert_format!(expected, &formatted);
+  assert_format!(expected, &formatted);
 }
 
 #[test]
 fn trailing_newline() {
-    let src = r#"trailing_new_line = {}"#;
+  let src = r#"trailing_new_line = {}"#;
 
-    let expected = r#"trailing_new_line = {}
+  let expected = r#"trailing_new_line = {}
 "#;
 
-    let formatted = crate::formatter::format(
-        src,
-        formatter::Options {
-            array_auto_collapse: true,
-            compact_arrays: true,
-            indent_string: "    ".into(),
-            ..Default::default()
-        },
-    );
+  let formatted = crate::formatter::format(src, formatter::Options {
+    array_auto_collapse: true,
+    compact_arrays: true,
+    indent_string: "    ".into(),
+    ..Default::default()
+  });
 
-    assert_format!(expected, &formatted);
+  assert_format!(expected, &formatted);
 }
 
 #[test]
 fn no_trailing_newline() {
-    let src = r#"no_new_line = {}
+  let src = r#"no_new_line = {}
 "#;
 
-    let expected = r#"no_new_line = {}"#;
+  let expected = r#"no_new_line = {}"#;
 
-    let formatted = crate::formatter::format(
-        src,
-        formatter::Options {
-            array_auto_collapse: true,
-            compact_arrays: true,
-            trailing_newline: false,
-            indent_string: "    ".into(),
-            ..Default::default()
-        },
-    );
+  let formatted = crate::formatter::format(src, formatter::Options {
+    array_auto_collapse: true,
+    compact_arrays: true,
+    trailing_newline: false,
+    indent_string: "    ".into(),
+    ..Default::default()
+  });
 
-    assert_format!(expected, &formatted);
+  assert_format!(expected, &formatted);
 }
 
 #[test]
 fn test_compact_entries() {
-    let src = r#"
+  let src = r#"
 entry1asdasd =  "string"     # trailing comment
 entry2asd   = "longer_string"        # trailing comment
 a         = "longer_string_hm" # trailing comment
 inline_table = { key = "value" }
 "#;
 
-    let expected = r#"
+  let expected = r#"
 entry1asdasd="string"        # trailing comment
 entry2asd="longer_string"    # trailing comment
 a="longer_string_hm"         # trailing comment
 inline_table={ key="value" }
 "#;
 
-    let formatted = crate::formatter::format(
-        src,
-        formatter::Options {
-            align_comments: true,
-            align_entries: false,
-            compact_entries: true,
-            ..Default::default()
-        },
-    );
+  let formatted = crate::formatter::format(src, formatter::Options {
+    align_comments: true,
+    align_entries: false,
+    compact_entries: true,
+    ..Default::default()
+  });
 
-    assert_format!(expected, &formatted);
+  assert_format!(expected, &formatted);
 }
 
 #[test]
 fn array_no_trailing_comma() {
-    let src = r#"
+  let src = r#"
 my_array = [
     [
         [
@@ -656,7 +611,7 @@ my_array = [
 ]
 "#;
 
-    let expected = r#"
+  let expected = r#"
 my_array = [
     [
         [
@@ -668,22 +623,19 @@ my_array = [
 ]
 "#;
 
-    let formatted = crate::formatter::format(
-        src,
-        formatter::Options {
-            array_auto_collapse: false,
-            array_trailing_comma: false,
-            indent_string: "    ".into(),
-            ..Default::default()
-        },
-    );
+  let formatted = crate::formatter::format(src, formatter::Options {
+    array_auto_collapse: false,
+    array_trailing_comma: false,
+    indent_string: "    ".into(),
+    ..Default::default()
+  });
 
-    assert_format!(expected, &formatted);
+  assert_format!(expected, &formatted);
 }
 
 #[test]
 fn array_max_new_lines() {
-    let src = r#"
+  let src = r#"
 my_array = [
     [
         [
@@ -706,7 +658,7 @@ my_array = [
 ]
 "#;
 
-    let expected = r#"
+  let expected = r#"
 my_array = [
     [
         [
@@ -720,22 +672,19 @@ my_array = [
 ]
 "#;
 
-    let formatted = crate::formatter::format(
-        src,
-        formatter::Options {
-            array_auto_collapse: false,
-            array_trailing_comma: false,
-            indent_string: "    ".into(),
-            ..Default::default()
-        },
-    );
+  let formatted = crate::formatter::format(src, formatter::Options {
+    array_auto_collapse: false,
+    array_trailing_comma: false,
+    indent_string: "    ".into(),
+    ..Default::default()
+  });
 
-    assert_format!(expected, &formatted);
+  assert_format!(expected, &formatted);
 }
 
 #[test]
 fn indent_entries() {
-    let src = r#"
+  let src = r#"
 [table]
 
   entry = "stuff"
@@ -764,24 +713,21 @@ fn indent_entries() {
   another_entry = 3
 "#;
 
-    let formatted = crate::formatter::format(
-        src,
-        formatter::Options {
-            array_auto_collapse: false,
-            array_trailing_comma: false,
-            indent_entries: true,
-            indent_tables: true,
-            indent_string: "  ".into(),
-            ..Default::default()
-        },
-    );
+  let formatted = crate::formatter::format(src, formatter::Options {
+    array_auto_collapse: false,
+    array_trailing_comma: false,
+    indent_entries: true,
+    indent_tables: true,
+    indent_string: "  ".into(),
+    ..Default::default()
+  });
 
-    assert_format!(src, &formatted);
+  assert_format!(src, &formatted);
 }
 
 #[test]
 fn multiple_comments() {
-    let src = r#"
+  let src = r#"
 # comments at the start
 # comments at the start
 # comments at the start
@@ -839,20 +785,17 @@ array = [ # comment at start
 # trailing comments
 "#;
 
-    let formatted = crate::formatter::format(
-        src,
-        formatter::Options {
-            indent_string: "    ".into(),
-            ..Default::default()
-        },
-    );
+  let formatted = crate::formatter::format(src, formatter::Options {
+    indent_string: "    ".into(),
+    ..Default::default()
+  });
 
-    assert_format!(src, &formatted);
+  assert_format!(src, &formatted);
 }
 
 #[test]
 fn multiple_comments_indented() {
-    let src = r#"
+  let src = r#"
 #General settings
 [general]
     #Is Enabled?
@@ -874,105 +817,90 @@ fn multiple_comments_indented() {
     # comment under table
 "#;
 
-    let formatted = crate::formatter::format(
-        src,
-        formatter::Options {
-            indent_entries: true,
-            indent_string: "    ".into(),
-            ..Default::default()
-        },
-    );
+  let formatted = crate::formatter::format(src, formatter::Options {
+    indent_entries: true,
+    indent_string: "    ".into(),
+    ..Default::default()
+  });
 
-    assert_format!(src, &formatted);
+  assert_format!(src, &formatted);
 }
 
 #[test]
 fn table_entries_no_blank_space() {
-    let src = r#"
+  let src = r#"
 [a]
 hello = "world"
 [b]
 foo = ["bar"]
 "#;
 
-    let formatted = crate::formatter::format(
-        src,
-        formatter::Options {
-            indent_string: "    ".into(),
-            ..Default::default()
-        },
-    );
+  let formatted = crate::formatter::format(src, formatter::Options {
+    indent_string: "    ".into(),
+    ..Default::default()
+  });
 
-    assert_format!(src, &formatted);
+  assert_format!(src, &formatted);
 }
 
 #[test]
 fn table_entries_no_blank_space_indent_entries() {
-    let src = r#"
+  let src = r#"
 [a]
     hello = "world"
 [b]
     foo = ["bar"]
 "#;
 
-    let formatted = crate::formatter::format(
-        src,
-        formatter::Options {
-            indent_entries: true,
-            indent_string: "    ".into(),
-            ..Default::default()
-        },
-    );
+  let formatted = crate::formatter::format(src, formatter::Options {
+    indent_entries: true,
+    indent_string: "    ".into(),
+    ..Default::default()
+  });
 
-    assert_format!(src, &formatted);
+  assert_format!(src, &formatted);
 }
 
 #[test]
 fn table_entries_no_blank_space_indent_entries_and_tables() {
-    let src = r#"
+  let src = r#"
 [a]
     hello = "world"
     [a.b]
         foo = ["bar"]
 "#;
 
-    let formatted = crate::formatter::format(
-        src,
-        formatter::Options {
-            indent_entries: true,
-            indent_tables: true,
-            indent_string: "    ".into(),
-            ..Default::default()
-        },
-    );
+  let formatted = crate::formatter::format(src, formatter::Options {
+    indent_entries: true,
+    indent_tables: true,
+    indent_string: "    ".into(),
+    ..Default::default()
+  });
 
-    assert_format!(src, &formatted);
+  assert_format!(src, &formatted);
 }
 
 #[test]
 fn single_comment_in_array() {
-    let src = r#"
+  let src = r#"
 runtime-benchmarks = [
     # a comment
 ]
 "#;
 
-    let formatted = crate::formatter::format(
-        src,
-        formatter::Options {
-            indent_entries: true,
-            indent_tables: true,
-            indent_string: "    ".into(),
-            ..Default::default()
-        },
-    );
+  let formatted = crate::formatter::format(src, formatter::Options {
+    indent_entries: true,
+    indent_tables: true,
+    indent_string: "    ".into(),
+    ..Default::default()
+  });
 
-    assert_format!(src, &formatted);
+  assert_format!(src, &formatted);
 }
 
 #[test]
 fn table_indents() {
-    let src = r#"
+  let src = r#"
 [[table]]
     name = "Root Table 1"
     [table.nestedtable]
@@ -986,40 +914,34 @@ fn table_indents() {
     name = "Root Table 2"
 "#;
 
-    let formatted = crate::formatter::format(
-        src,
-        formatter::Options {
-            indent_entries: true,
-            indent_tables: true,
-            indent_string: "    ".into(),
-            ..Default::default()
-        },
-    );
+  let formatted = crate::formatter::format(src, formatter::Options {
+    indent_entries: true,
+    indent_tables: true,
+    indent_string: "    ".into(),
+    ..Default::default()
+  });
 
-    assert_format!(src, &formatted);
+  assert_format!(src, &formatted);
 }
 
 #[test]
 fn no_expand_inline_table() {
-    let src = r#"
+  let src = r#"
 very_long_inline_table = { array = ["aaaaa", "aaaaa", "aaaaa", "aaaaa", "aaaaa", "aaaaa", "aaaaa", "aaaaa", "aaaaa"] }
 "#;
 
-    let formatted = crate::formatter::format(
-        src,
-        formatter::Options {
-            indent_string: "  ".into(),
-            inline_table_expand: false,
-            ..Default::default()
-        },
-    );
+  let formatted = crate::formatter::format(src, formatter::Options {
+    indent_string: "  ".into(),
+    inline_table_expand: false,
+    ..Default::default()
+  });
 
-    assert_format!(src, &formatted);
+  assert_format!(src, &formatted);
 }
 
 #[test]
 fn test_sorted_inline_tables() {
-    let src = r#"
+  let src = r#"
 foo = { b = 2, a = 1 }
 
 bar = [
@@ -1028,26 +950,23 @@ bar = [
 ]
 "#;
 
-    let expected = r#"
+  let expected = r#"
 foo = { a = 1, b = 2 }
 
 bar = [{ a = 1, b = 2, c = 3 }, { a = 1, b = 2, d = 4, e = 5 }]
 "#;
 
-    let formatted = crate::formatter::format(
-        src,
-        formatter::Options {
-            reorder_inline_tables: true,
-            ..Default::default()
-        },
-    );
+  let formatted = crate::formatter::format(src, formatter::Options {
+    reorder_inline_tables: true,
+    ..Default::default()
+  });
 
-    assert_format!(expected, &formatted);
+  assert_format!(expected, &formatted);
 }
 
 #[test]
 fn test_sorted_groupings_in_array() {
-    let src = r#"
+  let src = r#"
 foo = [
   "b",
   "a",
@@ -1067,7 +986,7 @@ foo = [
 ]
 "#;
 
-    let expected = r#"
+  let expected = r#"
 foo = [
   "a",
   "b",
@@ -1087,20 +1006,17 @@ foo = [
 ]
 "#;
 
-    let formatted = crate::formatter::format(
-        src,
-        formatter::Options {
-            reorder_arrays: true,
-            ..Default::default()
-        },
-    );
+  let formatted = crate::formatter::format(src, formatter::Options {
+    reorder_arrays: true,
+    ..Default::default()
+  });
 
-    assert_format!(expected, &formatted);
+  assert_format!(expected, &formatted);
 }
 
 #[test]
 fn test_single_comment_no_alignment() {
-    let src = r#"
+  let src = r#"
 entry1 = "string"  # trailing comment
 entry2 = "longer_string"
 
@@ -1114,7 +1030,7 @@ my_array = [
 ]
 "#;
 
-    let expected = r#"
+  let expected = r#"
 entry1 = "string" # trailing comment
 entry2 = "longer_string"
 
@@ -1128,21 +1044,18 @@ my_array = [
 ]
 "#;
 
-    let formatted = crate::formatter::format(
-        src,
-        formatter::Options {
-            align_comments: true,
-            align_single_comments: false,
-            ..Default::default()
-        },
-    );
+  let formatted = crate::formatter::format(src, formatter::Options {
+    align_comments: true,
+    align_single_comments: false,
+    ..Default::default()
+  });
 
-    assert_format!(expected, &formatted);
+  assert_format!(expected, &formatted);
 }
 
 #[test]
 fn test_single_comment_alignment() {
-    let src = r#"
+  let src = r#"
 entry1 = "string"  # trailing comment
 entry2 = "longer_string"
 
@@ -1156,7 +1069,7 @@ my_array = [
 ]
 "#;
 
-    let expected = r#"
+  let expected = r#"
 entry1 = "string"        # trailing comment
 entry2 = "longer_string"
 
@@ -1170,81 +1083,74 @@ my_array = [
 ]
 "#;
 
-    let formatted = crate::formatter::format(
-        src,
-        formatter::Options {
-            align_comments: true,
-            align_single_comments: true,
-            ..Default::default()
-        },
-    );
+  let formatted = crate::formatter::format(src, formatter::Options {
+    align_comments: true,
+    align_single_comments: true,
+    ..Default::default()
+  });
 
-    assert_format!(expected, &formatted);
+  assert_format!(expected, &formatted);
 }
 
 #[test]
 fn test_comment_with_brackets() {
-    let src = r#"
+  let src = r#"
 my_array = [
   # [x]
   "y",
 ]
 "#;
 
-    let expected = r#"
+  let expected = r#"
 my_array = [
   # [x]
   "y",
 ]
 "#;
 
-    let formatted = crate::formatter::format(src, Default::default());
+  let formatted = crate::formatter::format(src, Default::default());
 
-    assert_format!(expected, &formatted);
+  assert_format!(expected, &formatted);
 }
 
 #[test]
 fn test_comment_after_entry() {
-    let src = r#"
+  let src = r#"
 a = "b" # comment
 "#;
 
-    let expected = r#"
+  let expected = r#"
 a = "b" # comment
 "#;
-    let opt = Options {
-        column_width: 1,
-        ..Default::default()
-    };
-    let formatted = crate::formatter::format(src, opt);
+  let opt = Options {
+    column_width: 1,
+    ..Default::default()
+  };
+  let formatted = crate::formatter::format(src, opt);
 
-    assert_format!(expected, &formatted);
+  assert_format!(expected, &formatted);
 }
 
 #[test]
 fn test_entry_rule() {
-    let src = r#"
+  let src = r#"
 [foo]
 sort_me = ["3", "2", "1"]
 sort_me_not = ["3", "2", "1"]
 "#;
 
-    let expected = r#"
+  let expected = r#"
 [foo]
 sort_me = ["1", "2", "3"]
 sort_me_not = ["3", "2", "1"]
 "#;
 
-    let dom = crate::parser::parse(src).into_dom();
-    let scopes = [(
-        "foo.sort_me",
-        OptionsIncomplete {
-            reorder_arrays: Some(true),
-            ..Default::default()
-        },
-    )];
-    let formatted =
-        crate::formatter::format_with_path_scopes(dom, Options::default(), &[], scopes).unwrap();
+  let dom = crate::parser::parse(src).into_dom();
+  let scopes = [("foo.sort_me", OptionsIncomplete {
+    reorder_arrays: Some(true),
+    ..Default::default()
+  })];
+  let formatted = crate::formatter::format_with_path_scopes(dom, Options::default(), &[], scopes).unwrap();
 
-    assert_format!(expected, &formatted);
+  assert_format!(expected, &formatted);
 }

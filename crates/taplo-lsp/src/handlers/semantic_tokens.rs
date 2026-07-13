@@ -1,163 +1,156 @@
-use crate::World;
-use lsp_async_stub::{
-    rpc::Error,
-    util::{relative_range, LspExt, Mapper},
-    Context, Params,
-};
-use lsp_types::{
-    Range, SemanticToken, SemanticTokenModifier, SemanticTokenType, SemanticTokens,
-    SemanticTokensParams, SemanticTokensResult,
-};
-use taplo::{
-    dom::node::DomNode,
-    syntax::{
-        SyntaxElement,
-        SyntaxKind::{ARRAY, IDENT, INLINE_TABLE},
-        SyntaxNode, SyntaxToken,
-    },
-};
+use lsp_async_stub::Context;
+use lsp_async_stub::Params;
+use lsp_async_stub::rpc::Error;
+use lsp_async_stub::util::LspExt;
+use lsp_async_stub::util::Mapper;
+use lsp_async_stub::util::relative_range;
+use lsp_types::Range;
+use lsp_types::SemanticToken;
+use lsp_types::SemanticTokenModifier;
+use lsp_types::SemanticTokenType;
+use lsp_types::SemanticTokens;
+use lsp_types::SemanticTokensParams;
+use lsp_types::SemanticTokensResult;
+use taplo::dom::node::DomNode;
+use taplo::syntax::SyntaxElement;
+use taplo::syntax::SyntaxKind::ARRAY;
+use taplo::syntax::SyntaxKind::IDENT;
+use taplo::syntax::SyntaxKind::INLINE_TABLE;
+use taplo::syntax::SyntaxNode;
+use taplo::syntax::SyntaxToken;
 use taplo_common::environment::Environment;
+
+use crate::World;
 
 #[tracing::instrument(skip_all)]
 pub(crate) async fn semantic_tokens<E: Environment>(
-    context: Context<World<E>>,
-    params: Params<SemanticTokensParams>,
+  context: Context<World<E>>,
+  params: Params<SemanticTokensParams>,
 ) -> Result<Option<SemanticTokensResult>, Error> {
-    let p = params.required()?;
+  let p = params.required()?;
 
-    let Some(document_uri) = crate::uri::to_url(&p.text_document.uri) else {
-        return Ok(None);
-    };
+  let Some(document_uri) = crate::uri::to_url(&p.text_document.uri) else {
+    return Ok(None);
+  };
 
-    let Some(snapshot) = context.document_snapshot(&document_uri).await else {
-        return Ok(None);
-    };
-    if !snapshot.config.syntax.semantic_tokens {
-        return Ok(None);
-    }
-    let doc = &snapshot.document;
-    let Some(syntax) = doc.dom.syntax().and_then(|syntax| syntax.as_node()) else {
-        return Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
-            result_id: None,
-            data: Vec::new(),
-        })));
-    };
+  let Some(snapshot) = context.document_snapshot(&document_uri).await else {
+    return Ok(None);
+  };
+  if !snapshot.config.syntax.semantic_tokens {
+    return Ok(None);
+  }
+  let doc = &snapshot.document;
+  let Some(syntax) = doc.dom.syntax().and_then(|syntax| syntax.as_node()) else {
+    return Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+      result_id: None,
+      data:      Vec::new(),
+    })));
+  };
 
-    Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
-        result_id: None,
-        data: create_tokens(syntax, &doc.mapper),
-    })))
+  Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+    result_id: None,
+    data:      create_tokens(syntax, &doc.mapper),
+  })))
 }
 
 #[allow(dead_code)]
 #[derive(Debug, Copy, Clone)]
 #[repr(u32)]
 pub enum TokenType {
-    TomlArrayKey,
-    TomlTableKey,
+  TomlArrayKey,
+  TomlTableKey,
 }
 
 impl TokenType {
-    pub const LEGEND: &'static [SemanticTokenType] = &[
-        SemanticTokenType::new("tomlArrayKey"),
-        SemanticTokenType::new("tomlTableKey"),
-    ];
+  pub const LEGEND: &'static [SemanticTokenType] = &[SemanticTokenType::new("tomlArrayKey"), SemanticTokenType::new("tomlTableKey")];
 }
 
 #[allow(dead_code)]
 #[derive(Debug, Copy, Clone)]
 #[repr(u32)]
 pub enum TokenModifier {
-    ReadOnly,
+  ReadOnly,
 }
 
 impl TokenModifier {
-    pub const MODIFIERS: &'static [SemanticTokenModifier] = &[SemanticTokenModifier::READONLY];
+  pub const MODIFIERS: &'static [SemanticTokenModifier] = &[SemanticTokenModifier::READONLY];
 }
 
 #[tracing::instrument(skip_all)]
 pub fn create_tokens(syntax: &SyntaxNode, mapper: &Mapper) -> Vec<SemanticToken> {
-    let mut builder = SemanticTokensBuilder::new(mapper);
+  let mut builder = SemanticTokensBuilder::new(mapper);
 
-    for element in syntax.descendants_with_tokens() {
-        match element {
-            SyntaxElement::Node(_node) => {}
-            SyntaxElement::Token(token) => {
-                if let IDENT = token.kind() {
-                    // look for an inline table value
-                    let is_table_key = token
-                        .parent()
-                        .and_then(|p| p.next_sibling())
-                        .and_then(|t| t.first_child())
-                        .is_some_and(|t| t.kind() == INLINE_TABLE);
+  for element in syntax.descendants_with_tokens() {
+    match element {
+      SyntaxElement::Node(_node) => {}
+      SyntaxElement::Token(token) => {
+        if let IDENT = token.kind() {
+          // look for an inline table value
+          let is_table_key = token
+            .parent()
+            .and_then(|p| p.next_sibling())
+            .and_then(|t| t.first_child())
+            .is_some_and(|t| t.kind() == INLINE_TABLE);
 
-                    if is_table_key {
-                        builder.add_token(&token, TokenType::TomlTableKey, &[]);
-                        continue;
-                    }
+          if is_table_key {
+            builder.add_token(&token, TokenType::TomlTableKey, &[]);
+            continue;
+          }
 
-                    // look for an array
-                    let is_array_key = token
-                        .parent()
-                        .and_then(|p| p.next_sibling())
-                        .and_then(|t| t.first_child())
-                        .is_some_and(|t| t.kind() == ARRAY);
+          // look for an array
+          let is_array_key = token
+            .parent()
+            .and_then(|p| p.next_sibling())
+            .and_then(|t| t.first_child())
+            .is_some_and(|t| t.kind() == ARRAY);
 
-                    if is_array_key {
-                        builder.add_token(&token, TokenType::TomlArrayKey, &[]);
-                    }
-                }
-            }
+          if is_array_key {
+            builder.add_token(&token, TokenType::TomlArrayKey, &[]);
+          }
         }
+      }
     }
+  }
 
-    builder.build()
+  builder.build()
 }
 
 struct SemanticTokensBuilder<'b> {
-    tokens: Vec<SemanticToken>,
-    mapper: &'b Mapper,
-    last_range: Option<Range>,
+  tokens:     Vec<SemanticToken>,
+  mapper:     &'b Mapper,
+  last_range: Option<Range>,
 }
 
 impl<'b> SemanticTokensBuilder<'b> {
-    fn new(mapper: &'b Mapper) -> Self {
-        Self {
-            tokens: Vec::new(),
-            mapper,
-            last_range: None,
-        }
+  fn new(mapper: &'b Mapper) -> Self {
+    Self {
+      tokens: Vec::new(),
+      mapper,
+      last_range: None,
     }
+  }
 
-    fn add_token(
-        &mut self,
-        token: &SyntaxToken,
-        ty: TokenType,
-        modifiers: &[SemanticTokenModifier],
-    ) {
-        let range = self.mapper.range(token.text_range()).unwrap();
+  fn add_token(&mut self, token: &SyntaxToken, ty: TokenType, modifiers: &[SemanticTokenModifier]) {
+    let range = self.mapper.range(token.text_range()).unwrap();
 
-        let relative = relative_range(
-            range,
-            lsp_async_stub::util::Range::from_lsp(self.last_range.unwrap_or_default()),
-        );
+    let relative = relative_range(range, lsp_async_stub::util::Range::from_lsp(self.last_range.unwrap_or_default()));
 
-        #[allow(clippy::cast_possible_truncation)]
-        self.tokens.push(SemanticToken {
-            delta_line: relative.start.line as u32,
-            delta_start: relative.start.character as u32,
-            length: (relative.end.character - relative.start.character) as u32,
-            token_type: ty as u32,
-            token_modifiers_bitset: modifiers.iter().enumerate().fold(0, |mut total, (i, _)| {
-                total += 1 << i;
-                total
-            }),
-        });
+    #[allow(clippy::cast_possible_truncation)]
+    self.tokens.push(SemanticToken {
+      delta_line:             relative.start.line as u32,
+      delta_start:            relative.start.character as u32,
+      length:                 (relative.end.character - relative.start.character) as u32,
+      token_type:             ty as u32,
+      token_modifiers_bitset: modifiers.iter().enumerate().fold(0, |mut total, (i, _)| {
+        total += 1 << i;
+        total
+      }),
+    });
 
-        self.last_range = Some(range.into_lsp());
-    }
+    self.last_range = Some(range.into_lsp());
+  }
 
-    fn build(self) -> Vec<SemanticToken> {
-        self.tokens
-    }
+  fn build(self) -> Vec<SemanticToken> {
+    self.tokens
+  }
 }
