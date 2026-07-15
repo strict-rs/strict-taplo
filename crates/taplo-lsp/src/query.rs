@@ -107,10 +107,9 @@ impl Query {
           return false;
         };
 
-        let Some(bracket_end) =
-          header_syntax
-            .children_with_tokens()
-            .find_map(|t| if t.kind() == BRACKET_END { t.into_token() } else { None })
+        let Some(bracket_end) = header_syntax
+          .children_with_tokens()
+          .find_map(|t| if t.kind() == BRACKET_END { t.into_token() } else { None })
         else {
           return false;
         };
@@ -148,10 +147,9 @@ impl Query {
           return false;
         };
 
-        let Some(bracket_end) =
-          header_syntax
-            .children_with_tokens()
-            .find_map(|t| if t.kind() == BRACKET_END { t.into_token() } else { None })
+        let Some(bracket_end) = header_syntax
+          .children_with_tokens()
+          .find_map(|t| if t.kind() == BRACKET_END { t.into_token() } else { None })
         else {
           return false;
         };

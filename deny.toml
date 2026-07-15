@@ -1,0 +1,63 @@
+# cargo-deny configuration.
+#
+# See https://embarkstudios.github.io/cargo-deny/ for the full schema. This
+# template configures strict-but-reasonable defaults:
+#   - workspace crates have `publish = false` and carry the repo's ARR LICENSE,
+#     which is not SPDX-expressible; ignore the license check for them.
+#   - allow the permissive licenses commonly found on crates.io; reject anything
+#     else so copyleft dependencies surface before they ship.
+#   - ban non-crates.io sources and duplicate versions.
+
+# Audit the no-defaults + all-features graph so direct native engine dependencies
+# (`proptest` / `trybuild`) and the temporary `snapbox` adapter are genuinely
+# exercised instead of reported as unmatched in `[sources].allow-git`.
+[graph]
+all-features        = true
+no-default-features = true
+
+[licenses]
+confidence-threshold = 0.9
+private = { ignore = true }
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Zlib",
+  "CC0-1.0",
+  "MPL-2.0",
+]
+
+[bans]
+multiple-versions          = "warn"
+wildcards                  = "deny"
+highlight                  = "all"
+workspace-default-features = "allow"
+external-default-features  = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = [
+  "https://github.com/rust-lang/crates.io-index",
+]
+allow-git = [
+  "ssh://git@github.com/earthlings-dev/agents-md-rs.git",
+  "ssh://git@github.com/earthlings-dev/rust-mutant-fleet.git",
+  "ssh://git@github.com/earthlings-dev/strict-test-support-rs.git",
+  "ssh://git@github.com/earthlings-dev/strict-xtask-agents-md-rs.git",
+  "ssh://git@github.com/earthlings-dev/strict-xtask-cargo-rs.git",
+  "ssh://git@github.com/earthlings-dev/strict-xtask-core-rs.git",
+  "ssh://git@github.com/strict-rs/strict-bpaf.git",
+  "ssh://git@github.com/strict-rs/strict-pprof-rs.git",
+  "ssh://git@github.com/strict-rs/strict-rowan.git",
+  "ssh://git@github.com/strict-rs/strict-tracing.git",
+]
+
+[advisories]
+yanked = "deny"
+ignore = []

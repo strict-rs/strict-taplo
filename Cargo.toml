@@ -31,25 +31,25 @@ either             = { version = "1.16.0" }
 futures            = { version = "0.3.32" }
 getrandom          = { version = "0.4", default-features = false }
 glob               = { version = "0.3" }
-globset            = { version = "0.4.18" }
+globset            = "0.4"
 hex                = { version = "0.4" }
 indexmap           = { version = "2.14" }
 itertools          = { version = "0.15.0" }
 lsp-types          = { version = "0.97.0" }
 once_cell          = { version = "1.21" }
-parking_lot        = { version = "0.12.5" }
+parking_lot        = "0.12"
 regex              = { version = "1.13" }
 reqwest            = { version = "0.13.4", default-features = false }
 rowan              = { version = "0.17.0", git = "ssh://git@github.com/strict-rs/strict-rowan.git", branch = "upgrade" }
 schemars           = { version = "1.2.1" }
 serde              = { version = "1" }
-serde_json         = { version = "1.0.150" }
+serde_json         = "1"
 sha1               = { version = "0.11.0" }
 tap                = { version = "1.0.1" }
-thiserror          = { version = "2.0.18" }
+thiserror          = "2"
 time               = { version = "0.3.53" }
 tokio              = { version = "1.52.3", default-features = false }
-toml               = { version = "1.1" }
+toml               = "1.1"
 tracing            = { version = "0.1.44", git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict" }
 tracing-subscriber = { version = "0.3.23", git = "ssh://git@github.com/strict-rs/strict-tracing.git", branch = "strict" }
 url                = { version = "2.5.8" }
@@ -97,6 +97,7 @@ ignore = "0.4"
 toml_edit = "0.25"
 anstyle = "1"
 snapbox = { version = "1.2", features = ["diff"], default-features = false }
+proptest = { git = "ssh://git@github.com/strict-rs/strict-proptest.git", branch = "strict", version = "2", features = ["std", "strict-test"], default-features = false }
 
 [patch.crates-io]
 
@@ -1030,3 +1031,21 @@ codex-manifest  = ".codex-plugin/plugin.json"
 claude-manifest = ".claude-plugin/plugin.json"
 skills          = "skills"
 source          = { kind = "git", url = "git@github.com:earthlings-dev/agent-plugin-rust-template.git", branch = "main" }
+
+[patch."https://github.com/strict-rs/strict-taplo"]
+lsp-async-stub = { path = "crates/lsp-async-stub" }
+taplo = { path = "crates/taplo" }
+taplo-cli = { path = "crates/taplo-cli" }
+taplo-common = { path = "crates/taplo-common" }
+taplo-lsp = { path = "crates/taplo-lsp" }
+taplo-wasm = { path = "crates/taplo-wasm" }
+xtask = { path = "xtask" }
+
+[patch."ssh://git@github.com/strict-rs/strict-taplo.git"]
+lsp-async-stub = { path = "crates/lsp-async-stub" }
+taplo = { path = "crates/taplo" }
+taplo-cli = { path = "crates/taplo-cli" }
+taplo-common = { path = "crates/taplo-common" }
+taplo-lsp = { path = "crates/taplo-lsp" }
+taplo-wasm = { path = "crates/taplo-wasm" }
+xtask = { path = "xtask" }

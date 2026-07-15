@@ -33,4 +33,4 @@ strict-xtask-cargo.workspace = true
 strict-xtask-core.workspace = true
 
 [dev-dependencies]
-strict-test-support = { workspace = true }
+strict-test-support.workspace = true

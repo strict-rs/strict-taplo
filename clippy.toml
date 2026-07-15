@@ -1,0 +1,147 @@
+avoid-breaking-exported-api = false
+allow-unwrap-in-tests = false
+allow-expect-in-tests = false
+allow-panic-in-tests = false
+allow-dbg-in-tests = false
+allow-print-in-tests = false
+allow-indexing-slicing-in-tests = false
+allow-useless-vec-in-tests = false
+cognitive-complexity-threshold = 20
+excessive-nesting-threshold = 4 # mirrors tsconfig max-depth
+too-many-arguments-threshold = 7
+too-many-lines-threshold = 90
+type-complexity-threshold = 160
+enum-variant-size-threshold = 200
+enum-variant-name-threshold = 3
+large-error-threshold = 128
+pass-by-value-size-limit = 16
+single-char-binding-names-threshold = 3
+trivial-copy-size-limit = 16
+verbose-bit-mask-threshold = 1
+array-size-threshold = 512000
+stack-size-threshold = 512000
+future-size-threshold = 8192
+literal-representation-threshold = 10
+max-fn-params-bools = 2
+max-struct-bools = 2
+max-include-file-size = 1000000
+max-suggested-slice-pattern-length = 3
+max-trait-bounds = 3
+vec-box-size-threshold = 4096
+unnecessary-box-size = 128
+allowed-idents-below-min-chars = ["x", "y", "z", "i", "j", "n", "f"]
+doc-valid-idents = [".."]
+await-holding-invalid-types = [
+  "parking_lot::MutexGuard",
+  "parking_lot::MappedMutexGuard",
+  "parking_lot::RwLockReadGuard",
+  "parking_lot::MappedRwLockReadGuard",
+  "parking_lot::RwLockWriteGuard",
+  "parking_lot::MappedRwLockWriteGuard",
+]
+disallowed-names = [
+  "foo",
+  "bar",
+  "baz",
+  "tmp",
+  "temp",
+  "data",
+  "val",
+  "thing",
+  "stuff",
+  "date",
+  "todo",
+  "fixme",
+  "xxx",
+  "test",
+  "qux",
+  "info",
+  "value",
+  "item",
+  "price",
+  "amount",
+]
+disallowed-macros = [
+  { path = "std::dbg", reason = "debug artefact — remove before committing" },
+  { path = "std::todo", reason = "incomplete code must not land" },
+  { path = "std::unimplemented", reason = "incomplete code must not land" },
+  { path = "std::print", reason = "use tracing/log crate" },
+  { path = "std::println", reason = "use tracing/log crate" },
+  { path = "std::eprint", reason = "use tracing/log crate" },
+  { path = "std::eprintln", reason = "use tracing/log crate" },
+  { path = "anyhow::anyhow", reason = "typed errors only; anyhow is permitted only at bin/xtask boundary points" },
+  { path = "anyhow::bail", reason = "typed errors only; anyhow is permitted only at bin/xtask boundary points" },
+  { path = "anyhow::ensure", reason = "typed errors only; anyhow is permitted only at bin/xtask boundary points" },
+  { path = "std::assert", reason = "panics; return Result + strict_test_support::ensure / ensure_eq" },
+  { path = "std::assert_eq", reason = "panics; use strict_test_support::ensure_eq or ensure(a == b, ..)" },
+  { path = "std::assert_ne", reason = "panics; use strict_test_support::ensure_ne or ensure(a != b, ..)" },
+  { path = "std::debug_assert", reason = "panics in debug, silently dropped in release; model the invariant instead" },
+  { path = "std::debug_assert_eq", reason = "panics in debug, silently dropped in release; use strict_test_support::ensure_eq" },
+  { path = "std::debug_assert_ne", reason = "panics in debug, silently dropped in release; use strict_test_support::ensure_ne" },
+  { path = "proptest::proptest", reason = "panicking property harness; use proptest::strict::ensure_property", allow-invalid = true },
+  { path = "proptest::prop_assert", reason = "bypasses the TestFailure vocabulary; use strict_test_support::ensure inside the property closure", allow-invalid = true },
+  { path = "proptest::prop_assert_eq", reason = "bypasses the TestFailure vocabulary; use strict_test_support::ensure_eq inside the property closure", allow-invalid = true },
+  { path = "proptest::prop_assert_ne", reason = "bypasses the TestFailure vocabulary; use strict_test_support::ensure_ne inside the property closure", allow-invalid = true },
+  { path = "proptest::prop_assume", reason = "rejection belongs in the strategy; use Strategy::prop_filter", allow-invalid = true },
+  { path = "proptest::prelude::proptest", reason = "panicking property harness; use proptest::strict::ensure_property" },
+  { path = "proptest::prelude::prop_assert", reason = "bypasses the TestFailure vocabulary; use strict_test_support::ensure inside a proptest::strict::ensure_property closure" },
+  { path = "proptest::prelude::prop_assert_eq", reason = "bypasses the TestFailure vocabulary; use strict_test_support::ensure_eq inside a proptest::strict::ensure_property closure" },
+  { path = "proptest::prelude::prop_assert_ne", reason = "bypasses the TestFailure vocabulary; use strict_test_support::ensure_ne inside a proptest::strict::ensure_property closure" },
+  { path = "proptest::prelude::prop_assume", reason = "rejection belongs in the strategy; use Strategy::prop_filter" },
+  { path = "snapbox::assert_data_eq", reason = "panicking snapshot harness; use strict_test_support::ensure_snapshot" },
+]
+disallowed-methods = [
+  { path = "std::mem::forget", reason = "leaks resources; use drop or ManuallyDrop" },
+  { path = "std::process::exit", reason = "bypasses destructors; return from main instead" },
+  { path = "std::process::abort", reason = "bypasses destructors" },
+  { path = "std::env::set_var", reason = "racy in multi-threaded programs" },
+  { path = "std::env::remove_var", reason = "racy in multi-threaded programs" },
+  { path = "std::io::Error::new", reason = "ad-hoc error construction; define a typed error (e.g. via thiserror)", allow-invalid = true },
+  { path = "std::io::Error::other", reason = "ad-hoc error construction; define a typed error (e.g. via thiserror)", allow-invalid = true },
+  { path = "core::io::Error::new", reason = "ad-hoc error construction; define a typed error (e.g. via thiserror)", allow-invalid = true },
+  { path = "core::io::Error::other", reason = "ad-hoc error construction; define a typed error (e.g. via thiserror)", allow-invalid = true },
+  { path = "std::time::SystemTime::now", reason = "non-deterministic; inject the clock or derive time from the seeded RNG, use chrono::Utc::now" },
+  { path = "f64::to_string", reason = "financial precision" },
+  { path = "f32::to_string", reason = "financial precision" },
+  { path = "anyhow::Error::msg", reason = "typed errors only; anyhow is permitted only at bin/xtask boundary points" },
+  { path = "slice::split_at", reason = "panics if mid > len; use split_at_checked" },
+  { path = "slice::split_at_mut", reason = "panics if mid > len; use split_at_mut_checked" },
+  { path = "slice::chunks", reason = "panics if chunk size == 0; validate the size first" },
+  { path = "slice::chunks_exact", reason = "panics if chunk size == 0; validate the size first" },
+  { path = "slice::rchunks", reason = "panics if chunk size == 0; validate the size first" },
+  { path = "slice::rchunks_exact", reason = "panics if chunk size == 0; validate the size first" },
+  { path = "slice::windows", reason = "panics if size == 0; validate the size first" },
+  { path = "slice::copy_from_slice", reason = "panics on length mismatch; check lengths first" },
+  { path = "slice::clone_from_slice", reason = "panics on length mismatch; check lengths first" },
+  { path = "slice::rotate_left", reason = "panics if mid > len; validate first" },
+  { path = "slice::rotate_right", reason = "panics if k > len; validate first" },
+  { path = "slice::swap", reason = "panics on out-of-bounds index; use get/get_mut + mem::swap" },
+  { path = "std::vec::Vec::remove", reason = "panics if index out of bounds; check len first" },
+  { path = "std::vec::Vec::insert", reason = "panics if index > len; check len first" },
+  { path = "std::vec::Vec::swap_remove", reason = "panics if index out of bounds; check len first" },
+  { path = "std::vec::Vec::split_off", reason = "panics if at > len; check len first" },
+  { path = "std::vec::Vec::drain", reason = "panics if the range is out of bounds; validate the range" },
+  { path = "std::string::String::remove", reason = "panics off a char boundary; validate first" },
+  { path = "std::string::String::insert", reason = "panics off a char boundary; validate first" },
+  { path = "std::string::String::insert_str", reason = "panics off a char boundary; validate first" },
+  { path = "std::string::String::split_off", reason = "panics off a char boundary; validate first" },
+  { path = "std::string::String::drain", reason = "panics off char boundaries; validate first" },
+  { path = "std::string::String::truncate", reason = "panics off a char boundary; validate first" },
+  { path = "str::split_at", reason = "panics off a char boundary / past end; use split_at_checked" },
+  { path = "str::split_at_mut", reason = "panics off a char boundary / past end" },
+  { path = "std::time::Duration::from_secs_f64", reason = "panics on negative/NaN/overflow; use try_from_secs_f64" },
+  { path = "std::time::Duration::from_secs_f32", reason = "panics on negative/NaN/overflow; use try_from_secs_f32" },
+  { path = "std::time::Duration::mul_f64", reason = "panics on overflow / non-finite factor" },
+  { path = "std::time::Duration::mul_f32", reason = "panics on overflow / non-finite factor" },
+  { path = "std::time::Duration::div_f64", reason = "panics on overflow / non-finite divisor" },
+  { path = "std::time::Duration::div_f32", reason = "panics on overflow / non-finite divisor" },
+  { path = "std::cell::RefCell::borrow", reason = "panics on a borrow conflict; use try_borrow" },
+  { path = "std::cell::RefCell::borrow_mut", reason = "panics on a borrow conflict; use try_borrow_mut" },
+]
+disallowed-types = [
+  { path = "anyhow::Error", reason = "typed errors only; anyhow is permitted only at bin/xtask boundary points" },
+  { path = "anyhow::Result", reason = "typed errors only; use Result<T, YourCrateError>" },
+  { path = "std::sync::Mutex", reason = "prefer parking_lot in sync code; use async-aware primitives or redesign shared state in async code" },
+  { path = "std::sync::RwLock", reason = "prefer parking_lot in sync code; use async-aware primitives or redesign shared state in async code" },
+  { path = "std::sync::Condvar", reason = "prefer parking_lot in sync code; use async-aware signalling in async code" },
+]

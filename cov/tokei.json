@@ -2377,7 +2377,7 @@
   },
   "Rust": {
     "blanks": 2529,
-    "code": 19613,
+    "code": 19611,
     "comments": 115,
     "reports": [
       {
@@ -3005,7 +3005,7 @@
       {
         "stats": {
           "blanks": 69,
-          "code": 548,
+          "code": 546,
           "comments": 1,
           "blobs": {
             "Markdown": {
@@ -5118,7 +5118,7 @@
   },
   "Total": {
     "blanks": 4540,
-    "code": 25267,
+    "code": 25265,
     "comments": 3390,
     "reports": [],
     "children": {
@@ -7976,7 +7976,7 @@
         {
           "stats": {
             "blanks": 69,
-            "code": 548,
+            "code": 546,
             "comments": 1,
             "blobs": {
               "Markdown": {

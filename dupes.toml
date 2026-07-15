@@ -1,9 +1,26 @@
+# Duplication policy for `just cq` (cargo-dupes).
+#
+# Read from the repo root by `cargo dupes check` (see xtask/src/duplication.rs).
+# Config precedence: CLI flags > this file > Cargo.toml metadata.
+#
+# CALIBRATION: this repo has intentional, structurally-identical boilerplate
+# (the `pub fn x()/x_with()` subcommand wrappers in xtask/src/cmd.rs and the
+# RecordingRuntime-driven test fns). `min_nodes`/`min_lines` keep that small
+# boilerplate below the analysis floor so the zero-exact ceiling stays green,
+# and the `[token]`/`[line]` window floors below extend the same documented
+# line floor to the window-grain detection dimensions. A group that clears the
+# floors is adjudicated one of two ways: refactor it, or — when it is a
+# deliberately-retained pattern (pinned-contract test families, the spelled-out
+# twin gate pipelines, embedded fixture scripts) — register its fingerprint
+# with `cargo dupes ignore <fingerprint> --reason "..."` (the committed
+# `.dupes-ignore.toml`), rather than raising a ceiling.
+
 similarity_threshold = 0.9    # near-duplicate sensitivity (0.0..1.0)
-min_nodes = 40     # ignore small AST fragments
-min_lines = 8      # ignore short blocks
-exclude = ["target"]
+min_nodes            = 40     # ignore small AST fragments
+min_lines            = 8      # ignore short blocks
+exclude              = ["target"]
 max_exact_duplicates = 0      # zero exact copy-paste
-max_near_duplicates = 0      # zero near-duplicate groups at/above similarity_threshold
+max_near_duplicates  = 0      # zero near-duplicate groups at/above similarity_threshold
 
 [token]
 min_lines = 8                 # window-grain floor matches the documented min_lines

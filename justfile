@@ -163,9 +163,10 @@ cq:
 snap-update:
     cargo xtask snap-update
 
-# Rerun the test suite with STRICT_TEST_SEED=random so `ensure_property` draws
-# fresh entropy instead of its fixed seed; pin any counterexample as a named
-# unit test. Replay a specific seed with `STRICT_TEST_SEED=<n> just test`.
+# Rerun the test suite with STRICT_TEST_SEED=random so
+# `proptest::strict::ensure_property` draws fresh entropy instead of its fixed
+# seed; pin any counterexample as a named unit test. Replay a specific seed with
+# `STRICT_TEST_SEED=<n> just test`.
 
 # Rerun property tests with a random strict-test seed.
 fuzz:
