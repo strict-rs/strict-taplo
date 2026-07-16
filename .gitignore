@@ -17,14 +17,14 @@ wheels/
 **/*.rs.bk
 **/*.rmeta
 
-# Coverage reports (written by `cargo xtask coverage`)
-/cov/html/
+# Coverage reports (written by `template coverage`)
+cov/
 /report/
 
-# Code metrics (written by `cargo xtask cq`)
+# Code metrics (written by `template cq`)
 /metrics/
 
-# Mutation testing output (written by `cargo xtask mutants`)
+# Mutation testing output (written by `template mutants`)
 /mutants.out/
 /mutants.out.old/
 

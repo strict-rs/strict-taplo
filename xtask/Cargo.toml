@@ -7,7 +7,7 @@ authors      .workspace = true
 repository   .workspace = true
 publish      .workspace = true
 readme       .workspace = true
-description  = "Workspace automation runner — `cargo xtask <subcommand>`."
+description  = "Repository-specific `x` extension runner for the installed `template` workflow."
 default-run  = "xtask"
 
 [lib]
@@ -18,19 +18,13 @@ path = "src/lib.rs"
 name = "xtask"
 path = "src/main.rs"
 
-[[bin]]
-name = "precommit-hook"
-path = "src/precommit_hook.rs"
-
 # disabled for now
 # [lints]
 # workspace = true
 
 [dependencies]
-agents-md.workspace = true
-strict-xtask-agents-md.workspace = true
-strict-xtask-cargo.workspace = true
-strict-xtask-core.workspace = true
+template-core.workspace  = true
+template-xtask.workspace = true
 
 [dev-dependencies]
 strict-test-support.workspace = true

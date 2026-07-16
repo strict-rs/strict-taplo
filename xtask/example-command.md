@@ -1,208 +1,97 @@
 # Worked `just x` Extension Command
 
-The template ships with an empty local extension registry. That is intentional: `just x` is a stable consumer-owned seam, but no sample command is compiled into the template. Before a consumer adds commands, `just x` exits nonzero with:
+The template ships with an intentionally empty repository-specific extension registry. Standard workflows remain owned by the installed `template` binary; `just x` is the only consumer-compiled command seam.
 
-```text
-no extension commands are registered (add one in xtask/src/extensions.rs)
-```
+This example adds `just x release-notes -- --since <REF>` without changing the `justfile`, the installed catalog, or any reusable workflow crate.
 
-Use this document as the worked reference for adding the first project-specific command. The example below adds `just x release-notes -- --since <REF>` without changing reusable workflow crates, the `justfile`, CI, or any built-in command.
+## Add the parser dependency
 
-## Files Changed
-
-Adding a project command touches three existing local files and adds one new module:
-
-```text
-xtask/Cargo.toml       # add `bpaf.workspace = true` for the first bpaf-backed command
-xtask/src/
-├── lib.rs              # append `pub mod release_notes;`
-├── extensions.rs       # add the enum variant, run arm, and parser entry
-└── release_notes.rs    # new command module
-```
-
-`strict-xtask-core` owns the generic router through `extension_command_set`: parsing `x --from`, joining post-`--` passthrough tokens, rendering `bpaf` help/errors, handling the empty registry, and rebasing `CommandContext::invocation_dir()`.
-
-Because the empty template `xtask` does not depend on `bpaf` directly, add the direct dependency before creating the command module:
+The empty registry already depends on `template-core` and `template-xtask`. Add `bpaf` only when the repository gains its first typed extension parser:
 
 ```toml
 [dependencies]
 bpaf.workspace = true
-strict-xtask-agents-md.workspace = true
-strict-xtask-cargo.workspace = true
-strict-xtask-core.workspace = true
+template-core.workspace = true
+template-xtask.workspace = true
 ```
 
-## Command Module
+## Register the command
 
-Create `xtask/src/release_notes.rs`:
+Replace the empty body of `xtask/src/extensions.rs` with a typed repository-owned command enum and registry:
 
 ```rust
-//! Release-note extension command: `just x release-notes -- --since <REF>`.
+//! Consumer-owned registry for `just x <name>` commands.
 
-use bpaf::OptionParser;
 use bpaf::Parser as _;
 use bpaf::construct;
 use bpaf::long;
-use strict_xtask_core::CommandContext;
-use strict_xtask_core::ExtensionParser;
-use strict_xtask_core::extension_command;
-use strict_xtask_core::output::StatusKind;
-use strict_xtask_core::output::plain;
+use template_core::cli::command::CommandSet;
+use template_core::cli::output::plain;
 
-use crate::extensions::ProjectCommand;
-
-/// Parsed, validated arguments for `just x release-notes`.
+/// Arguments accepted by the release-note extension.
 #[derive(Clone, Debug)]
-pub(crate) struct Args {
-  /// Base git ref to compare against.
+struct ReleaseNotes {
+  /// Base Git reference to compare against.
   since: String,
 }
 
-/// Declare the command's `bpaf` options.
-#[allow(
-  clippy::single_call_fn,
-  reason = "a named options() keeps the extension parser beside the command it configures"
-)]
-fn options() -> OptionParser<Args> {
+/// Every repository-specific extension command.
+#[derive(Clone, Debug)]
+enum ProjectCommand {
+  /// Generate release notes from Git history.
+  ReleaseNotes(ReleaseNotes),
+}
+
+/// Build the repository extension registry.
+///
+/// # Errors
+///
+/// Returns a typed metadata or duplicate-name error before runner construction.
+pub fn commands() -> template_xtask::Result<CommandSet> {
   let since = long("since")
-    .help("Base git ref to compare against")
+    .help("Base Git reference to compare against")
     .argument::<String>("REF")
     .fallback("HEAD".to_owned());
-
-  construct!(Args {
+  let options = construct!(ReleaseNotes {
     since
   })
-  .to_options()
-  .descr("Generate release notes from git history")
-}
-
-/// Run the extension command.
-///
-/// # Errors
-///
-/// Returns an output error if writing a status line fails.
-#[allow(
-  clippy::single_call_fn,
-  reason = "extension dispatch calls the handler once through ProjectCommand::run"
-)]
-pub(crate) fn execute(context: &CommandContext, args: Args) -> strict_xtask_core::Result<()> {
-  let Args {
-    since,
-  } = args;
-  let invocation_dir = context.invocation_dir();
-
-  context.output().status(
-    StatusKind::Info,
-    plain(format!(
-      "building release notes since {since} from {}",
-      invocation_dir.display()
-    )),
-  )
-}
-
-/// Registry entry point referenced from `xtask/src/extensions.rs`.
-#[must_use]
-#[allow(
-  clippy::single_call_fn,
-  reason = "the command() seam is consumed once by the local extension registry"
-)]
-pub fn command() -> ExtensionParser<ProjectCommand> {
-  extension_command(
+  .to_options();
+  let release_notes = template_xtask::extension_command(
     "release-notes",
-    "Generate release notes from git history",
-    options(),
+    "Generate release notes from Git history",
+    options,
     ProjectCommand::ReleaseNotes,
+  )?;
+
+  template_xtask::registry(
+    "repository extensions",
+    vec![release_notes],
+    |command, context| match command {
+      ProjectCommand::ReleaseNotes(ReleaseNotes {
+        since,
+      }) => context.stdout(&plain(format!(
+        "building release notes since {since} from {}",
+        context.invocation_dir().display()
+      ))),
+    },
   )
 }
 ```
 
-Keep command arguments in the command module. The registry should only know the enum payload type and dispatch target.
+`template-xtask` rejects duplicate nested names before constructing the runner. Its top-level command set contains only `x` and is classified as `XtaskExtension`, so a repository extension cannot masquerade as an installed standard command.
 
-## Register The Module
+## Run the extension
 
-Append the module in `xtask/src/lib.rs`:
-
-```rust
-pub mod extensions;
-pub mod release_notes;
-```
-
-Then update `xtask/src/extensions.rs` from the empty registry to an inhabited one:
-
-```rust
-//! Consumer-owned extension registry for `just x <name>` commands.
-
-use strict_xtask_core::CommandContext;
-use strict_xtask_core::CommandSet;
-use strict_xtask_core::ExtensionParser;
-use strict_xtask_core::extension_command_set;
-
-use crate::release_notes;
-
-/// Every extension command this repository exposes under `just x <name>`.
-#[derive(Clone, Debug)]
-pub enum ProjectCommand {
-  /// Generate release notes from git history.
-  ReleaseNotes(release_notes::Args),
-}
-
-impl ProjectCommand {
-  /// Run the command selected by the extension parser.
-  ///
-  /// # Errors
-  ///
-  /// Propagates the selected command's error.
-  fn run(self, context: &CommandContext) -> strict_xtask_core::Result<()> {
-    match self {
-      Self::ReleaseNotes(args) => release_notes::execute(context, args),
-    }
-  }
-}
-
-/// Build the local extension command set.
-///
-/// # Errors
-///
-/// Returns an error if the top-level extension router cannot be registered.
-#[allow(
-  clippy::single_call_fn,
-  reason = "local xtask composition consumes this command set once when building the runner"
-)]
-pub fn commands() -> strict_xtask_core::Result<CommandSet> {
-  extension_command_set(
-    "local xtask extensions",
-    "x",
-    "Run a consumer-registered extension command",
-    "no extension commands are registered (add one in xtask/src/extensions.rs)",
-    parsers(),
-    ProjectCommand::run,
-  )
-}
-
-/// Build every extension parser in registration order.
-#[allow(
-  clippy::single_call_fn,
-  reason = "the parser list is named so new local extension registrations have a single obvious insertion point"
-)]
-fn parsers() -> Vec<ExtensionParser<ProjectCommand>> {
-  vec![release_notes::command()]
-}
-```
-
-## Run It
-
-Use `just x <name>` for the selected command and put the command's own dashed flags after `--`:
+The existing recipe forwards the directory from which `just` was invoked and places extension-owned dashed options after the passthrough separator:
 
 ```bash
 just x release-notes -- --since v1.2.0
 ```
 
-The `justfile` recipe forwards `--from "{{invocation_directory()}}"`, so `context.invocation_dir()` is the directory where the user ran `just`, even though the runner anchors reusable workflows at the workspace root.
-
-Per-command help comes from the command module's `bpaf` parser:
+Per-command help and parser failures use the shared `bpaf` renderer:
 
 ```bash
 just x release-notes -- --help
 ```
 
-Unknown names, missing arguments, validation failures, and the empty-registry case all go through the shared `strict-xtask-core` parser/error renderer.
+Direct `xtask` invocation remains guarded. Use `just x` locally; CI may invoke the extension runner with its existing `CI` signal.

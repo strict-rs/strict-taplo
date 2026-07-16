@@ -1,0 +1,149 @@
+schema-version = "0.1.0"
+
+[template]
+id = "rust-template"
+
+[template.source]
+kind = "git"
+url = "https://github.com/takumi-earth/rust-template.git"
+branch = "main"
+
+[ecosystems]
+order = ["cargo"]
+
+[ecosystems.cargo.layout]
+kind = "members-dir"
+members-dir = "crates"
+
+[ecosystems.cargo.update]
+lockfile-refresh = "when-managed-dependencies-change"
+
+[ecosystems.cargo.update.workspace]
+dependencies = [
+  "anstyle",
+  "bpaf",
+  "cargo_metadata",
+  "globset",
+  "ignore",
+  "parking_lot",
+  "proc-macro2",
+  "proptest",
+  "serde_json",
+  "snapbox",
+  "strict-test-support",
+  "syn",
+  "template-core",
+  "template-xtask",
+  "thiserror",
+  "toml",
+  "toml_edit",
+  "trybuild",
+]
+
+[[ecosystems.cargo.update.manifests]]
+path = "xtask/Cargo.toml"
+dependencies = ["template-core", "template-xtask"]
+dev-dependencies = ["strict-test-support"]
+
+[update.opt-outs]
+files = []
+defaults = []
+keys = []
+elements = []
+
+[guidance]
+
+[guidance.source]
+kind = "git"
+url = "https://github.com/earthlings-dev/agents-md-rs.git"
+branch = "main"
+fragments-root = "fragments"
+
+[managed-children]
+preserve-unknown = true
+
+[[managed-children.repositories]]
+id = "agent-plugin.rust-template-core"
+path = ".agents/plugins/rust-template-core"
+url = "https://github.com/earthlings-dev/agentic-plugin-rust-template.git"
+branch = "main"
+
+[[managed-children.repositories]]
+id = "agent-plugin.strict-adoption"
+path = ".agents/plugins/strict-adoption"
+url = "https://github.com/earthlings-dev/agentic-plugin-strict-adoption.git"
+branch = "main"
+
+[gates]
+format = ["rustfmt.toml"]
+lint = ["Cargo.toml", "clippy.toml"]
+audit = ["deny.toml"]
+code-quality = ["dupes.toml", ".jscpd.json"]
+toolchain = ["rust-toolchain.toml"]
+github = [".github/dependabot.yml", ".github/workflows/ci.yml", ".github/workflows/scheduled.yml"]
+automation = ["justfile"]
+guidance = ["AGENTS.md", "README.md", "crates/AGENTS.md", "xtask/AGENTS.md"]
+repository = [".gitattributes", ".gitmodules", "LICENSE"]
+
+[[gates.rules]]
+id = "coverage-contract"
+when-any = ["glob:badges/**"]
+command = "just coverage --per-file"
+reason = "changed generated coverage badges"
+fallout = ["Coverage workflows may refresh reports under `cov/` and the full badge set under `badges/`."]
+
+[[gates.rules]]
+id = "feature-matrix"
+when-any = ["path:Cargo.toml", "path:Cargo.lock", "glob:**/Cargo.toml"]
+command = "just hack"
+reason = "changed feature declarations or workspace dependency wiring"
+
+[[gates.rules]]
+id = "tests-or-behavior"
+when-any = ["glob:**/*.rs", "glob:**/tests/**", "glob:**/*.snap", "glob:**/*.stderr"]
+command = "just mutants"
+reason = "changed tests or behavior where missed assertions are plausible"
+
+[[gates.rules]]
+id = "guidance"
+when-any = ["glob:fragments/**", "glob:docs/fragments/**", "path:AGENTS.md", "glob:**/AGENTS.md", "path:README.md", "glob:**/README.md", "path:CLAUDE.md"]
+command = "just gen-md"
+reason = "changed generated-doc fragments or generated doc targets"
+fallout = ["Generated Markdown docs may be rewritten."]
+
+[[gates.rules]]
+id = "plugins"
+when-any = ["glob:.agents/plugins/**", "path:.gitmodules", "path:.agents/plugins/marketplace.json"]
+command = "skills-ref validate .agents/plugins/rust-template-core/skills/*"
+reason = "changed bundled agent skills or repo marketplace entries"
+
+[[gates.rules]]
+id = "shared-workflow"
+when-any = ["glob:xtask/**", "glob:.github/workflows/**", "path:justfile", "path:clippy.toml", "path:rustfmt.toml", "path:deny.toml", "path:dupes.toml", "path:.jscpd.json", "path:rust-toolchain.toml", "path:template-lint.toml", "path:template-clippy.toml"]
+command = "just ci"
+reason = "changed shared workflow, policy, or xtask automation"
+exclusive = true
+fallout = ["`just ci`, `just cq`, any coverage workflow, or the pre-commit hook may refresh transient reports under `cov/` and committed `badges/`."]
+
+[[gates.rules]]
+id = "rust-code"
+when-any = ["glob:**/*.rs", "path:Cargo.lock", "glob:**/Cargo.toml"]
+command = "just fmt && just lint && just test-all"
+reason = "changed Rust code or workspace manifests"
+
+[[agent-plugins.plugins]]
+id = "rust-template-core"
+path = ".agents/plugins/rust-template-core"
+source = { kind = "git", url = "https://github.com/earthlings-dev/agentic-plugin-rust-template.git", branch = "main" }
+
+[[agent-plugins.plugins]]
+id = "strict-adoption"
+path = ".agents/plugins/strict-adoption"
+source = { kind = "git", url = "https://github.com/earthlings-dev/agentic-plugin-strict-adoption.git", branch = "main" }
+
+[deviations.justfile]
+
+[[deviations.justfile.recipes]]
+file = "justfile"
+name = "x"
+reason = "strict-taplo retains a repository-specific extension seam while standard workflows use the installed template binary"
