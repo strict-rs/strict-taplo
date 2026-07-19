@@ -57,8 +57,8 @@ pub mod util;
 
 pub use rowan;
 
-pub type HashMap<K, V> = ahash::AHashMap<K, V>;
-pub type HashSet<V> = ahash::AHashSet<V>;
+pub type HashMap<K, V> = std::collections::HashMap<K, V, std::collections::hash_map::RandomState>;
+pub type HashSet<V> = std::collections::HashSet<V, std::collections::hash_map::RandomState>;
 
 #[cfg(test)]
 mod tests;

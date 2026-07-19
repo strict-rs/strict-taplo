@@ -24,10 +24,10 @@ pub mod util;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-pub type HashMap<K, V> = std::collections::HashMap<K, V, ahash::RandomState>;
-pub type IndexMap<K, V> = indexmap::IndexMap<K, V, ahash::RandomState>;
+pub type HashMap<K, V> = std::collections::HashMap<K, V, std::collections::hash_map::RandomState>;
+pub type IndexMap<K, V> = indexmap::IndexMap<K, V, std::collections::hash_map::RandomState>;
 
 pub type AsyncMutex<T> = tokio::sync::Mutex<T>;
 pub type AsyncRwLock<T> = tokio::sync::RwLock<T>;
 
-pub type LruCache<K, V> = lru::LruCache<K, V, ahash::RandomState>;
+pub type LruCache<K, V> = lru::LruCache<K, V, std::collections::hash_map::RandomState>;

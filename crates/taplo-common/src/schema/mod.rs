@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::collections::hash_map::RandomState;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -148,7 +149,7 @@ impl<E: Environment> Schemas<E> {
       http,
       validators: Arc::new(Mutex::new(LruCache::with_hasher(
         NonZeroUsize::new(3).unwrap_or(NonZeroUsize::MIN),
-        ahash::RandomState::new(),
+        RandomState::new(),
       ))),
     }
   }

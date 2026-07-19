@@ -21,7 +21,6 @@ reqwest    = ["dep:reqwest"]
 [dependencies]
 taplo = { workspace = true, features = ["schema", "serde"] }
 
-ahash              = { workspace = true, features = ["serde"] }
 anyhow             = { workspace = true }
 arc-swap           = { workspace = true }
 async-recursion    = { workspace = true }

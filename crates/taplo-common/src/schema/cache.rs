@@ -1,3 +1,4 @@
+use std::collections::hash_map::RandomState;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
@@ -50,7 +51,7 @@ impl<E: Environment> Cache<E> {
       env,
       schemas: Arc::new(Mutex::new(LruCache::with_hasher(
         NonZeroUsize::new(10).unwrap_or(NonZeroUsize::MIN),
-        ahash::RandomState::new(),
+        RandomState::new(),
       ))),
       disk_root: Default::default(),
     }

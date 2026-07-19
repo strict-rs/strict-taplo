@@ -24,17 +24,13 @@ mod tests {
 
   #[test]
   fn extension_registry_exposes_only_the_local_x_router() -> Result<(), TestFailure> {
-    let command_set = ensure_ok(
-      extensions::commands(),
-      "the local extension registry must build",
-    )?;
+    let command_set = ensure_ok(extensions::commands(), "the local extension registry must build")?;
     let descriptors = command_set.descriptors();
     ensure(
       descriptors.len() == 1
-        && descriptors.first().is_some_and(|descriptor| {
-          descriptor.name() == "x"
-            && descriptor.surface() == CommandSurface::XtaskExtension
-        }),
+        && descriptors
+          .first()
+          .is_some_and(|descriptor| descriptor.name() == "x" && descriptor.surface() == CommandSurface::XtaskExtension),
       "the consumer runner must expose only the local x extension surface",
     )
   }
