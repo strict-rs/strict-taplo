@@ -1,13 +1,12 @@
 [workspace]
-exclude = ["util/test-gen"]
-members = ["crates/*", "xtask"]
+members = ["crates/*", "stask"]
 
 resolver = "3"
 
 [workspace.package]
 authors      = ["tamasfe", "Takumi"]
 edition      = "2024"
-version = "0.15.0"
+version = "0.16.0"
 publish = false
 license      = "MIT"
 license-file = "LICENSE"
@@ -16,18 +15,15 @@ homepage     = "https://github.com/strict-rs/strict-taplo"
 repository   = "https://github.com/strict-rs/strict-taplo"
 
 [workspace.dependencies]
-lsp-async-stub = { version = "0.15.0", path = "crates/lsp-async-stub", default-features = false }
-taplo        = { version = "0.15.0", path = "crates/taplo", default-features = false }
-taplo-cli      = { version = "0.15.0", path = "crates/taplo-cli", default-features = false }
-taplo-common = { version = "0.15.0", path = "crates/taplo-common", default-features = false }
-taplo-lsp    = { version = "0.15.0", path = "crates/taplo-lsp", default-features = false }
+taplo-lsp-async = { version = "0.16.0", path = "crates/taplo-lsp-async", default-features = false }
+taplo        = { version = "0.16.0", path = "crates/taplo", default-features = false }
+taplo-cli      = { version = "0.16.0", path = "crates/taplo-cli", default-features = false }
+taplo-common = { version = "0.16.0", path = "crates/taplo-common", default-features = false }
+taplo-lsp    = { version = "0.16.0", path = "crates/taplo-lsp", default-features = false }
+taplo-test-support = { version = "0.16.0", path = "crates/taplo-test-support" }
 
-anyhow             = { version = "1.0.103" }
-arc-swap           = { version = "1.9.2" }
-async-trait        = { version = "0.1.89" }
-clap               = { version = "4.6.1", default-features = false, features = ["std"] }
-either             = { version = "1.16.0" }
-futures            = { version = "0.3.32" }
+clap               = { version = "4.6.2", default-features = false, features = ["std"] }
+futures            = { version = "0.3.33" }
 getrandom          = { version = "0.4", default-features = false }
 glob               = { version = "0.3" }
 globset            = "0.4"
@@ -35,34 +31,30 @@ hex                = { version = "0.4" }
 indexmap           = { version = "2.14" }
 itertools          = { version = "0.15.0" }
 lsp-types          = { version = "0.97.0" }
-once_cell          = { version = "1.21" }
 parking_lot        = "0.12"
 regex              = { version = "1.13" }
 reqwest            = { version = "0.13.4", default-features = false }
-rowan              = { version = "0.17.0", git = "https://github.com/strict-rs/strict-rowan.git", branch = "upgrade"}
+rowan              = { version = "0.17.0", git = "https://github.com/strict-rs/strict-rowan.git", branch = "strict"}
 schemars           = { version = "1.2.1" }
 serde              = { version = "1" }
 serde_json         = "1"
 sha1               = { version = "0.11.0" }
-tap                = { version = "1.0.1" }
-thiserror          = { version = "2"}
+thiserror          = { version = "2", git = "https://github.com/strict-rs/strict-thiserror.git", branch = "upgrade"}
 time               = { version = "0.3.53" }
-tokio              = { version = "1.52.3", default-features = false }
+tokio              = { version = "1.53.0", default-features = false }
 toml               = "1.1"
-tracing            = { version = "0.1.44", git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict"}
-tracing-subscriber = { version = "0.3.23", git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict"}
+tracing            = { version = "0.4.0", git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict"}
+tracing-subscriber = { version = "0.4.0", git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict"}
 url                = { version = "2.5.8" }
 
 # Consolidated
-logos      = { version = "0.16.1" }
+logos      = { version = "0.17.0", git = "https://github.com/strict-rs/strict-logos.git", branch = "upgrade" }
 codespan-reporting = { version = "0.13.1" }
-ansi_term     = { version = "0.12" }
 async-ctrlc   = { version = "1.2.0", features = ["stream"] }
 clap_complete = { version = "4.6.7" }
 prettydiff    = { version = "0.9.0", default-features = false }               # `prettydiff` is also a CLI that pulls in `clap` by default
-async-recursion    = { version = "1.1.1" }
 json_value_merge   = { version = "2.0.1" }
-jsonschema         = { version = "0.47.0", default-features = false }
+jsonschema         = { version = "0.48.1", default-features = false }
 lru                = { version = "0.18.1" }
 percent-encoding   = { version = "2.3.2" }
 rustls             = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
@@ -76,66 +68,40 @@ wasm-bindgen         = { version = "0.2.126" }
 wasm-bindgen-futures = { version = "0.4.76" }
 
 # Consolidated Dev Deps
-assert-json-diff = { version = "2" }
 criterion        = { version = "0.8" }   # criterion -> clap
-difference       = { version = "2.0.0" }
-pprof = { version = "0.16",  features = ["flamegraph", "criterion"], git = "https://github.com/strict-rs/strict-pprof-rs.git", branch = "upgrade" } # pprof -> criterion -> clap
+pprof = { version = "0.16",  features = ["flamegraph", "criterion"], git = "https://github.com/strict-rs/strict-pprof-rs.git", branch = "strict"} # pprof -> criterion -> clap
 
-bpaf = {  version = "0.10", default-features = false, git = "https://github.com/strict-rs/strict-bpaf.git", branch = "sync" }
-template-core = { version = "0.1.0", git = "https://github.com/earthlings-dev/template-rs.git", branch = "main"}
-template-xtask = { version = "0.1.0", git = "https://github.com/earthlings-dev/template-rs.git", branch = "main"}
-trybuild = {  version = "1", git = "https://github.com/strict-rs/strict-trybuild.git", branch = "strict" }
+bpaf = {  version = "0.10", default-features = false, git = "https://github.com/strict-rs/strict-bpaf.git", branch = "sync"}
+template-core = { version = "0.2.0", git = "https://github.com/earthlings-dev/template-rs.git", branch = "main"}
+template-stask = { version = "0.2.0", git = "https://github.com/earthlings-dev/template-rs.git", branch = "main"}
+trybuild = {  version = "1", git = "https://github.com/strict-rs/strict-trybuild.git", branch = "strict"}
 strict-test-support = { version = "0.1.0", git = "https://github.com/earthlings-dev/strict-test-support-rs.git", branch = "main"}
 
-syn         = { version = "2", features = ["full", "visit"] }
+syn         = { version = "3", features = ["full", "visit"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
 cargo_metadata = "0.23"
 ignore = "0.4"
 toml_edit = "0.25"
 anstyle = "1"
 snapbox = { version = "1.2", features = ["diff"], default-features = false }
-proptest = {  version = "2", features = ["std", "strict-test"], default-features = false, git = "https://github.com/strict-rs/strict-proptest.git", branch = "strict" }
+proptest = {  version = "2", features = ["std", "strict-test"], default-features = false, git = "https://github.com/strict-rs/strict-proptest.git", branch = "strict"}
 
 [patch.crates-io]
-
-pprof = {  version = "0.16", git = "https://github.com/strict-rs/strict-pprof-rs.git", branch = "upgrade" }
-
-# strict-proptest (comment out if unused, do not remove)
-# proptest = { version = "2", git = "https://github.com/strict-rs/strict-proptest.git", branch = "strict" }
-# proptest-macro = { version = "2", git = "https://github.com/strict-rs/strict-proptest.git", branch = "strict" }
-# proptest-state-machine = { version = "2", git = "https://github.com/strict-rs/strict-proptest.git", branch = "strict" }
-# proptest-derive = { version = "2", git = "https://github.com/strict-rs/strict-proptest.git", branch = "strict" }
-
-# strict-trybuild (comment out if unused, do not remove)
-# trybuild = { git = "https://github.com/strict-rs/strict-trybuild.git", branch = "strict", version = "1" }
-
-# strict-bpaf (comment out if unused, do not remove)
-bpaf = {  version = "0.10", git = "https://github.com/strict-rs/strict-bpaf.git", branch = "sync" }
-# bpaf_derive = { git = "https://github.com/strict-rs/strict-bpaf.git", branch = "sync", version = "0.10.0" }
-# bpaf_cauwugo = { git = "https://github.com/strict-rs/strict-bpaf.git", branch = "sync", version = "0.10.0" }
-
-# strict-tracing (comment out if unused, do not remove)
-tracing = {  version = "0.1.44", git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict" }
-# tracing-appender = { git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.2.5" }
-tracing-attributes = {  version = "0.1.31", git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict" }
-tracing-core = {  version = "0.1.36", git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict" }
-# tracing-error = { git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.2.1" }
-# tracing-flame = { git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.2.0" }
-# tracing-futures = { git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.2.5" }
-# tracing-journald = { git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.3.2" }
-tracing-log = {  version = "0.2.0", git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict" }
-# tracing-mock = { git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.1.0-beta.3" }
-# tracing-serde = { git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.2.0" }
-tracing-subscriber = {  version = "0.3.23", git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict" }
-# tracing-test = { git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.1.0" }
-# tracing-tower = { git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict", version = "0.1.0" }
-
-# lsp-async-stub = { version = "0.15.0", git = "https://github.com/strict-rs/strict-taplo.git", branch = "strict" }
-# taplo        = { version = "0.15.0", git = "https://github.com/strict-rs/strict-taplo.git", branch = "strict" }
-# taplo-cli      = { version = "0.15.0", git = "https://github.com/strict-rs/strict-taplo.git", branch = "strict" }
-# taplo-common = { version = "0.15.0", git = "https://github.com/strict-rs/strict-taplo.git", branch = "strict" }
-# taplo-lsp    = { version = "0.15.0", git = "https://github.com/strict-rs/strict-taplo.git", branch = "strict" }
-# taplo-wasm    = { version = "0.15.0", git = "https://github.com/strict-rs/strict-taplo.git", branch = "strict" }
+pprof = { git = "https://github.com/strict-rs/strict-pprof-rs.git", branch = "strict"}
+bpaf = { git = "https://github.com/strict-rs/strict-bpaf.git", branch = "sync"}
+tracing = { git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict" }
+tracing-core = { git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict" }
+tracing-attributes = { git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict" }
+tracing-attributes-internal = { git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict" }
+tracing-log = { git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict" }
+tracing-subscriber = { git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict" }
+rowan = { git = "https://github.com/strict-rs/strict-rowan.git", branch = "strict" }
+thiserror = { git = "https://github.com/strict-rs/strict-thiserror.git", branch = "upgrade" }
+taplo = { path = "crates/taplo" }
+taplo-cli = { path = "crates/taplo-cli" }
+taplo-common = { path = "crates/taplo-common" }
+taplo-lsp = { path = "crates/taplo-lsp" }
+taplo-wasm = { path = "crates/taplo-wasm" }
 
 # Original Taplo Release Profile
 # [profile.release]
@@ -177,27 +143,390 @@ opt-level        = 0
 overflow-checks  = true
 debug            = true
 
-[patch]
-
 # ─── cargo-machete integration ─────────────────────────────────────────────
 [workspace.metadata.cargo-machete]
 # Deps intentionally unused in the workspace root can be listed here.
 ignored = []
 
-[patch."https://github.com/strict-rs/strict-taplo"]
-lsp-async-stub = { path = "crates/lsp-async-stub" }
-taplo = { path = "crates/taplo" }
-taplo-cli = { path = "crates/taplo-cli" }
-taplo-common = { path = "crates/taplo-common" }
-taplo-lsp = { path = "crates/taplo-lsp" }
-taplo-wasm = { path = "crates/taplo-wasm" }
-xtask = { path = "xtask" }
+# ═════════════════════════════════════════════════════════════════════════════
+# Lint policy — rustc
+# ─────────────────────────────────────────────────────────────────────────────
+# `priority = -1` = applied before individual lints, so specific overrides
+# win. `forbid` cannot be relaxed even with `#[allow]`. `deny` can.
+# ═════════════════════════════════════════════════════════════════════════════
 
-[patch."https://github.com/strict-rs/strict-taplo.git"]
-lsp-async-stub = { path = "crates/lsp-async-stub" }
-taplo = { path = "crates/taplo" }
-taplo-cli = { path = "crates/taplo-cli" }
-taplo-common = { path = "crates/taplo-common" }
-taplo-lsp = { path = "crates/taplo-lsp" }
-taplo-wasm = { path = "crates/taplo-wasm" }
-xtask = { path = "xtask" }
+[workspace.lints.rust]
+# ── Absolute prohibitions ────────────────────────────────────────────────
+unsafe_code                             = "forbid"
+
+# ── Group-level floors (every lint in the group starts at deny) ─────────
+future_incompatible                     = { level = "deny", priority = -1 }
+rust_2018_idioms                        = { level = "deny", priority = -1 }
+rust_2021_compatibility                 = { level = "deny", priority = -1 }
+rust_2024_compatibility                 = { level = "deny", priority = -1 }
+nonstandard_style                       = { level = "deny", priority = -1 }
+let_underscore                          = { level = "deny", priority = -1 }
+unused                                  = { level = "deny", priority = -1 }
+deprecated_safe                         = { level = "deny", priority = -1 }
+keyword_idents                          = { level = "deny", priority = -1 }
+
+# ── Individual lints not covered by a group ─────────────────────────────
+missing_docs                            = "deny"
+missing_debug_implementations           = "deny"
+unreachable_pub                         = "deny"
+trivial_casts                           = "deny"
+trivial_numeric_casts                   = "deny"
+unused_lifetimes                        = "deny"
+unused_qualifications                   = "deny"
+unused_import_braces                    = "deny"
+unused_extern_crates                    = "deny"
+unused_results                          = "deny"
+unused_macro_rules                      = "deny"
+single_use_lifetimes                    = "deny"
+elided_lifetimes_in_paths               = "deny"
+meta_variable_misuse                    = "deny"
+non_ascii_idents                        = "deny"
+noop_method_call                        = "deny"
+macro_use_extern_crate                  = "deny"
+absolute_paths_not_starting_with_crate  = "deny"
+variant_size_differences                = "deny"
+redundant_lifetimes                     = "deny"
+refining_impl_trait_internal            = "deny"
+refining_impl_trait_reachable           = "deny"
+ambiguous_negative_literals             = "deny"
+
+# Native `async fn` in owned public traits is the workspace async contract: we
+# ban `async_trait` and target stable async-in-trait. Keep the `async fn` form
+# for owned service, port, repository, adapter, validator, lifecycle, reader, and
+# writer traits rather than rustc's manual `-> impl Future` desugaring;
+# `clippy::manual_async_fn` (deny) rejects that escape hatch. Caveat: these
+# futures are not `Send`-bounded — return an explicit `impl Future + Send` for a
+# trait that must be driven across threads.
+async_fn_in_trait                       = "allow"
+
+# When a small plain-value type can be `Copy`, treat that as a design review
+# prompt rather than a mandate. `Copy` can make APIs nicer for tiny enums,
+# coordinates, IDs, and other value types that behave like numbers.
+#
+# At the same time, `Copy` is a public-semver commitment. Do not add it just to
+# silence the lint if ownership, future extensibility, or drop behavior might
+# matter later.
+missing_copy_implementations            = "warn"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Lint policy — rustdoc
+# ─────────────────────────────────────────────────────────────────────────────
+# NOTE: rustdoc lints fire during a DOC BUILD (`cargo doc` / `cargo xdoc`), not
+# during `cargo check` / `clippy` / `test`. The installed `template ci`
+# pipeline runs the documentation phase, so these deny levels are a hard CI
+# gate as well as gating `cargo doc` locally and on docs.rs.
+# ═════════════════════════════════════════════════════════════════════════════
+
+[workspace.lints.rustdoc]
+# Intra-doc link integrity: unresolved `[Type]` / `[mod::item]` links, and public
+# items linking to a private one (renders as broken on docs.rs).
+broken_intra_doc_links                  = "deny"
+private_intra_doc_links                 = "deny"
+# Every crate root must carry a `//!` summary (complements `rust::missing_docs`).
+missing_crate_level_docs                = "deny"
+# Real links over raw URLs; balanced backticks; `rust` fences must parse as Rust
+# (label non-Rust examples ```text / ```ignore).
+bare_urls                               = "deny"
+unescaped_backticks                     = "deny"
+invalid_rust_codeblocks                 = "deny"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Lint policy — clippy
+# ─────────────────────────────────────────────────────────────────────────────
+# Eight of the nine clippy groups run at `deny`. The ninth — `restriction` —
+# contains mutually-contradictory lints (e.g. `implicit_return` vs
+# `needless_return`), so we keep the group at `allow` and individually promote
+# the restriction lints we want. See comments below.
+# ═════════════════════════════════════════════════════════════════════════════
+
+[workspace.lints.clippy]
+# ── Group floors ────────────────────────────────────────────────────────
+correctness = { level = "deny",  priority = -1 }
+suspicious  = { level = "deny",  priority = -1 }
+complexity  = { level = "deny",  priority = -1 }
+perf        = { level = "deny",  priority = -1 }
+style       = { level = "deny",  priority = -1 }
+pedantic    = { level = "deny",  priority = -1 }
+nursery     = { level = "deny",  priority = -1 }
+cargo       = { level = "deny",  priority = -1 }
+restriction = { level = "allow", priority = -1 }  # opt-in individually below
+
+# ─────────────────────────────────────────────────────────────────────────
+# Axis 1 — Type safety
+# ─────────────────────────────────────────────────────────────────────────
+as_conversions                           = "deny"
+as_underscore                            = "deny"
+as_ptr_cast_mut                          = "deny"
+cast_lossless                            = "deny"
+cast_possible_truncation                 = "deny"
+cast_possible_wrap                       = "deny"
+cast_precision_loss                      = "deny"
+cast_sign_loss                           = "deny"
+cast_ptr_alignment                       = "deny"
+char_lit_as_u8                           = "deny"
+fn_to_numeric_cast_any                   = "deny"
+ptr_as_ptr                               = "deny"
+borrow_as_ptr                            = "deny"
+float_arithmetic                         = "deny"
+float_cmp                                = "deny"
+float_cmp_const                          = "deny"
+lossy_float_literal                      = "deny"
+integer_division                         = "deny"
+integer_division_remainder_used          = "deny"
+modulo_arithmetic                        = "deny"
+arithmetic_side_effects                  = "deny"
+invalid_upcast_comparisons               = "deny"
+suspicious_xor_used_as_pow               = "deny"
+unchecked_time_subtraction               = "deny"
+
+# ─────────────────────────────────────────────────────────────────────────
+# Axis 2 — Memory safety (beyond unsafe_code = "forbid")
+# ─────────────────────────────────────────────────────────────────────────
+mem_forget                               = "deny"
+clone_on_ref_ptr                         = "deny"
+undocumented_unsafe_blocks               = "deny"
+multiple_unsafe_ops_per_block            = "deny"
+unnecessary_safety_comment               = "deny"
+unnecessary_safety_doc                   = "deny"
+transmute_ptr_to_ref                     = "deny"
+transmute_ptr_to_ptr                     = "deny"
+transmute_undefined_repr                 = "deny"
+ref_as_ptr                               = "deny"
+ptr_eq                                   = "deny"
+rc_buffer                                = "deny"
+rc_mutex                                 = "deny"
+mutex_atomic                             = "deny"
+mutex_integer                            = "deny"
+non_send_fields_in_send_ty               = "deny"
+
+# ─────────────────────────────────────────────────────────────────────────
+# Axis 3 — Rust 2027 / future-idiom readiness & static dispatch preference
+# ─────────────────────────────────────────────────────────────────────────
+mod_module_files                         = "deny"
+absolute_paths                           = "deny"
+semicolon_if_nothing_returned            = "deny"
+semicolon_outside_block                  = "deny"
+explicit_iter_loop                       = "deny"
+explicit_into_iter_loop                  = "deny"
+manual_let_else                          = "deny"
+redundant_else                           = "deny"
+map_unwrap_or                            = "deny"
+needless_collect                         = "deny"
+redundant_pub_crate                      = "deny"
+borrowed_box                             = "deny"
+box_collection                           = "deny"
+redundant_allocation                     = "deny"
+vec_box                                  = "deny"
+unnecessary_box_returns                  = "deny"
+manual_async_fn                          = "deny"
+large_futures                            = "deny"
+
+# ─────────────────────────────────────────────────────────────────────────
+# Axis 4 — Correctness promotions (on top of group deny)
+# ─────────────────────────────────────────────────────────────────────────
+missing_safety_doc                       = "deny"
+missing_panics_doc                       = "deny"
+missing_errors_doc                       = "deny"
+missing_assert_message                   = "deny"
+missing_asserts_for_indexing             = "deny"
+must_use_candidate                       = "deny"
+return_self_not_must_use                 = "deny"
+unused_self                              = "deny"
+unused_async                             = "deny"
+unused_trait_names                       = "deny"
+needless_pass_by_value                   = "deny"
+needless_pass_by_ref_mut                 = "deny"
+inefficient_to_string                    = "deny"
+string_add_assign                        = "deny"
+same_name_method                         = "deny"
+same_functions_in_if_condition           = "deny"
+trait_duplication_in_bounds              = "deny"
+type_repetition_in_bounds                = "deny"
+iter_over_hash_type                      = "deny"
+iter_without_into_iter                   = "deny"
+into_iter_without_iter                   = "deny"
+pattern_type_mismatch                    = "deny"
+rest_pat_in_fully_bound_structs          = "deny"
+wildcard_enum_match_arm                  = "deny"
+match_wild_err_arm                       = "deny"
+match_wildcard_for_single_variants       = "deny"
+match_same_arms                          = "deny"
+match_bool                               = "deny"
+
+# ─────────────────────────────────────────────────────────────────────────
+# Axis 5 — Block AI "pragmatic / simpler / TODO" shortcuts
+# ─────────────────────────────────────────────────────────────────────────
+# Stubs masquerading as implementations
+todo                                     = "deny"
+unimplemented                            = "deny"
+unreachable                              = "deny"
+panic                                    = "deny"
+panic_in_result_fn                       = "deny"
+empty_loop                               = "deny"
+empty_drop                               = "deny"
+empty_enums                              = "deny"
+empty_structs_with_brackets              = "deny"
+empty_enum_variants_with_brackets        = "deny"
+
+# Force structured error handling
+unwrap_used                              = "deny"
+expect_used                              = "deny"
+unwrap_in_result                         = "deny"
+get_unwrap                               = "deny"
+indexing_slicing                         = "deny"
+string_slice                             = "deny"
+map_err_ignore                           = "deny"
+ok_expect                                = "deny"
+error_impl_error                         = "deny"
+result_large_err                         = "deny"
+
+# Debug / "I'll remove this later" artefacts
+dbg_macro                                = "deny"
+print_stdout                             = "deny"
+print_stderr                             = "deny"
+use_debug                                = "deny"
+verbose_file_reads                       = "deny"
+non_ascii_literal                        = "deny"
+
+# Laziness heuristics
+missing_const_for_fn                     = "deny"
+if_then_some_else_none                   = "deny"
+option_option                            = "deny"
+result_unit_err                          = "deny"
+linkedlist                               = "deny"
+needless_continue                        = "deny"
+needless_return                          = "deny"
+needless_for_each                        = "deny"
+needless_raw_strings                     = "deny"
+needless_raw_string_hashes               = "deny"
+needless_bitwise_bool                    = "deny"
+should_panic_without_expect              = "deny"
+string_lit_as_bytes                      = "deny"
+string_lit_chars_any                     = "deny"
+unseparated_literal_suffix               = "deny"
+unnecessary_wraps                        = "deny"
+unnecessary_self_imports                 = "deny"
+unnested_or_patterns                     = "deny"
+unreadable_literal                       = "deny"
+useless_let_if_seq                       = "deny"
+redundant_clone                          = "deny"
+redundant_type_annotations               = "deny"
+redundant_closure_for_method_calls       = "deny"
+implicit_clone                           = "deny"
+implicit_hasher                          = "deny"
+items_after_statements                   = "deny"
+mixed_read_write_in_expression           = "deny"
+str_to_string                            = "deny"
+string_add                               = "deny"
+format_push_string                       = "deny"
+or_fun_call                              = "deny"
+suboptimal_flops                         = "deny"
+suspicious_operation_groupings           = "deny"
+
+# Shadowing / naming / similarity traps
+shadow_unrelated                         = "deny"
+shadow_reuse                             = "deny"
+shadow_same                              = "deny"
+similar_names                            = "deny"
+min_ident_chars                          = "deny"
+self_named_constructors                  = "deny"
+
+# Scoping / import hygiene
+wildcard_imports                         = "deny"
+enum_glob_use                            = "deny"
+exit                                     = "deny"
+create_dir                               = "deny"
+partial_pub_fields                       = "deny"
+multiple_inherent_impl                   = "deny"
+tests_outside_test_module                = "deny"
+
+# Cargo hygiene individuals
+wildcard_dependencies                    = "deny"
+multiple_crate_versions                  = "deny"
+negative_feature_names                   = "deny"
+redundant_feature_names                  = "deny"
+cargo_common_metadata                    = "deny"
+
+# Forbid silently discarding must-use values
+let_underscore_must_use                  = "deny"
+let_underscore_untyped                   = "deny"
+let_underscore_future                    = "deny"
+
+# Bool-flag smells
+fn_params_excessive_bools                = "deny"
+struct_excessive_bools                   = "deny"
+
+# Large things hiding copy-paste
+large_enum_variant                       = "deny"
+large_stack_arrays                       = "deny"
+large_stack_frames                       = "deny"
+large_types_passed_by_value              = "deny"
+large_include_file                       = "deny"
+large_digit_groups                       = "deny"
+
+# Formatting / macro hygiene
+uninlined_format_args                    = "deny"
+nonstandard_macro_braces                 = "deny"
+
+# Range / time / iter pitfalls
+range_minus_one                          = "deny"
+range_plus_one                           = "deny"
+path_buf_push_overwrite                  = "deny"
+iter_on_empty_collections                = "deny"
+iter_on_single_items                     = "deny"
+naive_bytecount                          = "deny"
+no_effect_underscore_binding             = "deny"
+
+# Identifier confusables / unicode hazards
+disallowed_script_idents                 = "deny"
+unicode_not_nfc                          = "deny"
+
+# Infinite / runaway loops
+infinite_loop                            = "deny"
+
+# Document private items too so internal invariants and rationale stay visible.
+missing_docs_in_private_items            = "deny"
+
+# Meta: localized `#[allow(clippy::single_call_fn, reason = "...")]` is
+# permitted where a named helper genuinely improves structure. The companion
+# `template lint-attrs` still rejects every other `#[allow(...)]` / `#[expect(...)]`.
+allow_attributes                         = "allow"
+allow_attributes_without_reason          = "deny"
+
+# Branching should usually read as a decision with a clear shape: guard clauses
+# for fast exits, `match` for exhaustive cases, or a helper when the decision
+# deserves a name.
+#
+# This warning catches long, open-ended `else if` ladders that tend to hide
+# missing cases, duplicate work, or control flow that wants to be modelled more
+# directly. It stays at `warn` because a short chain can still be the clearest
+# expression in local context.
+else_if_without_else                     = "warn"
+
+# Extract helpers when the name teaches the reader something important:
+# capturing a domain rule, isolating validation, ending a borrow before
+# `.await`, or turning a dense branch into a readable step.
+#
+# This warning exists to catch the opposite pattern: one-off wrappers that only
+# shuffle code around and make the call graph noisier without adding meaning.
+# It stays at `warn` because a genuinely clarifying helper is still the right
+# move, even if it currently has a single caller.
+single_call_fn                           = "warn"
+
+# ─────────────────────────────────────────────────────────────────────────
+# Intentional `allow`s — these contradict lints we've denied above, or fight
+# idiomatic Rust 2024. Leaving them at `allow` is a conscious choice.
+# ─────────────────────────────────────────────────────────────────────────
+implicit_return                          = "allow"   # contradicts trailing-expr idiom
+self_named_module_files                  = "allow"   # contradicts mod_module_files
+semicolon_inside_block                   = "allow"   # contradicts semicolon_outside_block
+separated_literal_suffix                 = "allow"   # contradicts unseparated_literal_suffix
+question_mark_used                       = "allow"   # `?` is idiomatic
+pub_use                                  = "allow"   # re-export idiom
+ref_binding_to_reference                 = "allow"   # contradicts pattern_type_mismatch
+blanket_clippy_restriction_lints         = "allow"   # we intentionally enable restriction individually

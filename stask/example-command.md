@@ -6,18 +6,18 @@ This example adds `just x release-notes -- --since <REF>` without changing the `
 
 ## Add the parser dependency
 
-The empty registry already depends on `template-core` and `template-xtask`. Add `bpaf` only when the repository gains its first typed extension parser:
+The empty registry already depends on `template-core` and `template-stask`. Add `bpaf` only when the repository gains its first typed extension parser:
 
 ```toml
 [dependencies]
 bpaf.workspace = true
 template-core.workspace = true
-template-xtask.workspace = true
+template-stask.workspace = true
 ```
 
 ## Register the command
 
-Replace the empty body of `xtask/src/extensions.rs` with a typed repository-owned command enum and registry:
+Replace the empty body of `stask/src/extensions.rs` with a typed repository-owned command enum and registry:
 
 ```rust
 //! Consumer-owned registry for `just x <name>` commands.
@@ -47,7 +47,7 @@ enum ProjectCommand {
 /// # Errors
 ///
 /// Returns a typed metadata or duplicate-name error before runner construction.
-pub fn commands() -> template_xtask::Result<CommandSet> {
+pub fn commands() -> template_stask::Result<CommandSet> {
   let since = long("since")
     .help("Base Git reference to compare against")
     .argument::<String>("REF")
@@ -56,14 +56,14 @@ pub fn commands() -> template_xtask::Result<CommandSet> {
     since
   })
   .to_options();
-  let release_notes = template_xtask::extension_command(
+  let release_notes = template_stask::extension_command(
     "release-notes",
     "Generate release notes from Git history",
     options,
     ProjectCommand::ReleaseNotes,
   )?;
 
-  template_xtask::registry(
+  template_stask::registry(
     "repository extensions",
     vec![release_notes],
     |command, context| match command {
@@ -78,7 +78,7 @@ pub fn commands() -> template_xtask::Result<CommandSet> {
 }
 ```
 
-`template-xtask` rejects duplicate nested names before constructing the runner. Its top-level command set contains only `x` and is classified as `XtaskExtension`, so a repository extension cannot masquerade as an installed standard command.
+`template-stask` rejects duplicate nested names before constructing the runner. Its top-level command set contains only `x` and is classified as `StaskExtension`, so a repository extension cannot masquerade as an installed standard command.
 
 ## Run the extension
 
@@ -94,4 +94,4 @@ Per-command help and parser failures use the shared `bpaf` renderer:
 just x release-notes -- --help
 ```
 
-Direct `xtask` invocation remains guarded. Use `just x` locally; CI may invoke the extension runner with its existing `CI` signal.
+Direct `stask` invocation remains guarded. Use `just x` locally; CI may invoke the extension runner with its existing `CI` signal.

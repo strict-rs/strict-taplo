@@ -1,5 +1,5 @@
 # ════════════════════════════════════════════════════════════════════════════
-# .cargo/mutants.toml — configuration for `cargo xtask mutants` (cargo-mutants).
+# .cargo/mutants.toml — configuration for `cargo stask mutants` (cargo-mutants).
 #
 #   Docs:   https://mutants.rs/
 #   Schema: `cargo mutants --emit-schema config`   (every key + its JSON type)
@@ -136,13 +136,13 @@ minimum_test_timeout = 30
 #
 # examine_globs NARROWS what gets mutated. By default cargo-mutants mutates every
 # source file — in this template that is ALREADY everything under `crates/` and
-# `xtask/` (the only workspace members), so the default run covers both your
-# crates and the xtask tooling. Set this only to mutate a SUBSET. Caveat: it acts
+# `stask/` (the only workspace members), so the default run covers both your
+# crates and the stask tooling. Set this only to mutate a SUBSET. Caveat: it acts
 # as a floor — a CLI `-f <glob>` is UNIONED onto it, not a replacement, so if these
 # globs already cover everything, `-f` can no longer scope a run down (it stays
 # full). To narrow a one-off run, use `-f` with NO examine_globs set, or `--in-diff`
 # (which filters on top of any globs). Example — restrict the default run to just
-# your crates, skipping the shared xtask tooling:
+# your crates, skipping the shared stask tooling:
 #   examine_globs = ["crates/**/*.rs"]
 # Skip files entirely — generated, vendored, or genuinely not worth mutating:
 #   exclude_globs = ["**/generated/**/*.rs", "src/bin/*.rs"]
@@ -163,7 +163,7 @@ minimum_test_timeout = 30
 #   returns but does NOT inject Err variants. Each expr must evaluate to the
 #   error type AT THE MUTATION SITE and be valid there; do NOT wrap it in `Err(…)`
 #   (cargo-mutants adds that); values that don't compile are silently dropped.
-#     error_values = ["crate::error::XtaskError::ParseFailed"]
+#     error_values = ["crate::error::StaskError::ParseFailed"]
 #
 # skip_calls / skip_calls_defaults: do NOT mutate the ARGUMENTS passed to calls
 #   of the named functions/methods (matched on the final path component, ignoring

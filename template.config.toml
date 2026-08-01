@@ -33,7 +33,7 @@ dependencies = [
   "strict-test-support",
   "syn",
   "template-core",
-  "template-xtask",
+  "template-stask",
   "thiserror",
   "toml",
   "toml_edit",
@@ -41,12 +41,12 @@ dependencies = [
 ]
 
 [[ecosystems.cargo.update.manifests]]
-path = "xtask/Cargo.toml"
-dependencies = ["template-core", "template-xtask"]
+path = "stask/Cargo.toml"
+dependencies = ["bpaf", "template-core", "template-stask", "thiserror"]
 dev-dependencies = ["strict-test-support"]
 
 [update.opt-outs]
-files = []
+files = [".github/workflows/ci.yml"]
 defaults = []
 keys = []
 elements = []
@@ -82,7 +82,7 @@ code-quality = ["dupes.toml", ".jscpd.json"]
 toolchain = ["rust-toolchain.toml"]
 github = [".github/dependabot.yml", ".github/workflows/ci.yml", ".github/workflows/scheduled.yml"]
 automation = ["justfile"]
-guidance = ["AGENTS.md", "README.md", "crates/AGENTS.md", "xtask/AGENTS.md"]
+guidance = ["AGENTS.md", "README.md", "crates/AGENTS.md", "stask/AGENTS.md"]
 repository = [".gitattributes", ".gitmodules", "LICENSE"]
 
 [[gates.rules]]
@@ -119,9 +119,9 @@ reason = "changed bundled agent skills or repo marketplace entries"
 
 [[gates.rules]]
 id = "shared-workflow"
-when-any = ["glob:xtask/**", "glob:.github/workflows/**", "path:justfile", "path:clippy.toml", "path:rustfmt.toml", "path:deny.toml", "path:dupes.toml", "path:.jscpd.json", "path:rust-toolchain.toml", "path:template-lint.toml", "path:template-clippy.toml"]
+when-any = ["glob:stask/**", "glob:.github/workflows/**", "path:justfile", "path:clippy.toml", "path:rustfmt.toml", "path:deny.toml", "path:dupes.toml", "path:.jscpd.json", "path:rust-toolchain.toml", "path:template-lint.toml", "path:template-clippy.toml"]
 command = "just ci"
-reason = "changed shared workflow, policy, or xtask automation"
+reason = "changed shared workflow, policy, or stask automation"
 exclusive = true
 fallout = ["`just ci`, `just cq`, any coverage workflow, or the pre-commit hook may refresh transient reports under `cov/` and committed `badges/`."]
 

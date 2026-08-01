@@ -1,5 +1,5 @@
 [package]
-name         = "xtask"
+name         = "stask"
 version      .workspace = true
 edition      .workspace = true
 license-file .workspace = true
@@ -8,23 +8,24 @@ repository   .workspace = true
 publish      .workspace = true
 readme       .workspace = true
 description  = "Repository-specific `x` extension runner for the installed `template` workflow."
-default-run  = "xtask"
+default-run  = "stask"
 
 [lib]
-name = "xtask"
+name = "stask"
 path = "src/lib.rs"
 
 [[bin]]
-name = "xtask"
+name = "stask"
 path = "src/main.rs"
 
-# disabled for now
-# [lints]
-# workspace = true
+[lints]
+workspace = true
 
 [dependencies]
+bpaf.workspace           = true
 template-core.workspace  = true
-template-xtask.workspace = true
+template-stask.workspace = true
+thiserror.workspace      = true
 
 [dev-dependencies]
 strict-test-support.workspace = true

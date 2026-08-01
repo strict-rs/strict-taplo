@@ -6,11 +6,11 @@ set windows-shell := ["powershell.exe", "-NoLogo", "-Command"]
 
 # `just x` is the canonical entry point for the consumer-compiled extension
 # runner. The installed `template` binary permits direct invocation.
-export XTASK_VIA_JUST := "1"
+export STASK_VIA_JUST := "1"
 
 # This justfile is the canonical repository entry point and command index.
 # Standard recipes are thin dispatchers into the installed `template` binary.
-# Local `xtask/src/` compiles only the repository-specific `just x` extension
+# Local `stask/src/` compiles only the repository-specific `just x` extension
 # seam, so extensions cannot collide with or mirror standard commands.
 #
 # Reusable workflow behavior belongs in its owning `template-rs` crate.
@@ -201,13 +201,13 @@ badges:
 cross *args:
     template cross {{args}}
 
-# Run a consumer-registered extension command (registry: xtask/src/extensions.rs).
+# Run a consumer-registered extension command (registry: stask/src/extensions.rs).
 # `--from` is always forwarded; the handler reads it via `CommandContext::invocation_dir()`.
 # Pass an extension's own dashed flags after `--`:  just x release-notes -- --since v1.2
 
 # Run a consumer-registered extension command.
 x *args:
-    cargo xtask x --from "{{invocation_directory()}}" {{args}}
+    cargo stask x --from "{{invocation_directory()}}" {{args}}
 
 # Print the installed template command help.
 help:
