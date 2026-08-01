@@ -4,7 +4,7 @@
 
 ## Read This First
 
-The local `xtask` is the consumer-compiled repository-specific extension seam behind `just x <name>`. Standard commands belong exclusively to the installed `template` binary and the root `justfile` recipes that call it.
+The local `stask` is the consumer-compiled repository-specific extension seam behind `just x <name>`. Standard commands belong exclusively to the installed `template` binary and the root `justfile` recipes that call it.
 
 ## Role of This Crate
 
@@ -16,7 +16,7 @@ The local `xtask` is the consumer-compiled repository-specific extension seam be
 
 ## Shared-Source Boundary
 
-Local extension code composes `template-core` and `template-xtask`; it does not fork shared workflow behavior.
+Local extension code composes `template-core` and `template-stask`; it does not fork shared workflow behavior.
 
 - Put generic command, runner, process, filesystem, Git, TOML, and output capabilities in `template-core`.
 - Put reusable standard workflows in their owning `template-rs` domain crate and expose them through `template-cli`.
@@ -26,7 +26,7 @@ Local extension code composes `template-core` and `template-xtask`; it does not 
 
 ## Adding or Changing Automation
 
-For a repository-specific command, define a typed argument parser and handler, lift it with `template_xtask::extension_command(...)`, and assemble it through `template_xtask::registry(...)`. Keep extension names unique and keep dispatch explicit.
+For a repository-specific command, define a typed argument parser and handler, lift it with `template_stask::extension_command(...)`, and assemble it through `template_stask::registry(...)`. Keep extension names unique and keep dispatch explicit.
 
 If more than one repository needs the behavior, stop treating it as a local extension. Implement it in the capability-owning `template-rs` crate, add behavioral tests there, and register the finished standard command through `template-cli`.
 
@@ -34,11 +34,11 @@ Never add standard command aliases, delegation, or fallback execution to the loc
 
 ## Extension Mechanism
 
-- `template_xtask::extension_command(...)` lifts one typed parser into a named nested extension.
-- `template_xtask::registry(...)` validates unique nested command identities and constructs the top-level `x` command set.
-- `template_xtask::empty_registry(...)` preserves the controlled `x` surface when the repository has no project command.
-- `template_xtask::run_with_extensions(...)` rejects installed command sets, validates the extension-only catalog, and executes it through `RunnerMode::Xtask`.
-- The runner parses `x --from <DIR>`, rebases `CommandContext::invocation_dir()`, splits passthrough tokens at the first bare `--`, and retains the `XTASK_VIA_JUST=1` or `CI` direct-invocation guard.
+- `template_stask::extension_command(...)` lifts one typed parser into a named nested extension.
+- `template_stask::registry(...)` validates unique nested command identities and constructs the top-level `x` command set.
+- `template_stask::empty_registry(...)` preserves the controlled `x` surface when the repository has no project command.
+- `template_stask::run_with_extensions(...)` rejects installed command sets, validates the extension-only catalog, and executes it through `RunnerMode::Stask`.
+- The runner parses `x --from <DIR>`, rebases `CommandContext::invocation_dir()`, splits passthrough tokens at the first bare `--`, and retains the `STASK_VIA_JUST=1` or `CI` direct-invocation guard.
 
 Reject duplicate extension names during registry construction, before parsing or executing a handler. Do not mirror the installed catalog locally to detect collisions; surface classification keeps installed and extension command sets distinct.
 
@@ -80,6 +80,6 @@ Expose only the local composition function and extension types required by the b
 
 - Do not add lint-silencing attributes, compatibility command aliases, standard-command fallbacks, broad preludes, `mod.rs`, or `#[path]` wiring.
 - Do not hand-edit generated Markdown or generated policy references; update their source inputs and run the owning installed workflow.
-- Keep local production dependencies limited to `template-core` and `template-xtask` unless a repository-specific extension has a genuine additional domain dependency.
+- Keep local production dependencies limited to `template-core` and `template-stask` unless a repository-specific extension has a genuine additional domain dependency.
 - Add reusable dependencies to the owning shared crate, not the consumer extension adapter.
 - Preserve the local `CLAUDE.md` companion as the exact `@./AGENTS.md` bridge when generated guidance manages this target.
