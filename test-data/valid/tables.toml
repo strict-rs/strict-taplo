@@ -1,0 +1,26 @@
+title = "fixture"
+owner.name = "Taplo"
+owner.active = true
+
+[database]
+ports = [8000, 8001, 8002]
+connection = { host = "localhost", secure = true }
+
+[database.credentials]
+user = "service"
+roles = ["reader", "writer"]
+
+[[products]]
+name = "Hammer"
+sku = 738594937
+
+[[products]]
+name = "Nail"
+sku = 284758393
+color = "gray"
+
+[[products.suppliers]]
+name = "Acme"
+
+[[products.suppliers]]
+name = "Contoso"

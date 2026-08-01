@@ -1,0 +1,11 @@
+basic = "quoted \"value\" with a tab\tand Unicode: 雪"
+literal = 'backslashes stay \ literal'
+multiline_basic = """
+Roses are red
+Violets are blue"""
+multiline_literal = '''
+The first newline is trimmed.
+Every other character is literal.'''
+"quoted key" = "value"
+'literal key' = "value"
+bare-key = "value"

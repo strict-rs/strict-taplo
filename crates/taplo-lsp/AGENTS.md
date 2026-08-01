@@ -2,25 +2,28 @@
 
 # taplo-lsp
 
-The TOML language server. Wires `lsp-async-stub` to `taplo` + `taplo-common`, exposing one handler per LSP request. Generic over `taplo_common::environment::Environment`, so the same server runs natively and in WASM.
+The TOML language server. Shared handlers and immutable world snapshots are exposed through two honest runtime families: a thread-safe concurrent native server and a current-thread local server for WASM. Both use the same message classification, lifecycle, mutation-ordering, cancellation, and typed service logic without requiring JavaScript values to be `Send` or `Sync`.
 
 ## Entry points
 
-`lib.rs` exposes two constructors:
+`lib.rs` exposes four explicit constructors:
 
-- `create_server::<E>() -> Server<World<E>>` — builds the `lsp-async-stub` server and registers every request/notification handler (initialize, folding ranges, document symbols, formatting, completion, hover, links, semantic tokens, prepare/rename, document + configuration + workspace notifications).
-- `create_world::<E>(env) -> World<E>` — constructs the shared server state.
+- `create_concurrent_server::<E>() -> ConcurrentServer<ConcurrentWorld<E>>` and `create_concurrent_world(env, http)` — construct the native multi-threaded server and `Arc`-owned world for a `ConcurrentEnvironment`.
+- `create_local_server::<E>() -> LocalServer<LocalWorld<E>>` and `create_local_world(env, http)` — construct the current-thread server and `Rc`-owned world for a `LocalEnvironment`.
+
+There are no `Server`, `ServerBuilder`, or ambiguous world aliases. Construction that initializes schema services is fallible and returns `WorldError`.
 
 ## Layout
 
 - `handlers/` — one module per request (e.g. `completion.rs`, `hover.rs`, `formatting.rs`, `rename.rs`, `semantic_tokens.rs`, `document_symbols.rs`, `folding_ranges.rs`, `links.rs`, `initialize.rs`, `schema.rs`, `documents.rs`, `configuration.rs`, `workspaces.rs`, `conversion.rs`). `handlers.rs` re-exports them.
-- `world.rs` — `World`/`WorldState` server state.
-- `lsp_ext/` — non-standard protocol extensions: `request.rs` (`ConvertToJson`, `ConvertToToml`, `ListSchemas`, `AssociatedSchema`) and `notification.rs` (`AssociateSchema`), registered alongside the standard handlers in `create_server`.
+- `world.rs` — mutable service state, immutable document/config/schema snapshots, checked revisions, and the `LocalWorld`/`ConcurrentWorld` ownership aliases.
+- `runtime.rs` — macro owner that generates the bound-specific `local` and `concurrent` runtime families and registers the same handlers on `LocalServer` and `ConcurrentServer`.
+- `lsp_ext/` — non-standard protocol extensions plus the Taplo-owned modern document-symbol request marker, registered alongside the standard handlers in both server families.
 - `config.rs`, `diagnostics.rs`, `query.rs` — LSP-side config model, diagnostic publishing, and syntax-tree position queries.
 
 ## Adding or changing a handler
 
-Implement it in `handlers/<name>.rs`, re-export it from `handlers.rs`, and register it in `create_server`. Custom (non-LSP-spec) messages additionally need their type declared under `lsp_ext/`.
+Implement runtime-neutral behavior in `handlers/<name>.rs`, re-export it from `handlers.rs`, and register thin adapters in both runtime families. State-changing notifications belong on the ordered mutation lane. Requests must capture immutable snapshots after the preceding mutation barrier and suppress generation-dependent output when the captured revision is stale. Custom messages additionally need their type declared under `lsp_ext/`.
 
 ## Features and crate type
 

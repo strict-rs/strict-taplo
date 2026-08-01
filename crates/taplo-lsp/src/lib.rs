@@ -1,65 +1,156 @@
-#![warn(clippy::pedantic)]
-#![deny(clippy::print_stdout, clippy::print_stderr)]
-#![allow(
-  clippy::single_match,
-  clippy::default_trait_access,
-  clippy::single_match_else,
-  clippy::module_name_repetitions,
-  clippy::missing_errors_doc,
-  clippy::missing_panics_doc,
-  clippy::similar_names,
-  clippy::too_many_lines,
-  clippy::enum_glob_use
-)]
+//! Taplo language-server composition for local and concurrent execution models.
 
+#![forbid(unsafe_code)]
+
+use std::future::Future;
+use std::pin::Pin;
+use std::rc::Rc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 
-use lsp_async_stub::Server;
-use lsp_types::notification;
-use lsp_types::request;
-use taplo_common::environment::Environment;
-use world::World;
+#[cfg(not(target_arch = "wasm32"))]
+use taplo_common::environment::ConcurrentEnvironment;
+use taplo_common::environment::LocalEnvironment;
+#[cfg(not(target_arch = "wasm32"))]
+use taplo_common::schema::transport::ConcurrentSchemaTransport;
+use taplo_common::schema::transport::LocalSchemaTransport;
+#[cfg(not(target_arch = "wasm32"))]
+use world::ConcurrentWorld;
+use world::LocalWorld;
+use world::WorldError;
 use world::WorldState;
 
-mod diagnostics;
-mod handlers;
-#[cfg(test)]
-mod test_support;
-mod uri;
+/// Generate aligned local and concurrent Taplo LSP operation families.
+macro_rules! define_lsp_execution_families {
+  (
+    handler
+    $operations:ident;
+    $(($local:ident, $concurrent:ident)),+ $(,)?
+  ) => {
+    use crate::LocalFuture as HandlerLocalFuture;
+    use taplo_common::environment::LocalEnvironment as HandlerLocalEnvironment;
+    use taplo_common::schema::transport::LocalSchemaTransport as HandlerLocalSchemaTransport;
+    #[cfg(not(target_arch = "wasm32"))]
+    use crate::ConcurrentFuture as HandlerConcurrentFuture;
+    #[cfg(not(target_arch = "wasm32"))]
+    use taplo_common::environment::ConcurrentEnvironment as HandlerConcurrentEnvironment;
+    #[cfg(not(target_arch = "wasm32"))]
+    use taplo_common::schema::transport::ConcurrentSchemaTransport as HandlerConcurrentSchemaTransport;
+
+    define_lsp_execution_families!(
+      @families
+      $operations;
+      $(($local, $concurrent)),+;
+      local = (
+        HandlerLocalFuture,
+        HandlerLocalEnvironment,
+        HandlerLocalSchemaTransport,
+        crate::world::LocalSchemaExecution
+      );
+      concurrent = (
+        HandlerConcurrentFuture,
+        HandlerConcurrentEnvironment,
+        HandlerConcurrentSchemaTransport,
+        crate::world::ConcurrentSchemaExecution
+      );
+    );
+  };
+  (
+    world
+    $operations:ident;
+    $(($local:ident, $concurrent:ident)),+ $(,)?
+  ) => {
+    define_lsp_execution_families!(
+      @families
+      $operations;
+      $(($local, $concurrent)),+;
+      local = (
+        LocalFuture,
+        LocalEnvironment,
+        LocalSchemaTransport,
+        LocalSchemaExecution
+      );
+      concurrent = (
+        ConcurrentFuture,
+        ConcurrentEnvironment,
+        ConcurrentSchemaTransport,
+        ConcurrentSchemaExecution
+      );
+    );
+  };
+  (
+    @families
+    $operations:ident;
+    $(($local:ident, $concurrent:ident)),+;
+    local = (
+      $local_future:ident,
+      $local_environment:path,
+      $local_transport:ident,
+      $local_schema_execution:path
+    );
+    concurrent = (
+      $concurrent_future:ident,
+      $concurrent_environment:path,
+      $concurrent_transport:ident,
+      $concurrent_schema_execution:path
+    );
+  ) => {
+    $operations!(
+      $($local),+;
+      $local_future,
+      $local_environment,
+      $local_transport,
+      $local_schema_execution;
+      []
+    );
+    #[cfg(not(target_arch = "wasm32"))]
+    $operations!(
+      $($concurrent),+;
+      $concurrent_future,
+      $concurrent_environment,
+      $concurrent_transport,
+      $concurrent_schema_execution;
+      [Send]
+    );
+  };
+}
+
+pub(crate) mod handlers;
 
 pub mod config;
 pub mod lsp_ext;
 pub mod query;
 pub mod world;
 
-#[must_use]
-pub fn create_server<E: Environment>() -> Server<World<E>> {
-  Server::new()
-    .on_request::<request::Initialize, _>(handlers::initialize)
-    .on_request::<request::FoldingRangeRequest, _>(handlers::folding_ranges)
-    .on_request::<request::DocumentSymbolRequest, _>(handlers::document_symbols)
-    .on_request::<request::Formatting, _>(handlers::format)
-    .on_request::<request::Completion, _>(handlers::completion)
-    .on_request::<request::HoverRequest, _>(handlers::hover)
-    .on_request::<request::DocumentLinkRequest, _>(handlers::links)
-    .on_request::<request::SemanticTokensFullRequest, _>(handlers::semantic_tokens)
-    .on_request::<request::PrepareRenameRequest, _>(handlers::prepare_rename)
-    .on_request::<request::Rename, _>(handlers::rename)
-    .on_notification::<notification::Initialized, _>(handlers::initialized)
-    .on_notification::<notification::DidOpenTextDocument, _>(handlers::document_open)
-    .on_notification::<notification::DidChangeTextDocument, _>(handlers::document_change)
-    .on_notification::<notification::DidSaveTextDocument, _>(handlers::document_save)
-    .on_notification::<notification::DidCloseTextDocument, _>(handlers::document_close)
-    .on_notification::<notification::DidChangeConfiguration, _>(handlers::configuration_change)
-    .on_notification::<notification::DidChangeWorkspaceFolders, _>(handlers::workspace_change)
-    .on_request::<lsp_ext::request::ConvertToJsonRequest, _>(handlers::convert_to_json)
-    .on_request::<lsp_ext::request::ConvertToTomlRequest, _>(handlers::convert_to_toml)
-    .on_request::<lsp_ext::request::ListSchemasRequest, _>(handlers::list_schemas)
-    .on_request::<lsp_ext::request::AssociatedSchemaRequest, _>(handlers::associated_schema)
-    .on_notification::<lsp_ext::notification::AssociateSchema, _>(handlers::associate_schema)
-    .build()
+pub use handlers::create_local_server;
+
+/// A current-thread operation that may retain local or WebAssembly state.
+pub(crate) type LocalFuture<'operation, Output> = Pin<Box<dyn Future<Output = Output> + 'operation>>;
+
+/// A native operation that may cross executor threads.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) type ConcurrentFuture<'operation, Output> = Pin<Box<dyn Future<Output = Output> + Send + 'operation>>;
+
+/// Construct a local world using an explicitly configured browser-compatible HTTP client.
+///
+/// # Errors
+///
+/// Returns [`WorldError`] when the detached workspace or schema services cannot initialize.
+pub fn create_local_world<E: LocalEnvironment>(environment: E, http: reqwest::Client) -> Result<LocalWorld<E>, WorldError> {
+  let transport = LocalSchemaTransport::new(environment.clone(), http);
+  WorldState::with_transport(environment, transport).map(Rc::new)
 }
 
-pub fn create_world<E: Environment>(env: E) -> World<E> {
-  Arc::new(WorldState::new(env))
+#[cfg(not(target_arch = "wasm32"))]
+pub use handlers::create_concurrent_server;
+
+/// Construct a concurrent world using an explicitly configured native HTTP client.
+///
+/// # Errors
+///
+/// Returns [`WorldError`] when the detached workspace or schema services cannot initialize.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn create_concurrent_world<E: ConcurrentEnvironment>(environment: E, http: reqwest::Client) -> Result<ConcurrentWorld<E>, WorldError> {
+  let transport = ConcurrentSchemaTransport::new(environment.clone(), http);
+  WorldState::with_transport(environment, transport).map(Arc::new)
 }

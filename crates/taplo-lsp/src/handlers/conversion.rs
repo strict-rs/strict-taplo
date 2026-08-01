@@ -1,32 +1,33 @@
-use lsp_async_stub::Context;
-use lsp_async_stub::Params;
-use lsp_async_stub::rpc::Error;
+//! Stateless TOML and JSON conversion request handling.
+
 use serde_json::Value;
-use taplo::dom::Node;
 use taplo::parser::parse;
-use taplo_common::environment::Environment;
+use taplo_common::convert;
+use taplo_lsp_async::Params;
+use taplo_lsp_async::rpc::RpcError;
 
 use crate::lsp_ext::request::ConvertToJsonParams;
 use crate::lsp_ext::request::ConvertToJsonResponse;
 use crate::lsp_ext::request::ConvertToTomlParams;
 use crate::lsp_ext::request::ConvertToTomlResponse;
-use crate::world::World;
 
+/// Convert TOML input to JSON while preserving already-valid JSON text.
+///
+/// # Errors
+///
+/// Returns [`RpcError`] when required request parameters are absent.
 #[tracing::instrument(skip_all)]
-pub(crate) async fn convert_to_json<E: Environment>(
-  _context: Context<World<E>>,
-  params: Params<ConvertToJsonParams>,
-) -> Result<ConvertToJsonResponse, Error> {
-  let p = params.required()?;
+pub(super) async fn convert_to_json(params: Params<ConvertToJsonParams>) -> Result<ConvertToJsonResponse, RpcError> {
+  let parameters = params.required()?;
 
-  if serde_json::from_str::<Value>(&p.text).is_ok() {
+  if serde_json::from_str::<Value>(&parameters.text).is_ok() {
     return Ok(ConvertToJsonResponse {
-      text:  Some(p.text),
+      text:  Some(parameters.text),
       error: None,
     });
   }
 
-  match serde_json::to_string_pretty(&parse(&p.text).into_dom()) {
+  match convert::toml_to_json(&parameters.text) {
     Ok(text) => Ok(ConvertToJsonResponse {
       text:  Some(text),
       error: None,
@@ -38,33 +39,39 @@ pub(crate) async fn convert_to_json<E: Environment>(
   }
 }
 
+/// Convert JSON input to TOML while preserving already-valid TOML text.
+///
+/// # Errors
+///
+/// Returns [`RpcError`] when required request parameters are absent.
 #[tracing::instrument(skip_all)]
-pub(crate) async fn convert_to_toml<E: Environment>(
-  _context: Context<World<E>>,
-  params: Params<ConvertToTomlParams>,
-) -> Result<ConvertToTomlResponse, Error> {
-  let p = params.required()?;
+pub(super) async fn convert_to_toml(params: Params<ConvertToTomlParams>) -> Result<ConvertToTomlResponse, RpcError> {
+  let parameters = params.required()?;
 
-  let parse = parse(&p.text);
-  if parse.errors.is_empty() {
-    return Ok(ConvertToTomlResponse {
-      text:  Some(p.text),
-      error: None,
-    });
-  }
-
-  let dom = match serde_json::from_str::<Node>(&p.text) {
-    Ok(dom) => dom,
-    Err(err) => {
+  match parse(&parameters.text) {
+    Ok(parsed) if parsed.diagnostics().is_empty() => {
       return Ok(ConvertToTomlResponse {
-        text:  None,
-        error: Some(err.to_string()),
+        text:  Some(parameters.text),
+        error: None,
       });
     }
-  };
+    Ok(_) => {}
+    Err(error) => {
+      return Ok(ConvertToTomlResponse {
+        text:  None,
+        error: Some(error.to_string()),
+      });
+    }
+  }
 
-  Ok(ConvertToTomlResponse {
-    text:  Some(dom.to_toml(false, false)),
-    error: None,
-  })
+  match convert::json_to_toml(&parameters.text, false) {
+    Ok(text) => Ok(ConvertToTomlResponse {
+      text:  Some(text),
+      error: None,
+    }),
+    Err(error) => Ok(ConvertToTomlResponse {
+      text:  None,
+      error: Some(error.to_string()),
+    }),
+  }
 }

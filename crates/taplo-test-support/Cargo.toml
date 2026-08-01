@@ -1,0 +1,24 @@
+[package]
+name         = "taplo-test-support"
+description  = "Private deterministic host capabilities for Taplo workspace behavior tests."
+version      = { workspace = true }
+rust-version = { workspace = true }
+authors      = { workspace = true }
+edition      = { workspace = true }
+homepage     = { workspace = true }
+license      = { workspace = true }
+repository   = { workspace = true }
+publish      = false
+
+[lints]
+workspace = true
+
+[dependencies]
+futures             = { workspace = true }
+parking_lot        = { workspace = true }
+strict-test-support = { workspace = true }
+time               = { workspace = true }
+tokio              = { workspace = true, features = ["io-util"] }
+
+[package.metadata.auto-tag]
+enabled = false

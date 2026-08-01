@@ -6,37 +6,63 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use globset::Glob;
-use globset::GlobSetBuilder;
+use globset::GlobSet;
 use percent_encoding::percent_decode_str;
 use serde_json::Value;
+use thiserror::Error;
 
+/// A failure while compiling an include/exclude glob rule.
+#[derive(Debug, Error)]
+pub enum GlobRuleError {
+  /// One glob expression or the resulting set was invalid.
+  #[error("invalid glob rule")]
+  InvalidGlob(#[from] globset::Error),
+}
+
+/// Compiled include/exclude path matching rules.
 #[derive(Debug, Clone)]
 pub struct GlobRule {
-  include: globset::GlobSet,
-  exclude: globset::GlobSet,
+  /// Expressions a path must match to be included.
+  include: GlobSet,
+  /// Expressions that remove an otherwise included path.
+  exclude: GlobSet,
+}
+
+/// Compile one set of glob expressions into a matcher.
+///
+/// An empty expression set yields a matcher that matches nothing.
+fn compile_globs(patterns: impl IntoIterator<Item = impl AsRef<str>>) -> Result<GlobSet, globset::Error> {
+  let globs = patterns
+    .into_iter()
+    .map(|pattern| Glob::new(pattern.as_ref()))
+    .collect::<Result<Vec<_>, _>>()?;
+  GlobSet::new(globs)
 }
 
 impl GlobRule {
+  /// Compile one include set and one exclude set into a matching rule.
+  ///
+  /// An empty include set matches nothing; an empty exclude set removes nothing.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`GlobRuleError`] when an expression is not a valid glob or the resulting set
+  /// cannot be built.
   pub fn new(
     include: impl IntoIterator<Item = impl AsRef<str>>,
     exclude: impl IntoIterator<Item = impl AsRef<str>>,
-  ) -> Result<Self, anyhow::Error> {
-    let mut inc = GlobSetBuilder::new();
-    for glob in include {
-      inc.add(Glob::new(glob.as_ref())?);
-    }
-
-    let mut exc = GlobSetBuilder::new();
-    for glob in exclude {
-      exc.add(Glob::new(glob.as_ref())?);
-    }
-
+  ) -> Result<Self, GlobRuleError> {
     Ok(Self {
-      include: inc.build()?,
-      exclude: exc.build()?,
+      include: compile_globs(include)?,
+      exclude: compile_globs(exclude)?,
     })
   }
 
+  /// Return whether a path is included by this rule.
+  ///
+  /// A path matches when it matches the include set and no exclude expression, so excludes
+  /// always win over includes.
+  #[must_use]
   pub fn is_match(&self, text: impl AsRef<Path>) -> bool {
     if !self.include.is_match(text.as_ref()) {
       return false;
@@ -46,7 +72,11 @@ impl GlobRule {
   }
 }
 
-#[derive(Eq)]
+/// A shared JSON value usable as a hash-map key or deduplication key.
+///
+/// [`serde_json::Value`] is not [`Hash`], so schema deduplication wraps it here; hashing is
+/// delegated to [`HashValue`] and equality to the underlying value.
+#[derive(Debug, Eq)]
 pub struct ArcHashValue(pub Arc<Value>);
 
 impl Hash for ArcHashValue {
@@ -61,7 +91,11 @@ impl PartialEq for ArcHashValue {
   }
 }
 
-#[derive(Eq)]
+/// A borrowed JSON value that hashes structurally.
+///
+/// Objects hash their entries in iteration order, so two structurally equal values only hash
+/// alike when their key order agrees — which holds for values produced by the same decoder.
+#[derive(Debug, Eq)]
 pub struct HashValue<'v>(pub &'v Value);
 
 impl PartialEq for HashValue<'_> {
@@ -72,26 +106,30 @@ impl PartialEq for HashValue<'_> {
 
 impl Hash for HashValue<'_> {
   fn hash<H: Hasher>(&self, state: &mut H) {
-    match &self.0 {
+    match *self.0 {
       Value::Null => 0.hash(state),
-      Value::Bool(v) => v.hash(state),
-      Value::Number(v) => v.hash(state),
-      Value::String(v) => v.hash(state),
-      Value::Array(v) => {
-        for v in v {
-          HashValue(v).hash(state);
+      Value::Bool(ref boolean) => boolean.hash(state),
+      Value::Number(ref number) => number.hash(state),
+      Value::String(ref string) => string.hash(state),
+      Value::Array(ref array) => {
+        for element in array {
+          HashValue(element).hash(state);
         }
       }
-      Value::Object(v) => {
-        for (k, v) in v {
-          k.hash(state);
-          HashValue(v).hash(state);
+      Value::Object(ref object) => {
+        for (key, element) in object {
+          key.hash(state);
+          HashValue(element).hash(state);
         }
       }
     }
   }
 }
 
+/// Conversion of a host path into Taplo's comparable path model.
+///
+/// Configuration globs, schema associations, and cache keys are all compared as text, so every
+/// path that reaches those comparisons is normalized first.
 pub trait Normalize {
   /// Normalizing in the context of Taplo the following:
   ///
@@ -103,16 +141,18 @@ pub trait Normalize {
 
 impl Normalize for PathBuf {
   fn normalize(self) -> Self {
-    match self.to_str() {
-      Some(s) => (*normalize_str(s)).into(),
-      None => self,
-    }
+    self.to_str().map(|source| (*normalize_str(source)).into()).unwrap_or(self)
   }
 }
 
-pub(crate) fn normalize_str(s: &str) -> Cow<'_, str> {
-  let Some(percent_decoded) = percent_decode_str(s).decode_utf8().ok() else {
-    return s.into();
+/// Normalize percent escapes and platform separators in one path-like string.
+#[allow(
+  clippy::single_call_fn,
+  reason = "string normalization keeps percent decoding and platform separator rules reusable at the path normalization boundary"
+)]
+pub(crate) fn normalize_str(source: &str) -> Cow<'_, str> {
+  let Some(percent_decoded) = percent_decode_str(source).decode_utf8().ok() else {
+    return source.into();
   };
 
   if cfg!(windows) {
@@ -120,52 +160,4 @@ pub(crate) fn normalize_str(s: &str) -> Cow<'_, str> {
   } else {
     percent_decoded
   }
-}
-
-#[cfg(all(not(target_arch = "wasm32"), feature = "reqwest"))]
-#[tracing::instrument]
-pub fn get_reqwest_client(timeout: std::time::Duration) -> Result<reqwest::Client, reqwest::Error> {
-  #[cfg(any(feature = "native-tls", feature = "rustls-tls"))]
-  fn get_certs(mut builder: reqwest::ClientBuilder, path: &std::ffi::OsStr) -> reqwest::ClientBuilder {
-    fn get_cert(path: &Path) -> Result<reqwest::Certificate, anyhow::Error> {
-      let is_der = path.extension().is_some_and(|ext| ext == "der");
-      let buf = std::fs::read(path)?;
-      tracing::info!("Found a custom CA {}. Reading the CA...", path.to_string_lossy());
-      if is_der {
-        Ok(reqwest::Certificate::from_der(&buf)?)
-      } else {
-        Ok(reqwest::Certificate::from_pem(&buf)?)
-      }
-    }
-
-    match get_cert(path.as_ref()) {
-      Ok(cert) => {
-        builder = builder.add_root_certificate(cert);
-        tracing::info!(?path, "Added the custom CA");
-      }
-      Err(err) => {
-        tracing::error!(error = %err, "Could not parse the custom CA");
-      }
-    }
-    builder
-  }
-  #[cfg(not(any(feature = "native-tls", feature = "rustls-tls")))]
-  fn get_certs(builder: reqwest::ClientBuilder, path: &std::ffi::OsStr) -> reqwest::ClientBuilder {
-    tracing::error!(?path, "Could not load certs, taplo was built without TLS");
-    builder
-  }
-
-  // reqwest's `rustls-no-provider` feature builds against rustls without bundling a crypto
-  // provider, so we install ring as the process default before constructing any client. This
-  // is process-global and idempotent (subsequent calls return `Err`, which is ignored).
-  #[cfg(feature = "rustls-tls")]
-  {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-  }
-
-  let mut builder = reqwest::Client::builder().timeout(timeout);
-  if let Some(path) = std::env::var_os("TAPLO_EXTRA_CA_CERTS") {
-    builder = get_certs(builder, &path);
-  }
-  builder.build()
 }

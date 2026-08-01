@@ -1,0 +1,12 @@
+[[products]]
+name = "hammer"
+dimensions = { length = 12, width = 4 }
+tags = ["tool", "metal"]
+
+[[products]]
+name = "nail"
+dimensions = { length = 2, width = 1 }
+tags = [
+  "tool",
+  "metal",
+]

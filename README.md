@@ -1,26 +1,9 @@
-<div style="text-align:left"><img src="taplo-icon.png" width="128"></div>
+<!-- Do not edit; generated file. -->
 
-[![Continuous integration](https://github.com/tamasfe/taplo/workflows/Continuous%20integration/badge.svg)](https://github.com/tamasfe/taplo/actions?query=workflow%3A%22Continuous+integration%22)
-[![Latest Version](https://img.shields.io/crates/v/taplo.svg)](https://crates.io/crates/taplo)
-[![Documentation](https://docs.rs/taplo/badge.svg)](https://docs.rs/taplo)
+## The `0.16` architecture
 
-[**Website**](https://taplo.tamasfe.dev)
+Taplo `0.16` is a coordinated breaking release over the maintained strict Logos and Rowan forks. Logos remains the lexer engine; the parser is fallible and non-recursive, the source-preserving DOM is frozen and `Send + Sync`, and source formatter/render entry points expose typed failures.
 
-# Taplo
+The language server has separate runtime contracts: native execution uses `ConcurrentServer` with `Arc` snapshots and `Send` request futures, while WebAssembly uses `LocalServer` with `Rc` ownership and local futures. Both share protocol lifecycle, ordered mutation barriers, immutable generation-checked snapshots, schema interpretation, and diagnostic behavior.
 
-This is the repository for Taplo, a TOML v1.0.0 toolkit, more details on the [website](https://taplo.tamasfe.dev).
-
-
-- [Taplo](#taplo)
-  - [Status](#status)
-  - [Contributing](#contributing)
-
-## Status
-
-The project is very young, so bugs and incomplete features are expected, so [any help is welcome](CONTRIBUTING.md)!
-
-The correctness of the TOML parsing and decoding is not yet entirely guaranteed (as there is no official 1.0.0 compliance test suite yet).
-
-## Contributing
-
-All kinds of contributions are welcome. Make sure to read the [CONTRIBUTING.md](CONTRIBUTING.md) first!
+Repository-owned `just x` extensions run TOML 1.1 conformance, the complete WASM feature matrix, JavaScript wrapper builds, and Taplo self-formatting. See [`docs/migrations/0.16.md`](docs/migrations/0.16.md) for the API migration.

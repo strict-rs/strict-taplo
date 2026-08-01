@@ -1,0 +1,47 @@
+[package]
+name         = "taplo-lsp-async"
+description  = "Local and concurrent JSON-RPC/LSP server runtimes"
+version      = { workspace = true }
+categories   = ["asynchronous", "development-tools", "network-programming"]
+keywords     = ["async", "json-rpc", "language-server", "lsp"]
+readme       = "README.md"
+rust-version = { workspace = true }
+authors      = { workspace = true }
+edition      = { workspace = true }
+homepage     = { workspace = true }
+license      = { workspace = true }
+repository   = { workspace = true }
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lints]
+workspace = true
+
+[dependencies]
+futures     = { workspace = true }
+lsp-types   = { workspace = true }
+parking_lot = { workspace = true }
+rowan       = { workspace = true }
+serde       = { workspace = true, features = ["derive"] }
+serde_json  = { workspace = true }
+thiserror   = { workspace = true }
+tokio       = { workspace = true, optional = true }
+tracing     = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+strict-test-support = { workspace = true }
+
+# getrandom is not used directly; it is declared to select the JS/web backend for
+# transitive users when building for wasm32 (see the backend cfg in the wasm crate's
+# .cargo/config.toml). It is intentionally absent from native builds.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { workspace = true, features = ["wasm_js"] }
+
+[features]
+default     = []
+tokio-stdio = ["tokio", "tokio/io-std", "tokio/io-util", "tokio/macros", "tokio/rt"]
+tokio-tcp   = ["tokio", "tokio/io-util", "tokio/macros", "tokio/net", "tokio/rt"]
+
+[package.metadata.auto-tag]
+enabled = true

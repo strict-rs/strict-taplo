@@ -1,266 +1,393 @@
+//! TOML formatting command implementation.
+
 use std::mem;
 use std::path::Path;
 use std::path::PathBuf;
 
-use anyhow::anyhow;
 use codespan_reporting::files::SimpleFile;
 use taplo::formatter;
 use taplo::parser;
 use taplo_common::config::Config;
-use taplo_common::environment::Environment;
-use taplo_common::util::Normalize;
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
+use taplo_common::environment::LocalEnvironment;
+use taplo_common::util::Normalize as _;
+use tokio::io::AsyncReadExt as _;
+use tokio::io::AsyncWriteExt as _;
 
+use crate::CliError;
+use crate::CliFailure;
+use crate::LocalCommandFuture;
 use crate::Taplo;
 use crate::args::FormatCommand;
+use crate::path_text;
+use crate::printing::print_parse_errors;
 
-impl<E: Environment> Taplo<E> {
-  pub async fn execute_format(&mut self, cmd: FormatCommand) -> Result<(), anyhow::Error> {
-    if matches!(cmd.files.first().map(|it| it.as_str()), Some("-")) {
-      self.format_stdin(cmd).await
+/// Execute one formatting command.
+pub(super) fn execute_format<E: LocalEnvironment>(
+  taplo: &mut Taplo<E>,
+  command: FormatCommand,
+) -> LocalCommandFuture<'_, Result<(), CliError>> {
+  Box::pin(async move {
+    if matches!(command.files.first().map(String::as_str), Some("-")) {
+      format_stdin(taplo, command).await
     } else {
-      self.format_files(cmd).await
+      format_files(taplo, command).await
     }
-  }
+  })
+}
 
-  #[tracing::instrument(skip_all)]
-  async fn format_stdin(&mut self, cmd: FormatCommand) -> Result<(), anyhow::Error> {
+/// Format standard input.
+#[tracing::instrument(skip_all)]
+fn format_stdin<E: LocalEnvironment>(taplo: &mut Taplo<E>, command: FormatCommand) -> LocalCommandFuture<'_, Result<(), CliError>> {
+  Box::pin(async move {
     let mut source = String::new();
-    self.env.stdin().read_to_string(&mut source).await?;
+    let bytes_read = taplo.env.stdin().read_to_string(&mut source).await?;
+    tracing::trace!(bytes_read, "read formatting input from standard input");
 
-    let config = self.load_config(&cmd.general).await?;
-    let display_path = match cmd.stdin_filepath.as_deref() {
-      Some(filepath) if self.env.is_absolute(filepath.as_ref()) => PathBuf::from(filepath).normalize(),
+    let config = taplo.load_config(&command.general).await?;
+    let display_path = match command.stdin_filepath.as_deref() {
+      Some(filepath) if taplo.env.is_absolute(filepath.as_ref())? => PathBuf::from(filepath).normalize(),
       Some(filepath) => {
-        let cwd = self
-          .env
-          .cwd_normalized()
-          .ok_or_else(|| anyhow!("could not figure the current working directory"))?;
+        let cwd = taplo.env.cwd_normalized()?.ok_or(CliFailure::WorkingDirectoryRequired)?;
         cwd.join(filepath).normalize()
       }
       None => PathBuf::from("-"),
     };
-    let p = parser::parse(&source);
+    let parse = parser::parse(&source)?;
 
-    if !p.errors.is_empty() {
-      self
-        .print_parse_errors(&SimpleFile::new(&display_path.to_string_lossy(), source.as_str()), &p.errors)
-        .await?;
-
-      if !cmd.force {
-        return Err(anyhow!("no formatting was done due to syntax errors"));
+    if !parse.diagnostics().is_empty() {
+      print_parse_errors(
+        taplo,
+        &SimpleFile::new(path_text(&display_path)?, source.as_str()),
+        parse.diagnostics(),
+      )
+      .await?;
+      if !command.input.force {
+        return Err(CliFailure::FormattingBlocked.into());
       }
     }
 
-    let format_opts = self.format_options(&config, &cmd, &display_path)?;
+    let format_options = format_options(&config, &command, &display_path)?;
+    let error_ranges = parse.diagnostics().iter().map(parser::Diagnostic::range).collect::<Vec<_>>();
+    let dom = parse.into_dom();
+    let formatted = formatter::format_with_path_scopes(&dom, &format_options, &error_ranges, config.format_scopes(&display_path))?;
 
-    let error_ranges = p.errors.iter().map(|e| e.range).collect::<Vec<_>>();
-
-    let dom = p.into_dom();
-
-    let formatted = formatter::format_with_path_scopes(dom, format_opts, &error_ranges, config.format_scopes(&display_path))
-      .map_err(|err| anyhow!("invalid key pattern: {err}"))?;
-
-    if cmd.check {
+    if command.output.check {
       if source != formatted {
-        return Err(anyhow!("the input was not properly formatted"));
+        return Err(CliFailure::FormattingMismatch.into());
       }
     } else {
-      let mut stdout = self.env.stdout();
+      let mut stdout = taplo.env.stdout();
       stdout.write_all(formatted.as_bytes()).await?;
       stdout.flush().await?;
     }
-
     Ok(())
-  }
+  })
+}
 
-  #[cfg(target_arch = "wasm32")]
-  async fn print_diff(&self, _path: impl AsRef<Path>, _original: &str, _formatted: &str) -> Result<(), anyhow::Error> {
-    tracing::warn!("the `--diff` flag is not available in this build yet");
+/// Report that diff output is not available to the browser build.
+#[cfg(target_arch = "wasm32")]
+fn print_diff<E: LocalEnvironment>(
+  _taplo: &Taplo<E>,
+  _path: &Path,
+  _original: &str,
+  _formatted: &str,
+) -> LocalCommandFuture<'static, Result<(), CliError>> {
+  Box::pin(async {
+    tracing::warn!("the `--diff` flag is not available in this build");
     Ok(())
-  }
+  })
+}
 
-  #[cfg(not(target_arch = "wasm32"))]
-  async fn print_diff(&self, path: impl AsRef<Path>, original: &str, formatted: &str) -> Result<(), anyhow::Error> {
-    let path = path.as_ref();
-    let mut stdout = self.env.stdout();
-
-    // print to stdout
-    macro_rules! echo {
-            ($($args:tt)*) => {
-                let msg = format!("{}\n", std::format_args!($($args)*));
-                stdout.write_all_buf(&mut msg.as_str().as_bytes()).await?;
-            }
-        }
-
-    echo!("diff a/{path} b/{path}", path = path.display());
-    echo!("--- a/{path}", path = path.display());
-    echo!("+++ b/{path}", path = path.display());
-
-    // How many lines of context to print:
-    const CONTEXT_LINES: usize = 7;
-
-    let hunks = prettydiff::diff_lines(original, formatted);
-    let hunks = hunks.diff();
-    let hunkcount = hunks.len();
-    let mut acc = Vec::<String>::with_capacity(hunkcount);
-
-    let mut pre_line = 0_usize;
-    let mut post_line = 0_usize;
-
-    for (idx, diff_op) in hunks.into_iter().enumerate() {
-      use ansi_term::Colour::Green;
-      use ansi_term::Colour::Red;
-      use ansi_term::Colour::{
-        self,
-      };
-      use prettydiff::basic::DiffOp;
-
-      // apply the given color and prefix to the set of strings `s`
-      fn apply_color<'a>(s: &'a [&'a str], prefix: &'a str, color: Colour) -> impl IntoIterator<Item = String> + 'a {
-        s.iter().map(move |&s| color.paint(prefix.to_owned() + s).to_string())
-      }
-
-      let mut pre_length = 0_usize;
-      let mut post_length = 0_usize;
-
-      // length of a net diff op
-      match diff_op {
-        DiffOp::Equal(slices) => {
-          if slices.len() < CONTEXT_LINES * 2 && idx > 0 && idx + 1 < hunkcount {
-            acc.extend(slices[..].iter().map(|&s| s.to_owned()));
-            pre_length += slices.len();
-            post_length += slices.len();
-          } else {
-            if idx > 0 {
-              let end = usize::min(CONTEXT_LINES, slices.len());
-              acc.extend(slices[0..end].iter().map(|&s| s.to_owned()));
-              pre_length += end;
-              post_length += end;
-            }
-            // context before the hunk within the file
-
-            // context after the hunk within the file
-            if idx + 1 < hunkcount {
-              let skip = slices.len().saturating_sub(CONTEXT_LINES);
-              acc.extend(slices[skip..].iter().map(|&s| s.to_owned()));
-              let delta = slices.len().saturating_sub(skip);
-              pre_length += delta;
-              post_length += delta;
-            }
-          }
-        }
-        DiffOp::Insert(ins) => {
-          acc.extend(apply_color(ins, "+", Green));
-          post_length += ins.len();
-        }
-        DiffOp::Remove(rem) => {
-          acc.extend(apply_color(rem, "-", Red));
-          pre_length += rem.len();
-        }
-        DiffOp::Replace(rem, ins) => {
-          acc.extend(apply_color(rem, "-", Red));
-          acc.extend(apply_color(ins, "+", Green));
-          pre_length += rem.len();
-          post_length += ins.len();
-        }
-      };
-      echo!("@@ -{},{} +{},{} @@", pre_line, pre_length, post_line, post_length);
-      echo!("{}", acc.join("\n"));
-
-      pre_line += pre_length;
-      post_line += post_length;
-      acc.clear();
-    }
-
+/// Write one colored unified-style diff.
+#[cfg(not(target_arch = "wasm32"))]
+fn print_diff<'operation, E: LocalEnvironment>(
+  taplo: &'operation Taplo<E>,
+  path: &'operation Path,
+  original: &'operation str,
+  formatted: &'operation str,
+) -> LocalCommandFuture<'operation, Result<(), CliError>> {
+  Box::pin(async move {
+    let rendered = render_diff(path, original, formatted, taplo.colors);
+    let mut stdout = taplo.env.stdout();
+    stdout.write_all(rendered.as_bytes()).await?;
     stdout.flush().await?;
     Ok(())
-  }
+  })
+}
 
-  #[tracing::instrument(skip_all)]
-  async fn format_files(&mut self, mut cmd: FormatCommand) -> Result<(), anyhow::Error> {
-    if cmd.stdin_filepath.is_some() {
-      tracing::warn!("using `--stdin-filepath` has no effect unless input comes from stdin")
+/// Format every selected file.
+#[tracing::instrument(skip_all)]
+fn format_files<E: LocalEnvironment>(taplo: &mut Taplo<E>, mut command: FormatCommand) -> LocalCommandFuture<'_, Result<(), CliError>> {
+  Box::pin(async move {
+    if command.stdin_filepath.is_some() {
+      tracing::warn!("using `--stdin-filepath` has no effect unless input comes from stdin");
     }
 
-    let config = self.load_config(&cmd.general).await?;
-
-    let cwd = self
-      .env
-      .cwd_normalized()
-      .ok_or_else(|| anyhow!("could not figure the current working directory"))?;
-
-    let files = self.collect_files(&cwd, &config, mem::take(&mut cmd.files).into_iter()).await?;
-
-    let mut result = Ok(());
+    let config = taplo.load_config(&command.general).await?;
+    let cwd = taplo.env.cwd_normalized()?.ok_or(CliFailure::WorkingDirectoryRequired)?;
+    let files = taplo
+      .collect_files(&cwd, &config, mem::take(&mut command.files).into_iter())
+      .await?;
+    let mut result: Result<(), CliError> = Ok(());
 
     for path in files {
-      let format_opts = self.format_options(&config, &cmd, &path)?;
+      let format_options = format_options(&config, &command, &path)?;
+      let source = String::from_utf8(taplo.env.read_file(&path).await?)?;
+      let parse = parser::parse(&source)?;
 
-      let f = self.env.read_file(&path).await?;
-      let source = String::from_utf8_lossy(&f).into_owned();
-
-      let p = parser::parse(&source);
-
-      if !p.errors.is_empty() {
-        self
-          .print_parse_errors(&SimpleFile::new(&*path.to_string_lossy(), source.as_str()), &p.errors)
-          .await?;
-
-        if !cmd.force {
-          result = Err(anyhow!("some files were not formatted due to syntax errors"));
+      if !parse.diagnostics().is_empty() {
+        print_parse_errors(taplo, &SimpleFile::new(path_text(&path)?, source.as_str()), parse.diagnostics()).await?;
+        if !command.input.force {
+          result = Err(CliFailure::FileFormattingFailed.into());
           continue;
         }
       }
 
-      let error_ranges = p.errors.iter().map(|e| e.range).collect::<Vec<_>>();
+      let error_ranges = parse.diagnostics().iter().map(parser::Diagnostic::range).collect::<Vec<_>>();
+      let dom = parse.into_dom();
+      let formatted = formatter::format_with_path_scopes(&dom, &format_options, &error_ranges, config.format_scopes(&path))?;
 
-      let dom = p.into_dom();
+      if source == formatted {
+        continue;
+      }
+      if command.output.diff {
+        print_diff(taplo, &path, &source, &formatted).await?;
+      }
+      if command.output.check {
+        tracing::error!(?path, "the file is not properly formatted");
+        result = Err(CliFailure::FileFormattingFailed.into());
+      } else {
+        taplo.env.write_file(&path, formatted.as_bytes()).await?;
+      }
+    }
+    result
+  })
+}
 
-      let formatted = formatter::format_with_path_scopes(dom, format_opts, &error_ranges, config.format_scopes(&path))
-        .map_err(|err| anyhow!("invalid key pattern: {err}"))?;
+/// Merge configuration and command-line formatting options.
+fn format_options(config: &Config, command: &FormatCommand, path: &Path) -> Result<formatter::Options, CliError> {
+  let mut format_options = formatter::Options::default();
+  config.update_format_options(path, &mut format_options);
 
-      if source != formatted {
-        if cmd.diff
-          && let Err(error) = self.print_diff(&path, &source, &formatted).await
-        {
-          self
-            .env
-            .stderr()
-            .write_all(format!("Failed to write diff to stdout: {error:?}").as_str().as_bytes())
-            .await?;
-        }
+  let mut parsed = Vec::with_capacity(command.options.len());
+  for option in &command.options {
+    let Some((key, option_value)) = option.split_once('=') else {
+      return Err(formatter::OptionParseError::InvalidOption(option.clone()).into());
+    };
+    parsed.push((key, option_value));
+  }
+  format_options.update_from_str(parsed.into_iter())?;
+  Ok(format_options)
+}
 
-        if cmd.check {
-          tracing::error!(?path, "the file is not properly formatted");
-          result = Err(anyhow!("some files were not properly formatted"));
+/// Number of unchanged lines retained around each rendered diff hunk.
+#[cfg(not(target_arch = "wasm32"))]
+const DIFF_CONTEXT_LINES: usize = 7;
+
+/// Append the visible portion of one unchanged diff segment.
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(
+  clippy::single_call_fn,
+  reason = "equal-segment selection isolates boundary and context-window policy from diff operation dispatch"
+)]
+fn append_equal_context(slices: &[&str], index: usize, hunk_count: usize, accumulated: &mut Vec<String>) -> usize {
+  let next_index = index.saturating_add(1);
+  let complete_context = DIFF_CONTEXT_LINES.saturating_mul(2);
+  if slices.len() < complete_context && index > 0 && next_index < hunk_count {
+    accumulated.extend(slices.iter().map(|line| (*line).to_owned()));
+    return slices.len();
+  }
+
+  let mut visible_length = 0_usize;
+  if index > 0 {
+    let end = usize::min(DIFF_CONTEXT_LINES, slices.len());
+    accumulated.extend(slices.iter().take(end).map(|line| (*line).to_owned()));
+    visible_length = visible_length.saturating_add(end);
+  }
+  if next_index < hunk_count {
+    let skip = slices.len().saturating_sub(DIFF_CONTEXT_LINES);
+    accumulated.extend(slices.iter().skip(skip).map(|line| (*line).to_owned()));
+    visible_length = visible_length.saturating_add(slices.len().saturating_sub(skip));
+  }
+  visible_length
+}
+
+/// Render a compact unified-style line diff.
+#[cfg(not(target_arch = "wasm32"))]
+fn render_diff(path: &Path, original: &str, formatted: &str, colors: bool) -> String {
+  use anstyle::AnsiColor;
+  use anstyle::Style;
+  use prettydiff::basic::DiffOp;
+
+  /// Apply one optional ANSI style to prefixed lines.
+  fn styled_lines(lines: &[&str], prefix: &str, style: Style, colors: bool) -> Vec<String> {
+    lines
+      .iter()
+      .map(|line| {
+        let text = format!("{prefix}{line}");
+        if colors {
+          format!("{style}{text}{style:#}")
         } else {
-          self.env.write_file(&path, formatted.as_bytes()).await?;
+          text
         }
+      })
+      .collect()
+  }
+
+  let green = Style::new().fg_color(Some(AnsiColor::Green.into()));
+  let red = Style::new().fg_color(Some(AnsiColor::Red.into()));
+  let line_diff = prettydiff::diff_lines(original, formatted);
+  let hunks = line_diff.diff();
+  let hunk_count = hunks.len();
+  let mut output = format!("diff a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n", path = path.display());
+  let mut accumulated = Vec::<String>::with_capacity(hunk_count);
+  let mut pre_line = 0_usize;
+  let mut post_line = 0_usize;
+
+  for (index, diff_operation) in hunks.into_iter().enumerate() {
+    let mut pre_length = 0_usize;
+    let mut post_length = 0_usize;
+    match diff_operation {
+      DiffOp::Equal(slices) => {
+        let visible_length = append_equal_context(slices, index, hunk_count, &mut accumulated);
+        pre_length = pre_length.saturating_add(visible_length);
+        post_length = post_length.saturating_add(visible_length);
+      }
+      DiffOp::Insert(inserted) => {
+        accumulated.extend(styled_lines(inserted, "+", green, colors));
+        post_length = post_length.saturating_add(inserted.len());
+      }
+      DiffOp::Remove(removed) => {
+        accumulated.extend(styled_lines(removed, "-", red, colors));
+        pre_length = pre_length.saturating_add(removed.len());
+      }
+      DiffOp::Replace(removed, inserted) => {
+        accumulated.extend(styled_lines(removed, "-", red, colors));
+        accumulated.extend(styled_lines(inserted, "+", green, colors));
+        pre_length = pre_length.saturating_add(removed.len());
+        post_length = post_length.saturating_add(inserted.len());
       }
     }
 
-    result
+    let hunk = format!(
+      "@@ -{pre_line},{pre_length} +{post_line},{post_length} @@\n{}\n",
+      accumulated.join("\n")
+    );
+    output.push_str(&hunk);
+    pre_line = pre_line.saturating_add(pre_length);
+    post_line = post_line.saturating_add(post_length);
+    accumulated.clear();
+  }
+  output
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+  use std::path::Path;
+
+  use strict_test_support::TestFailure;
+  use strict_test_support::ensure;
+  use strict_test_support::ensure_contains;
+  use strict_test_support::ensure_eq;
+  use strict_test_support::ensure_lacks;
+
+  use super::append_equal_context;
+  use super::render_diff;
+
+  #[test]
+  fn equal_diff_context_preserves_short_interiors_and_bounds_long_edges() -> Result<(), TestFailure> {
+    let mut visible = Vec::new();
+    let short = ["middle-a", "middle-b"];
+    let short_length = append_equal_context(&short, 1, 3, &mut visible);
+    ensure_eq(
+      &short_length,
+      &short.len(),
+      "a short unchanged segment between edits must remain complete",
+    )?;
+    ensure(
+      visible.iter().map(String::as_str).collect::<Vec<_>>() == short,
+      "a short interior context segment must retain every unchanged line in order",
+    )?;
+
+    let long = [
+      "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen",
+      "fifteen",
+    ];
+    visible.clear();
+    let leading_length = append_equal_context(&long, 0, 2, &mut visible);
+    ensure_eq(
+      &leading_length,
+      &super::DIFF_CONTEXT_LINES,
+      "leading unchanged content must expose only the trailing context window",
+    )?;
+    ensure(
+      visible.iter().map(String::as_str).collect::<Vec<_>>() == ["nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen"],
+      "leading context must retain the lines closest to the following edit",
+    )?;
+
+    visible.clear();
+    let trailing_length = append_equal_context(&long, 1, 2, &mut visible);
+    ensure_eq(
+      &trailing_length,
+      &super::DIFF_CONTEXT_LINES,
+      "trailing unchanged content must expose only the leading context window",
+    )?;
+    ensure(
+      visible.iter().map(String::as_str).collect::<Vec<_>>() == ["zero", "one", "two", "three", "four", "five", "six"],
+      "trailing context must retain the lines closest to the preceding edit",
+    )?;
+
+    visible.clear();
+    let middle_length = append_equal_context(&long, 1, 3, &mut visible);
+    ensure_eq(
+      &middle_length,
+      &super::DIFF_CONTEXT_LINES.saturating_mul(2),
+      "a long interior segment must expose one context window beside each edit",
+    )?;
+    ensure(
+      visible.iter().map(String::as_str).collect::<Vec<_>>()
+        == [
+          "zero", "one", "two", "three", "four", "five", "six", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen",
+        ],
+      "long interior context must retain both edit-adjacent windows without the distant middle",
+    )
   }
 
-  fn format_options(&self, config: &Config, cmd: &FormatCommand, path: &Path) -> Result<formatter::Options, anyhow::Error> {
-    let mut format_opts = formatter::Options::default();
-    config.update_format_options(path, &mut format_opts);
+  #[test]
+  fn rendered_diffs_distinguish_insert_remove_replace_context_and_color() -> Result<(), TestFailure> {
+    let path = Path::new("nested/document.toml");
+    let inserted = render_diff(path, "keep\n", "keep\nadded\n", false);
+    ensure_contains(
+      &inserted,
+      "diff a/nested/document.toml b/nested/document.toml",
+      "diff output must identify both sides of the selected path",
+    )?;
+    ensure_contains(&inserted, "+added", "an insertion must be rendered with the added-line prefix")?;
+    ensure_lacks(&inserted, "-added", "an insertion must not fabricate a removed counterpart")?;
+    ensure_contains(
+      &inserted,
+      "keep",
+      "an edit beside unchanged content must retain its bounded context",
+    )?;
 
-    format_opts.update_from_str(cmd.options.iter().filter_map(|s| {
-      let mut split = s.split('=');
-      let k = split.next();
-      let v = split.next();
+    let removed = render_diff(path, "keep\nremoved\n", "keep\n", false);
+    ensure_contains(&removed, "-removed", "a removal must be rendered with the removed-line prefix")?;
+    ensure_lacks(&removed, "+removed", "a removal must not fabricate an inserted counterpart")?;
 
-      if let (Some(k), Some(v)) = (k, v) {
-        Some((k, v))
-      } else {
-        tracing::error!(option = %s, "malformed formatter option");
-        None
-      }
-    }))?;
-
-    Ok(format_opts)
+    let replaced = render_diff(path, "old\n", "new\n", true);
+    ensure_contains(
+      &replaced,
+      "\u{1b}[31m-old\u{1b}[0m",
+      "colored replacement output must style the removed line in red",
+    )?;
+    ensure_contains(
+      &replaced,
+      "\u{1b}[32m+new\u{1b}[0m",
+      "colored replacement output must style the inserted line in green",
+    )?;
+    ensure(
+      [replaced.contains("\n-old\n"), replaced.contains("\n+new\n")] == [false, false],
+      "colored replacement output must not duplicate unstyled edit lines",
+    )
   }
 }

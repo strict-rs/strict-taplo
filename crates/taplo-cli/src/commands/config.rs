@@ -1,16 +1,22 @@
 use schemars::schema_for;
 use taplo_common::config::Config;
-use taplo_common::environment::Environment;
-use tokio::io::AsyncWriteExt;
+use taplo_common::environment::LocalEnvironment;
+use tokio::io::AsyncWriteExt as _;
 
+use crate::CliError;
+use crate::LocalCommandFuture;
 use crate::Taplo;
 use crate::args::ConfigCommand;
 use crate::default_config;
 
-impl<E: Environment> Taplo<E> {
-  pub async fn execute_config(&self, cmd: ConfigCommand) -> Result<(), anyhow::Error> {
-    let mut stdout = self.env.stdout();
-    match cmd {
+/// Print the default configuration or its JSON schema.
+pub(super) fn execute_config<E: LocalEnvironment>(
+  taplo: &Taplo<E>,
+  command: ConfigCommand,
+) -> LocalCommandFuture<'_, Result<(), CliError>> {
+  Box::pin(async move {
+    let mut stdout = taplo.env.stdout();
+    match command {
       ConfigCommand::Default => {
         stdout.write_all(toml::to_string_pretty(&default_config())?.as_bytes()).await?;
         stdout.flush().await?;
@@ -24,5 +30,5 @@ impl<E: Environment> Taplo<E> {
         Ok(())
       }
     }
-  }
+  })
 }

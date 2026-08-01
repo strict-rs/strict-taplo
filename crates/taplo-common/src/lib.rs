@@ -1,33 +1,42 @@
-#![warn(clippy::pedantic)]
-#![deny(clippy::print_stdout, clippy::print_stderr)]
-#![allow(
-  clippy::single_match,
-  clippy::default_trait_access,
-  clippy::single_match_else,
-  clippy::module_name_repetitions,
-  clippy::missing_errors_doc,
-  clippy::missing_panics_doc,
-  clippy::missing_fields_in_debug,
-  clippy::similar_names,
-  clippy::too_many_lines,
-  clippy::needless_continue
-)]
+//! Shared configuration, environment, schema, conversion, and utility services.
 
+#![forbid(unsafe_code)]
+
+use std::collections::HashMap as StandardHashMap;
+use std::collections::hash_map::RandomState;
+
+use indexmap::IndexMap as OrderedMap;
+use lru::LruCache as LeastRecentlyUsedCache;
+use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::RwLock as TokioRwLock;
+
+/// Taplo configuration loading and file-rule policy.
 pub mod config;
+/// TOML and JSON conversion helpers.
 pub mod convert;
+/// Local and concurrent host capability contracts.
 pub mod environment;
+/// Shared logging initialization.
 pub mod log;
 #[cfg(feature = "schema")]
+/// Schema interpretation, association, cache, and transport services.
 pub mod schema;
+/// Shared path, glob, and parsing utilities.
 pub mod util;
 
 #[cfg(test)]
-pub(crate) mod test_support;
+/// Adapter from the shared deterministic test host into this crate's trait identity.
+pub mod test_support;
 
-pub type HashMap<K, V> = std::collections::HashMap<K, V, std::collections::hash_map::RandomState>;
-pub type IndexMap<K, V> = indexmap::IndexMap<K, V, std::collections::hash_map::RandomState>;
+/// Workspace hash map using the standard randomized hasher.
+pub type HashMap<K, V> = StandardHashMap<K, V, RandomState>;
+/// Insertion-ordered workspace map using the standard randomized hasher.
+pub type IndexMap<K, V> = OrderedMap<K, V, RandomState>;
 
-pub type AsyncMutex<T> = tokio::sync::Mutex<T>;
-pub type AsyncRwLock<T> = tokio::sync::RwLock<T>;
+/// Asynchronous mutual-exclusion lock shared by local and concurrent services.
+pub type AsyncMutex<T> = TokioMutex<T>;
+/// Asynchronous reader-writer lock shared by local and concurrent services.
+pub type AsyncRwLock<T> = TokioRwLock<T>;
 
-pub type LruCache<K, V> = lru::LruCache<K, V, std::collections::hash_map::RandomState>;
+/// Least-recently-used cache using the standard randomized hasher.
+pub type LruCache<K, V> = LeastRecentlyUsedCache<K, V, RandomState>;

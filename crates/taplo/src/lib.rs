@@ -1,4 +1,3 @@
-#![allow(clippy::single_match)]
 //! # About
 //!
 //! The main purpose of the library is to provide tools for analyzing TOML data where the
@@ -12,8 +11,6 @@
 //! syntax tree with additional information and functionality.
 //!
 //! # Features
-//!
-//! - **time**: Use [time](https://github.com/time-rs/time) for TOML dates and times
 //!
 //! - **serde**: Support for [serde](https://serde.rs) serialization of the DOM nodes.
 //! - **schema**: Enable JSON-schema generation for formatter configuration.
@@ -29,40 +26,64 @@
 //! parts of it might be missing.
 //!
 //! ```
+//! use strict_test_support::TestFailure;
+//! use strict_test_support::ensure;
+//! use strict_test_support::ensure_ok;
 //! use taplo::parser::parse;
+//!
+//! # fn main() -> Result<(), TestFailure> {
 //! const SOURCE: &str = "value = 1
 //! value = 2
 //!
 //! [table]
 //! string = 'some string'";
 //!
-//! let parse_result = parse(SOURCE);
+//! let parse_result = ensure_ok(parse(SOURCE), "the syntax tree must build")?;
 //!
 //! // Check for syntax errors.
 //! // These are not carried over to DOM errors.
-//! assert!(parse_result.errors.is_empty());
+//! ensure(
+//!   parse_result.diagnostics().is_empty(),
+//!   "the source must not produce syntax diagnostics",
+//! )?;
 //!
 //! let root_node = parse_result.into_dom();
 //!
 //! // Check for semantic errors.
 //! // In this example "value" is a duplicate key.
-//! assert!(root_node.validate().is_err());
+//! ensure(
+//!   root_node.validate().is_err(),
+//!   "the duplicate key must produce a semantic diagnostic",
+//! )
+//! # }
 //! ```
 
+use std::collections::HashMap as StandardHashMap;
+use std::collections::HashSet as StandardHashSet;
+use std::collections::hash_map::RandomState;
+
+/// Immutable semantic TOML values, diagnostics, queries, rendering, and source-preserving rewrites.
 pub mod dom;
+/// Source-preserving formatting for parsed syntax trees and semantic DOM values.
 pub mod formatter;
+/// Lossless TOML parsing with ordered recoverable diagnostics and fatal builder failures.
 pub mod parser;
+/// Stable syntax kinds, typed Rowan aliases, and the private Logos-backed lexer.
 pub mod syntax;
+/// Escape decoding, syntax-tree operations, character validation, and source-range helpers.
 pub mod util;
 
 pub use rowan;
 
-pub type HashMap<K, V> = std::collections::HashMap<K, V, std::collections::hash_map::RandomState>;
-pub type HashSet<V> = std::collections::HashSet<V, std::collections::hash_map::RandomState>;
+/// Workspace hash map using the standard randomized hasher.
+pub type HashMap<K, V> = StandardHashMap<K, V, RandomState>;
+/// Workspace hash set using the standard randomized hasher.
+pub type HashSet<V> = StandardHashSet<V, RandomState>;
 
 #[cfg(test)]
-mod tests;
+/// Shared panic-free syntax and DOM construction for sibling core tests.
+pub mod test_support;
 
-mod private {
-  pub trait Sealed {}
-}
+#[cfg(test)]
+/// Cross-module parser, formatter, fixture, and property contracts.
+mod tests;

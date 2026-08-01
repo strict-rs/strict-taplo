@@ -36,7 +36,7 @@ Scripts for development, this might be the most useful if you're about to ask `h
 ### [taplo](crates/taplo)
 
 This is the main Rust library, that contains the parser, formatter, and DOM, and every utility that is required for the core features.
-Every other package (with the exception of [lsp-async-stub](lsp-async-stub)) depends on it in this repository.
+Every other package (with the exception of [taplo-lsp-async](crates/taplo-lsp-async)) depends on it in this repository.
 
 ### [taplo-cli](crates/taplo-cli)
 

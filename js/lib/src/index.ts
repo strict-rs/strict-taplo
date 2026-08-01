@@ -1,5 +1,6 @@
 import {
   Config,
+  asError,
   convertEnv,
   Environment,
   FormatterOptions,
@@ -61,6 +62,26 @@ export interface LintResult {
 }
 
 /**
+ * WebAssembly exports consumed by the synchronous library wrapper.
+ */
+interface TaploWasmModule {
+  initialize: () => void;
+  lint: (
+    environment: unknown,
+    toml: string,
+    config: unknown
+  ) => Promise<LintResult>;
+  format: (
+    environment: unknown,
+    toml: string,
+    options: unknown,
+    config: unknown
+  ) => string;
+  from_json: (json: string) => string;
+  to_json: (toml: string) => string;
+}
+
+/**
  * This class allows for usage of the library in a synchronous context
  * after being asynchronously initialized once.
  *
@@ -80,31 +101,37 @@ export interface LintResult {
  * ```
  */
 export class Taplo {
-  private static taplo: any | undefined;
-  private static initializing: boolean = false;
+  private static modulePromise: Promise<TaploWasmModule> | undefined;
 
-  private constructor(private env: Environment) {
-    if (!Taplo.initializing) {
-      throw new Error(
-        `an instance of Taplo can only be created by calling the "initialize" static method`
-      );
+  private constructor(
+    private env: Environment,
+    private wasm: TaploWasmModule
+  ) {}
+
+  private static loadModule(): Promise<TaploWasmModule> {
+    if (typeof Taplo.modulePromise === "undefined") {
+      Taplo.modulePromise = loadTaplo()
+        .then(module => {
+          module.initialize();
+          return module;
+        })
+        .catch(error => {
+          Taplo.modulePromise = undefined;
+          throw error;
+        });
     }
+    return Taplo.modulePromise;
   }
 
   public static async initialize(env?: Environment): Promise<Taplo> {
-    if (typeof Taplo.taplo === "undefined") {
-      Taplo.taplo = await loadTaplo();
+    try {
+      const module = await Taplo.loadModule();
+      const environment = env ?? browserEnvironment();
+      prepareEnv(environment);
+      return new Taplo(environment, module);
+    } catch (error) {
+      throw asError(error);
     }
-    Taplo.taplo.initialize();
-
-    const environment = env ?? browserEnvironment();
-    prepareEnv(environment);
-
-    Taplo.initializing = true;
-    const t = new Taplo(environment);
-    Taplo.initializing = false;
-
-    return t;
   }
 
   /**
@@ -130,11 +157,15 @@ export class Taplo {
    * @param options Optional additional options.
    */
   public async lint(toml: string, options?: LintOptions): Promise<LintResult> {
-    return await Taplo.taplo.lint(
-      convertEnv(this.env),
-      toml,
-      objectCamel(options?.config ?? {})
-    );
+    try {
+      return await this.wasm.lint(
+        convertEnv(this.env),
+        toml,
+        objectCamel(options?.config ?? {})
+      );
+    } catch (error) {
+      throw asError(error);
+    }
   }
 
   /**
@@ -145,14 +176,14 @@ export class Taplo {
    */
   public format(toml: string, options?: FormatOptions): string {
     try {
-      return Taplo.taplo.format(
+      return this.wasm.format(
         convertEnv(this.env),
         toml,
         options?.options ?? {},
         objectCamel(options?.config ?? {})
       );
-    } catch (e) {
-      throw new Error(e);
+    } catch (error) {
+      throw asError(error);
     }
   }
 
@@ -169,9 +200,9 @@ export class Taplo {
     }
 
     try {
-      return Taplo.taplo.from_json(data);
-    } catch (e) {
-      throw new Error(e);
+      return this.wasm.from_json(data);
+    } catch (error) {
+      throw asError(error);
     }
   }
 
@@ -200,9 +231,9 @@ export class Taplo {
   ): T | string {
     let v: string;
     try {
-      v = Taplo.taplo.to_json(data);
-    } catch (e) {
-      throw new Error(e);
+      v = this.wasm.to_json(data);
+    } catch (error) {
+      throw asError(error);
     }
 
     if (parse) {
@@ -218,25 +249,26 @@ export class Taplo {
  */
 function browserEnvironment(): Environment {
   return {
-    cwd: () => "",
-    envVar: () => "",
-    envVars: () => [["", ""]],
+    cwd: () => "/",
+    envVar: () => undefined,
+    envVars: () => [],
     findConfigFile: () => undefined,
     glob: () => [],
     isAbsolute: () => true,
     now: () => new Date(),
-    readFile: () => Promise.reject("not implemented"),
-    writeFile: () => Promise.reject("not implemented"),
+    readFile: () => Promise.reject(new Error("file reads are unavailable")),
+    writeFile: () => Promise.reject(new Error("file writes are unavailable")),
     stderr: async bytes => {
       console.error(new TextDecoder().decode(bytes));
       return bytes.length;
     },
     stdErrAtty: () => false,
-    stdin: () => Promise.reject("not implemented"),
+    stdin: () => Promise.reject(new Error("standard input is unavailable")),
     stdout: async bytes => {
       console.log(new TextDecoder().decode(bytes));
       return bytes.length;
     },
+    filePathToUrl: filePath => new URL(filePath, "file:///").href,
     urlToFilePath: (url: string) => url.slice("file://".length),
   };
 }

@@ -1,136 +1,122 @@
-//! Manual schema association queries and updates.
+//! Manual schema association queries and state transitions.
 
-use lsp_async_stub::Context;
-use lsp_async_stub::Params;
-use lsp_async_stub::rpc::Error;
-use serde_json::json;
-use taplo_common::environment::Environment;
-use taplo_common::schema::associations::AssociationRule;
+use serde_json::Map;
+use serde_json::Value;
 use taplo_common::schema::associations::SchemaAssociation;
 use taplo_common::schema::associations::priority;
 use taplo_common::schema::associations::source;
+use taplo_lsp_async::Params;
+use taplo_lsp_async::rpc::RpcError;
 
-use crate::diagnostics::publish_diagnostics;
+use crate::lsp_ext::notification;
 use crate::lsp_ext::notification::AssociateSchemaParams;
-use crate::lsp_ext::notification::{
-  self,
-};
 use crate::lsp_ext::request::AssociatedSchemaParams;
 use crate::lsp_ext::request::AssociatedSchemaResponse;
 use crate::lsp_ext::request::ListSchemasParams;
 use crate::lsp_ext::request::ListSchemasResponse;
 use crate::lsp_ext::request::SchemaInfo;
-use crate::world::World;
-use crate::world::send_association_notifications;
+use crate::world::ManualAssociationRule;
+use crate::world::ManualAssociationUpdate;
+use crate::world::WorldState;
 
-#[tracing::instrument(skip_all)]
-pub async fn list_schemas<E: Environment>(
-  context: Context<World<E>>,
-  params: Params<ListSchemasParams>,
-) -> Result<ListSchemasResponse, Error> {
-  let params = params.required()?;
-  let workspace = context.workspace_for_document(&params.document_uri).await;
-  let workspace = workspace.read().await;
-  let associations = workspace.schemas.associations().read();
-  Ok(ListSchemasResponse {
-    schemas: associations
-      .iter()
-      .filter(|(rule, _)| !matches!(rule, AssociationRule::Url(..)))
-      .map(|(_, association)| SchemaInfo {
-        url:  association.url.clone(),
-        meta: association.meta.clone(),
+/// Generate manual-schema operations over one concrete execution family.
+macro_rules! define_schema_handler_future_family {
+  (
+    $list_schemas:ident,
+    $associate_schema:ident,
+    $associated_schema:ident,
+    $list_schema_associations:ident,
+    $world_associate_schema:ident,
+    $world_associated_schema:ident;
+    $future:ident,
+    $environment:path,
+    $transport:ident,
+    $schema_execution:path;
+    [$($value_bound:path),*]
+  ) => {
+    /// List every non-document association visible to a document's workspace.
+    pub(super) fn $list_schemas<E: $environment>(
+      world: &WorldState<E, $transport<E>>,
+      params: Params<ListSchemasParams>,
+    ) -> $future<'_, Result<ListSchemasResponse, RpcError>> {
+      Box::pin(async move {
+        let parameters = params.required()?;
+        Ok(ListSchemasResponse {
+          schemas: world
+            .$list_schema_associations(&parameters.document_uri)
+            .await
+            .into_iter()
+            .map(|association| SchemaInfo {
+              url:  association.url,
+              meta: association.meta,
+            })
+            .collect(),
+        })
       })
-      .collect(),
-  })
-}
+    }
 
-#[tracing::instrument(skip_all)]
-pub async fn associate_schema<E: Environment>(context: Context<World<E>>, params: Params<AssociateSchemaParams>) {
-  let Ok(params) = params.required() else {
-    return;
+    /// Validate and commit one manual schema association.
+    pub(super) fn $associate_schema<E: $environment>(
+      world: &WorldState<E, $transport<E>>,
+      params: Params<AssociateSchemaParams>,
+    ) -> $future<'_, Result<ManualAssociationUpdate, RpcError>> {
+      Box::pin(async move {
+        let parameters = params.required()?;
+        let association = SchemaAssociation {
+          priority: parameters.priority.unwrap_or(priority::MAX),
+          url:      parameters.schema_uri,
+          meta:     {
+            let mut metadata = match parameters.meta {
+              Some(Value::Object(metadata)) => metadata,
+              Some(_) | None => Map::new(),
+            };
+            drop(metadata.insert(String::from("source"), Value::String(String::from(source::MANUAL))));
+            Value::Object(metadata)
+          },
+        };
+        let rule = match parameters.rule {
+          notification::AssociationRule::Glob(pattern) => ManualAssociationRule::Glob(pattern),
+          notification::AssociationRule::Regex(pattern) => ManualAssociationRule::Regex(pattern),
+          notification::AssociationRule::Url(document) => ManualAssociationRule::Url(document),
+        };
+        world
+          .$world_associate_schema(rule, association)
+          .await
+          .map_err(|error| RpcError::internal_error().with_details(error.to_string()))
+      })
+    }
+
+    /// Return the highest-priority schema association selected for one document.
+    pub(super) fn $associated_schema<E: $environment>(
+      world: &WorldState<E, $transport<E>>,
+      params: Params<AssociatedSchemaParams>,
+    ) -> $future<'_, Result<AssociatedSchemaResponse, RpcError>> {
+      Box::pin(async move {
+        let parameters = params.required()?;
+        Ok(AssociatedSchemaResponse {
+          schema: world
+            .$world_associated_schema(&parameters.document_uri)
+            .await
+            .map(|association| SchemaInfo {
+              url:  association.url,
+              meta: association.meta,
+            }),
+        })
+      })
+    }
   };
-  let association = SchemaAssociation {
-    priority: params.priority.unwrap_or(priority::MAX),
-    url:      params.schema_uri,
-    meta:     {
-      let mut meta = params.meta.unwrap_or_else(|| json!({}));
-      if !meta.is_object() {
-        meta = json!({});
-      }
-      meta["source"] = source::MANUAL.into();
-      meta
-    },
-  };
-
-  let mut notifications = Vec::new();
-  let mut diagnostic_document = None;
-  match params.rule {
-    notification::AssociationRule::Glob(glob) => {
-      let rule = match AssociationRule::glob(&glob) {
-        Ok(rule) => rule,
-        Err(error) => {
-          tracing::error!(%error, schema_uri = %association.url, "invalid schema glob");
-          return;
-        }
-      };
-      for handle in context.all_workspace_handles().await {
-        let workspace = handle.write().await;
-        workspace.schemas.associations().add(rule.clone(), association.clone());
-        notifications.extend(workspace.association_notifications());
-      }
-    }
-    notification::AssociationRule::Regex(regex) => {
-      let rule = match AssociationRule::regex(&regex) {
-        Ok(rule) => rule,
-        Err(error) => {
-          tracing::error!(%error, schema_uri = %association.url, "invalid schema regex");
-          return;
-        }
-      };
-      for handle in context.all_workspace_handles().await {
-        let workspace = handle.write().await;
-        workspace.schemas.associations().add(rule.clone(), association.clone());
-        notifications.extend(workspace.association_notifications());
-      }
-    }
-    notification::AssociationRule::Url(document_uri) => {
-      let handle = context.workspace_for_document(&document_uri).await;
-      let workspace = handle.write().await;
-      workspace.schemas.associations().retain(|(rule, existing)| match rule {
-        AssociationRule::Url(url) => url != &document_uri || existing.meta["source"] != source::MANUAL,
-        _ => true,
-      });
-      workspace
-        .schemas
-        .associations()
-        .add(AssociationRule::Url(document_uri.clone()), association);
-      notifications.extend(workspace.association_notifications());
-      diagnostic_document = Some(document_uri);
-    }
-  }
-
-  if let Some(document) = diagnostic_document {
-    publish_diagnostics(context.clone(), document).await;
-  }
-  send_association_notifications(context, notifications).await;
 }
 
-#[tracing::instrument(skip_all)]
-pub async fn associated_schema<E: Environment>(
-  context: Context<World<E>>,
-  params: Params<AssociatedSchemaParams>,
-) -> Result<AssociatedSchemaResponse, Error> {
-  let params = params.required()?;
-  let workspace = context.workspace_for_document(&params.document_uri).await;
-  let workspace = workspace.read().await;
-  Ok(AssociatedSchemaResponse {
-    schema: workspace
-      .schemas
-      .associations()
-      .association_for(&params.document_uri)
-      .map(|association| SchemaInfo {
-        url:  association.url,
-        meta: association.meta,
-      }),
-  })
-}
+define_lsp_execution_families!(
+  handler
+  define_schema_handler_future_family;
+  (list_schemas_local, list_schemas_concurrent),
+  (associate_schema_local, associate_schema_concurrent),
+  (associated_schema_local, associated_schema_concurrent),
+  (
+    list_schema_associations,
+    list_schema_associations_concurrent
+  ),
+  (associate_schema, associate_schema_concurrent),
+  (associated_schema, associated_schema_concurrent),
+);

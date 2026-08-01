@@ -5,64 +5,43 @@
 //! `url::Url`, so standard LSP params/results are converted at the protocol boundary while
 //! everything internal stays `url::Url`.
 
-use std::str::FromStr;
+use std::str::FromStr as _;
 
-use lsp_async_stub::util::Mapper;
-use lsp_async_stub::util::Position as MapperPosition;
-use lsp_types::Position;
 use lsp_types::Range;
 use lsp_types::Uri;
 use taplo::rowan::TextRange;
+use taplo_lsp_async::rpc::RpcError;
+use taplo_lsp_async::util::Mapper;
+use taplo_lsp_async::util::MappingError;
 use url::Url;
 
 /// Convert an internal [`Url`] into the LSP wire [`Uri`].
 #[must_use]
-pub(crate) fn to_uri(url: &Url) -> Option<Uri> {
+pub(super) fn to_uri(url: &Url) -> Option<Uri> {
   Uri::from_str(url.as_str()).ok()
 }
 
 /// Convert an LSP wire [`Uri`] into an internal [`Url`], returning [`None`] if it is not a valid
 /// absolute URL.
 #[must_use]
-pub(crate) fn to_url(uri: &Uri) -> Option<Url> {
+pub(super) fn to_url(uri: &Uri) -> Option<Url> {
   Url::parse(uri.as_str()).ok()
 }
 
-/// Convert an LSP input position to the mapper's nontruncating coordinate type.
-#[must_use]
-pub(crate) fn from_lsp_position(position: Position) -> MapperPosition {
-  MapperPosition::new(u64::from(position.line), u64::from(position.character))
+/// Map a syntax range directly into checked LSP coordinates.
+pub(super) fn to_lsp_range(mapper: &Mapper, range: TextRange) -> Result<Range, MappingError> {
+  mapper.range(range)
 }
 
-/// Convert a mapper position to LSP coordinates when both values fit on the wire.
-#[must_use]
-pub(crate) fn to_lsp_position(position: MapperPosition) -> Option<Position> {
-  Some(Position::new(
-    u32::try_from(position.line).ok()?,
-    u32::try_from(position.character).ok()?,
-  ))
-}
-
-/// Map a syntax range and convert both endpoints to LSP coordinates without truncation.
-#[must_use]
-pub(crate) fn to_lsp_range(mapper: &Mapper, range: TextRange) -> Option<Range> {
-  let range = mapper.range(range)?;
-  Some(Range::new(to_lsp_position(range.start)?, to_lsp_position(range.end)?))
-}
-
-/// Convert a mapper range to LSP coordinates without truncation.
-#[must_use]
-pub(crate) fn mapper_range_to_lsp(range: lsp_async_stub::util::Range) -> Option<Range> {
-  Some(Range::new(to_lsp_position(range.start)?, to_lsp_position(range.end)?))
+/// Translate a checked coordinate failure at the JSON-RPC protocol boundary.
+pub(super) fn mapping_rpc_error(error: &MappingError) -> RpcError {
+  RpcError::internal_error().with_details(error.to_string())
 }
 
 #[cfg(test)]
 mod tests {
-  use std::str::FromStr;
+  use std::str::FromStr as _;
 
-  use lsp_async_stub::util::Mapper;
-  use lsp_async_stub::util::Position as MapperPosition;
-  use lsp_async_stub::util::Range as MapperRange;
   use lsp_types::Position;
   use lsp_types::Uri;
   use strict_test_support::TestFailure;
@@ -71,10 +50,10 @@ mod tests {
   use strict_test_support::ensure_some;
   use taplo::rowan::TextRange;
   use taplo::rowan::TextSize;
+  use taplo_lsp_async::util::Mapper;
+  use taplo_lsp_async::util::MappingError;
   use url::Url;
 
-  use super::mapper_range_to_lsp;
-  use super::to_lsp_position;
   use super::to_lsp_range;
   use super::to_uri;
   use super::to_url;
@@ -99,35 +78,20 @@ mod tests {
   }
 
   #[test]
-  fn position_and_range_conversion_are_exact_or_absent() -> Result<(), TestFailure> {
-    ensure(
-      to_lsp_position(MapperPosition::new(2, 3)) == Some(Position::new(2, 3)),
-      "representable mapper coordinates must convert exactly",
-    )?;
-    let too_large = u64::from(u32::MAX).saturating_add(1);
-    ensure(
-      to_lsp_position(MapperPosition::new(too_large, 0)).is_none(),
-      "a line beyond the LSP width must be rejected",
-    )?;
-    ensure(
-      mapper_range_to_lsp(MapperRange {
-        start: MapperPosition::new(0, 0),
-        end:   MapperPosition::new(0, too_large),
-      })
-      .is_none(),
-      "an unrepresentable range endpoint must suppress the whole range",
-    )?;
-
-    let mapper = Mapper::new_utf16("alpha\nβeta", false);
+  fn range_conversion_is_exact_or_typed() -> Result<(), TestFailure> {
+    let mapper = ensure_ok(Mapper::new_utf16("alpha\n\u{3b2}eta"), "the mapper fixture must build")?;
     let source_range = TextRange::new(TextSize::from(0), TextSize::from(5));
-    let mapped = ensure_some(to_lsp_range(&mapper, source_range), "a source-backed range must map")?;
+    let lsp_range = ensure_ok(to_lsp_range(&mapper, source_range), "a source-backed range must map")?;
     ensure(
-      mapped == lsp_types::Range::new(Position::new(0, 0), Position::new(0, 5)),
+      lsp_range == lsp_types::Range::new(Position::new(0, 0), Position::new(0, 5)),
       "mapped source coordinates must remain exact",
     )?;
     ensure(
-      to_lsp_range(&mapper, TextRange::new(TextSize::new(100), TextSize::new(101))).is_none(),
-      "source offsets absent from the mapper must not fabricate a range",
+      matches!(
+        to_lsp_range(&mapper, TextRange::new(TextSize::new(100), TextSize::new(101))),
+        Err(MappingError::OffsetOutOfBounds { .. })
+      ),
+      "source offsets absent from the mapper must return a typed failure",
     )
   }
 }

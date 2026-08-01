@@ -1,6 +1,8 @@
 ## Entry points
 
-`lib.rs` exposes two constructors:
+`lib.rs` exposes four explicit constructors:
 
-- `create_server::<E>() -> Server<World<E>>` — builds the `lsp-async-stub` server and registers every request/notification handler (initialize, folding ranges, document symbols, formatting, completion, hover, links, semantic tokens, prepare/rename, document + configuration + workspace notifications).
-- `create_world::<E>(env) -> World<E>` — constructs the shared server state.
+- `create_concurrent_server::<E>() -> ConcurrentServer<ConcurrentWorld<E>>` and `create_concurrent_world(env, http)` — construct the native multi-threaded server and `Arc`-owned world for a `ConcurrentEnvironment`.
+- `create_local_server::<E>() -> LocalServer<LocalWorld<E>>` and `create_local_world(env, http)` — construct the current-thread server and `Rc`-owned world for a `LocalEnvironment`.
+
+There are no `Server`, `ServerBuilder`, or ambiguous world aliases. Construction that initializes schema services is fallible and returns `WorldError`.

@@ -29,7 +29,7 @@ export interface Environment {
    *
    * This function must not return more than `n` bytes.
    */
-  stdin: Readable | ((n: bigint) => Promise<Uint8Array>);
+  stdin: Readable | ((n: number) => Promise<Uint8Array>);
   /**
    * Write the given bytes to the standard output returning
    * the number of bytes written.
@@ -49,13 +49,21 @@ export interface Environment {
    */
   readFile: (path: string) => Promise<Uint8Array>;
   /**
-   * Write and overwrite a file at the given path.
+   * Atomically replace or create a file at the given path.
+   *
+   * Resolve the promise only after the complete byte sequence is visible at the
+   * destination. Implementations should use a same-directory temporary file
+   * followed by an atomic replacement, or the host platform's equivalent.
    */
   writeFile: (path: string, bytes: Uint8Array) => Promise<void>;
   /**
    * Turn an URL into a file path.
    */
-  urlToFilePath: (url: string) => string;
+  urlToFilePath: (url: string) => string | undefined;
+  /**
+   * Turn a file path into an absolute file URL.
+   */
+  filePathToUrl: (path: string) => string | undefined;
   /**
    * Return whether a path is absolute.
    */
@@ -63,7 +71,7 @@ export interface Environment {
   /**
    * Return the path to the current working directory.
    */
-  cwd: () => string;
+  cwd: () => string | undefined;
   /**
    * Find the Taplo config file from the given directory
    * and return the path if found.
@@ -88,20 +96,59 @@ export interface Environment {
     Response: any;
   };
 }
+
+/**
+ * Failure while preparing browser-compatible HTTP globals for the WebAssembly transport.
+ */
+export class EnvironmentSetupError extends Error {
+  public constructor(message: string) {
+    super(message);
+    this.name = "EnvironmentSetupError";
+  }
+}
+
+/**
+ * Preserve JavaScript and WebAssembly errors while normalizing non-error throws.
+ */
+export function asError(thrown: unknown): Error {
+  if (thrown instanceof Error) {
+    return thrown;
+  }
+  return new Error(String(thrown));
+}
+
 /**
  * @private
  */
-export function prepareEnv(environment: Environment) {
-  if (typeof fetch === "undefined") {
-    if (environment.fetch) {
-      // FIXME: A lot of assumptions here...
-      (global as any).Headers = environment.fetch.Headers;
-      (global as any).Request = environment.fetch.Request;
-      (global as any).Response = environment.fetch.Response;
-      (global as any).fetch = environment.fetch.fetch;
-    } else {
-      console.warn(
-        "fetch was not provided, HTTP operations will not be possible"
+export function prepareEnv(environment: Environment): void {
+  if (typeof globalThis.fetch === "function") {
+    return;
+  }
+
+  const bindings = environment.fetch;
+  if (typeof bindings?.fetch !== "function") {
+    throw new EnvironmentSetupError(
+      "fetch is unavailable; provide complete HTTP bindings in Environment.fetch"
+    );
+  }
+
+  const globals: Array<[string, unknown]> = [
+    ["Headers", bindings.Headers],
+    ["Request", bindings.Request],
+    ["Response", bindings.Response],
+    ["fetch", bindings.fetch],
+  ];
+  for (const [name, binding] of globals) {
+    if (typeof binding !== "function") {
+      throw new EnvironmentSetupError(
+        `Environment.fetch.${name} must be callable`
+      );
+    }
+  }
+  for (const [name, binding] of globals) {
+    if (!Reflect.set(globalThis, name, binding)) {
+      throw new EnvironmentSetupError(
+        `failed to install Environment.fetch.${name}`
       );
     }
   }
@@ -110,7 +157,7 @@ export function prepareEnv(environment: Environment) {
 /**
  * @private
  */
-export function convertEnv(env: Environment): any {
+export function convertEnv(env: Environment) {
   const stdin =
     typeof env.stdin === "function" ? env.stdin : streamToReadCb(env.stdin);
   const stdout =
@@ -119,20 +166,22 @@ export function convertEnv(env: Environment): any {
     typeof env.stderr === "function" ? env.stderr : streamToWriteCb(env.stderr);
 
   return {
-    js_now: env.now,
-    js_env_var: env.envVar,
-    js_env_vars: env.envVars,
-    js_atty_stderr: env.stdErrAtty,
+    js_now: () => env.now(),
+    js_env_var: (name: string) => env.envVar(name),
+    js_env_vars: () => env.envVars(),
+    js_atty_stderr: () => env.stdErrAtty(),
     js_on_stdin: stdin,
     js_on_stdout: stdout,
     js_on_stderr: stderr,
-    js_glob_files: env.glob,
-    js_read_file: env.readFile,
-    js_write_file: env.writeFile,
-    js_to_file_path: env.urlToFilePath,
-    js_is_absolute: env.isAbsolute,
-    js_cwd: env.cwd,
-    js_find_config_file: env.findConfigFile,
+    js_glob_files: (pattern: string) => env.glob(pattern),
+    js_read_file: (path: string) => env.readFile(path),
+    js_write_file: (path: string, bytes: Uint8Array) =>
+      env.writeFile(path, bytes),
+    js_to_file_path: (url: string) => env.urlToFilePath(url),
+    js_to_file_url: (path: string) => env.filePathToUrl(path),
+    js_is_absolute: (path: string) => env.isAbsolute(path),
+    js_cwd: () => env.cwd(),
+    js_find_config_file: (from: string) => env.findConfigFile(from),
   };
 }
 
@@ -140,16 +189,19 @@ function streamToWriteCb(
   stream: Writable
 ): (bytes: Uint8Array) => Promise<number> {
   return bytes => {
-    return new Promise(resolve => {
-      // FIXME: we immediately resolve as it does not matter
-      //   in any of the use-cases.
-      stream.write(bytes);
-      resolve(bytes.length);
+    return new Promise((resolve, reject) => {
+      stream.write(bytes, error => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve(bytes.length);
+      });
     });
   };
 }
 
-function streamToReadCb(stream: Readable): (n: bigint) => Promise<Uint8Array> {
+function streamToReadCb(stream: Readable): (n: number) => Promise<Uint8Array> {
   // The stream EOF event callback is immediately called after the last
   // bit of data was read, however we cannot immediately signal it as we are still returning data.
   //
@@ -161,42 +213,66 @@ function streamToReadCb(stream: Readable): (n: bigint) => Promise<Uint8Array> {
   let eof = false;
 
   return n => {
-    // Make sure that we only resolve/reject the promise once.
-    // This might not be necessary, but it's better to be safe.
-    let done = false;
-
     return new Promise((resolve, reject) => {
-      if (eof) {
+      if (eof || stream.readableEnded) {
+        eof = true;
         return resolve(new Uint8Array());
       }
 
-      function onReadable() {
-        const data = stream.read(Number(n));
-        if (data !== null) {
-          if (!done) {
-            done = true;
-            resolve(data);
-            stream.off("readable", onReadable);
-          }
+      let settled = false;
+
+      function cleanup() {
+        stream.off("readable", onReadable);
+        stream.off("end", onEnd);
+        stream.off("error", onError);
+      }
+
+      function settleData(data: unknown) {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanup();
+        if (data instanceof Uint8Array) {
+          resolve(data);
+        } else {
+          reject(new TypeError("stdin stream returned a non-byte chunk"));
         }
       }
 
-      stream.on("readable", onReadable);
+      function onReadable() {
+        const data = stream.read(n);
+        if (data !== null) {
+          settleData(data);
+        }
+      }
 
-      stream.once("end", () => {
+      function onEnd() {
         eof = true;
-        if (!done) {
-          done = true;
+        if (!settled) {
+          settled = true;
+          cleanup();
           resolve(new Uint8Array());
         }
-      });
+      }
 
-      stream.once("error", err => {
-        if (!done) {
-          done = true;
-          reject(err);
+      function onError(error: Error) {
+        if (!settled) {
+          settled = true;
+          cleanup();
+          reject(error);
         }
-      });
+      }
+
+      const immediate = stream.read(n);
+      if (immediate !== null) {
+        settleData(immediate);
+        return;
+      }
+
+      stream.on("readable", onReadable);
+      stream.once("end", onEnd);
+      stream.once("error", onError);
     });
   };
 }

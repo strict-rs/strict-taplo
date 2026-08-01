@@ -7,16 +7,16 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug unit tests in library 'lsp-async-stub'",
+            "name": "Debug unit tests in library 'taplo-lsp-async'",
             "cargo": {
                 "args": [
                     "test",
                     "--no-run",
                     "--lib",
-                    "--package=lsp-async-stub"
+                    "--package=taplo-lsp-async"
                 ],
                 "filter": {
-                    "name": "lsp-async-stub",
+                    "name": "taplo-lsp-async",
                     "kind": "lib"
                 }
             },

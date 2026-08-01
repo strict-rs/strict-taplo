@@ -1,314 +1,456 @@
-use std::io;
-use std::path::Path;
-use std::pin::Pin;
-use std::task::Poll;
-use std::task::{
-  self,
-};
+//! Validated JavaScript host capabilities for local WebAssembly execution.
 
-use anyhow::anyhow;
-use futures::FutureExt;
+use std::any::type_name;
+use std::fmt;
+use std::io;
+use std::io::ErrorKind;
+use std::path::Path;
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::task::Context;
+use std::task::Poll;
+
+use futures::FutureExt as _;
+use js_sys::Date;
 use js_sys::Function;
 use js_sys::Promise;
+use js_sys::Reflect;
 use js_sys::Uint8Array;
+use serde::de::DeserializeOwned;
 use taplo_common::environment::Environment;
+use taplo_common::environment::EnvironmentError;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::io::ReadBuf;
 use url::Url;
+use wasm_bindgen::JsCast as _;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 use wasm_bindgen_futures::spawn_local;
 
-/// Convert a JavaScript exception or rejected promise into the shared I/O error contract.
-pub(crate) fn js_io_error(error: JsValue) -> io::Error {
-  io::Error::other(format!("{error:?}"))
+use crate::JsAsyncOperation;
+use crate::JsAsyncRead;
+use crate::JsAsyncWrite;
+use crate::LocalWasmFuture;
+use crate::WasmEnvironment;
+use crate::js_error_message;
+
+/// Describe a JavaScript value's runtime type.
+fn js_type(javascript_value: &JsValue) -> String {
+  javascript_value
+    .js_typeof()
+    .as_string()
+    .unwrap_or_else(|| "unknown JavaScript value".into())
 }
 
-pub(crate) struct JsAsyncRead {
-  fut: Option<JsFuture>,
-  f:   Function,
+impl JsAsyncOperation {
+  /// Construct shared pending state around one validated callback.
+  const fn new(callback: Function) -> Self {
+    Self {
+      future: None,
+      callback,
+    }
+  }
+
+  /// Render only stable state without exposing the JavaScript callback.
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>, name: &'static str) -> fmt::Result {
+    formatter
+      .debug_struct(name)
+      .field("pending", &self.future.is_some())
+      .finish_non_exhaustive()
+  }
+
+  /// Start or resume one promise-returning callback operation.
+  fn poll_callback(&mut self, context: &mut Context<'_>, argument: &JsValue) -> Poll<io::Result<JsValue>> {
+    if self.future.is_none() {
+      let returned = match self.callback.call1(&JsValue::null(), argument) {
+        Ok(returned) => returned,
+        Err(_javascript_error) => {
+          return Poll::Ready(Err(io::Error::from(ErrorKind::BrokenPipe)));
+        }
+      };
+      let Ok(promise) = returned.dyn_into::<Promise>() else {
+        return Poll::Ready(Err(io::Error::from(ErrorKind::InvalidData)));
+      };
+      self.future = Some(JsFuture::from(promise));
+    }
+
+    let Some(future) = self.future.as_mut() else {
+      return Poll::Ready(Err(io::Error::from(ErrorKind::InvalidData)));
+    };
+    match future.poll_unpin(context) {
+      Poll::Ready(result) => {
+        self.future = None;
+        Poll::Ready(result.map_err(|_javascript_error| io::Error::from(ErrorKind::BrokenPipe)))
+      }
+      Poll::Pending => Poll::Pending,
+    }
+  }
+}
+
+impl fmt::Debug for JsAsyncRead {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    self.operation.fmt(formatter, "JsAsyncRead")
+  }
 }
 
 impl JsAsyncRead {
-  fn new(cb: Function) -> Self {
+  /// Construct a reader around a validated callback.
+  fn new(callback: Function) -> Self {
     Self {
-      fut: None, f: cb
+      operation: JsAsyncOperation::new(callback),
     }
   }
 }
 
 impl AsyncRead for JsAsyncRead {
-  fn poll_read(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>, buf: &mut ReadBuf<'_>) -> task::Poll<std::io::Result<()>> {
-    if self.fut.is_none() {
-      let this = JsValue::null();
-      let ret: JsValue = match self.f.call1(&this, &JsValue::from(buf.remaining())) {
-        Ok(val) => val,
-        Err(error) => {
-          return Poll::Ready(Err(js_io_error(error)));
-        }
-      };
+  fn poll_read(mut self: Pin<&mut Self>, context: &mut Context<'_>, buffer: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    let Poll::Ready(result) = self.operation.poll_callback(context, &JsValue::from(buffer.remaining())) else {
+      return Poll::Pending;
+    };
+    Poll::Ready(result.and_then(|chunk| complete_read(chunk, buffer)))
+  }
+}
 
-      self.fut = Some(JsFuture::from(Promise::from(ret)));
-    }
+/// Decode one resolved standard-input callback result into the caller's buffer.
+fn complete_read(chunk: JsValue, buffer: &mut ReadBuf<'_>) -> io::Result<()> {
+  if !chunk.is_instance_of::<Uint8Array>() {
+    return Err(io::Error::from(ErrorKind::InvalidData));
+  }
+  let bytes = Uint8Array::from(chunk).to_vec();
+  if bytes.len() > buffer.remaining() {
+    return Err(io::Error::from(ErrorKind::InvalidData));
+  }
+  buffer.put_slice(&bytes);
+  Ok(())
+}
 
-    if let Some(fut) = self.fut.as_mut() {
-      match fut.poll_unpin(cx) {
-        task::Poll::Ready(val) => {
-          let res = match val {
-            Ok(chunk) => {
-              let arr = js_sys::Uint8Array::from(chunk).to_vec();
-              if !arr.is_empty() {
-                buf.put_slice(&arr);
-              }
-
-              Ok(())
-            }
-            Err(error) => Err(js_io_error(error)),
-          };
-
-          self.fut = None;
-
-          Poll::Ready(res)
-        }
-        task::Poll::Pending => Poll::Pending,
-      }
-    } else {
-      Poll::Ready(Err(io::Error::other("JavaScript read future was not initialized")))
-    }
+impl fmt::Debug for JsAsyncWrite {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    self.operation.fmt(formatter, "JsAsyncWrite")
   }
 }
 
 impl JsAsyncWrite {
-  fn new(cb: Function) -> Self {
+  /// Construct a writer around a validated callback.
+  fn new(callback: Function) -> Self {
     Self {
-      fut: None, f: cb
+      operation: JsAsyncOperation::new(callback),
     }
   }
-}
-
-pub(crate) struct JsAsyncWrite {
-  fut: Option<JsFuture>,
-  f:   Function,
 }
 
 impl AsyncWrite for JsAsyncWrite {
-  fn poll_write(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>, buf: &[u8]) -> task::Poll<Result<usize, std::io::Error>> {
-    if self.fut.is_none() {
-      let this = JsValue::null();
-
-      let ret: JsValue = match self.f.call1(&this, &Uint8Array::from(buf).into()) {
-        Ok(val) => val,
-        Err(error) => {
-          return Poll::Ready(Err(js_io_error(error)));
-        }
-      };
-
-      self.fut = Some(JsFuture::from(Promise::from(ret)));
-    }
-
-    if let Some(fut) = self.fut.as_mut() {
-      match fut.poll_unpin(cx) {
-        task::Poll::Ready(val) => {
-          let res = match val {
-            Ok(num_written) => {
-              serde_wasm_bindgen::from_value(num_written).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-            }
-            Err(error) => Err(js_io_error(error)),
-          };
-
-          self.fut = None;
-
-          Poll::Ready(res)
-        }
-        task::Poll::Pending => Poll::Pending,
-      }
-    } else {
-      Poll::Ready(Err(io::Error::other("JavaScript write future was not initialized")))
-    }
+  fn poll_write(mut self: Pin<&mut Self>, context: &mut Context<'_>, buffer: &[u8]) -> Poll<Result<usize, io::Error>> {
+    let argument = JsValue::from(Uint8Array::from(buffer));
+    let Poll::Ready(result) = self.operation.poll_callback(context, &argument) else {
+      return Poll::Pending;
+    };
+    Poll::Ready(result.and_then(|resolved| complete_write(resolved, buffer.len())))
   }
 
-  fn poll_flush(self: Pin<&mut Self>, _cx: &mut task::Context<'_>) -> task::Poll<Result<(), std::io::Error>> {
+  fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
     Poll::Ready(Ok(()))
   }
 
-  fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut task::Context<'_>) -> task::Poll<Result<(), std::io::Error>> {
+  fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
     Poll::Ready(Ok(()))
   }
 }
 
-#[derive(Clone)]
-pub(crate) struct WasmEnvironment {
-  js_now:              Function,
-  js_env_var:          Function,
-  js_env_vars:         Function,
-  js_atty_stderr:      Function,
-  js_on_stdin:         Function,
-  js_on_stdout:        Function,
-  js_on_stderr:        Function,
-  js_glob_files:       Function,
-  js_read_file:        Function,
-  js_write_file:       Function,
-  js_to_file_path:     Function,
-  js_is_absolute:      Function,
-  js_cwd:              Function,
-  js_find_config_file: Function,
+/// Decode one resolved writer callback result into an accepted byte count.
+fn complete_write(resolved: JsValue, supplied: usize) -> io::Result<usize> {
+  let written = match serde_wasm_bindgen::from_value::<usize>(resolved) {
+    Ok(written) => written,
+    Err(_decode_error) => return Err(io::Error::from(ErrorKind::InvalidData)),
+  };
+  if written > supplied {
+    return Err(io::Error::from(ErrorKind::InvalidData));
+  }
+  Ok(written)
 }
 
-impl From<JsValue> for WasmEnvironment {
-  fn from(val: JsValue) -> Self {
-    Self {
-      js_now:              js_sys::Reflect::get(&val, &JsValue::from_str("js_now")).unwrap().into(),
-      js_env_var:          js_sys::Reflect::get(&val, &JsValue::from_str("js_env_var")).unwrap().into(),
-      js_env_vars:         js_sys::Reflect::get(&val, &JsValue::from_str("js_env_vars")).unwrap().into(),
-      js_atty_stderr:      js_sys::Reflect::get(&val, &JsValue::from_str("js_atty_stderr")).unwrap().into(),
-      js_on_stdin:         js_sys::Reflect::get(&val, &JsValue::from_str("js_on_stdin")).unwrap().into(),
-      js_on_stdout:        js_sys::Reflect::get(&val, &JsValue::from_str("js_on_stdout")).unwrap().into(),
-      js_on_stderr:        js_sys::Reflect::get(&val, &JsValue::from_str("js_on_stderr")).unwrap().into(),
-      js_glob_files:       js_sys::Reflect::get(&val, &JsValue::from_str("js_glob_files")).unwrap().into(),
-      js_read_file:        js_sys::Reflect::get(&val, &JsValue::from_str("js_read_file")).unwrap().into(),
-      js_write_file:       js_sys::Reflect::get(&val, &JsValue::from_str("js_write_file")).unwrap().into(),
-      js_to_file_path:     js_sys::Reflect::get(&val, &JsValue::from_str("js_to_file_path"))
-        .unwrap()
-        .into(),
-      js_is_absolute:      js_sys::Reflect::get(&val, &JsValue::from_str("js_is_absolute")).unwrap().into(),
-      js_cwd:              js_sys::Reflect::get(&val, &JsValue::from_str("js_cwd")).unwrap().into(),
-      js_find_config_file: js_sys::Reflect::get(&val, &JsValue::from_str("js_find_config_file"))
-        .unwrap()
-        .into(),
-    }
+impl fmt::Debug for WasmEnvironment {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter.debug_struct("WasmEnvironment").finish_non_exhaustive()
   }
 }
 
-// SAFETY: we're in a single-threaded WASM environment.
-unsafe impl Send for WasmEnvironment {}
-unsafe impl Sync for WasmEnvironment {}
+impl TryFrom<JsValue> for WasmEnvironment {
+  type Error = EnvironmentError;
 
-#[async_trait::async_trait(?Send)]
+  fn try_from(host: JsValue) -> Result<Self, Self::Error> {
+    Ok(Self {
+      now:              callback(&host, "js_now")?,
+      env_var:          callback(&host, "js_env_var")?,
+      env_vars:         callback(&host, "js_env_vars")?,
+      atty_stderr:      callback(&host, "js_atty_stderr")?,
+      stdin:            callback(&host, "js_on_stdin")?,
+      stdout:           callback(&host, "js_on_stdout")?,
+      stderr:           callback(&host, "js_on_stderr")?,
+      glob_files:       callback(&host, "js_glob_files")?,
+      read_file:        callback(&host, "js_read_file")?,
+      write_file:       callback(&host, "js_write_file")?,
+      to_file_path:     callback(&host, "js_to_file_path")?,
+      to_file_url:      callback(&host, "js_to_file_url")?,
+      is_absolute:      callback(&host, "js_is_absolute")?,
+      cwd:              callback(&host, "js_cwd")?,
+      find_config_file: callback(&host, "js_find_config_file")?,
+    })
+  }
+}
+
 impl Environment for WasmEnvironment {
   type Stdin = JsAsyncRead;
   type Stdout = JsAsyncWrite;
   type Stderr = JsAsyncWrite;
 
-  fn now(&self) -> OffsetDateTime {
-    let this = JsValue::null();
-    let res: JsValue = self.js_now.call0(&this).unwrap();
-    let s: String = js_sys::Date::from(res).to_iso_string().into();
-    OffsetDateTime::parse(&s, &time::format_description::well_known::Rfc3339).unwrap()
-  }
-
-  fn spawn<F>(&self, fut: F)
-  where
-    F: std::future::Future + Send + 'static,
-    F::Output: Send,
-  {
-    spawn_local(async move {
-      fut.await;
+  fn now(&self) -> Result<OffsetDateTime, EnvironmentError> {
+    let returned = call0(&self.now, "js_now")?;
+    let timestamp = if let Some(timestamp) = returned.as_string() {
+      timestamp
+    } else if returned.is_instance_of::<Date>() {
+      date_to_timestamp(&returned)?
+    } else {
+      return Err(invalid_return("js_now", "Date or RFC 3339 string", &returned));
+    };
+    OffsetDateTime::parse(&timestamp, &Rfc3339).map_err(|error| EnvironmentError::InvalidTimestamp {
+      name:    "js_now",
+      message: error.to_string(),
     })
   }
 
-  fn spawn_local<F>(&self, fut: F)
-  where
-    F: std::future::Future + 'static,
-  {
-    spawn_local(async move {
-      fut.await;
-    })
+  fn env_var(&self, name: &str) -> Result<Option<String>, EnvironmentError> {
+    optional_string("js_env_var", &call1(&self.env_var, "js_env_var", &JsValue::from_str(name))?)
   }
 
-  fn env_var(&self, name: &str) -> Option<String> {
-    let this = JsValue::null();
-    let res: JsValue = self.js_env_var.call1(&this, &JsValue::from_str(name)).unwrap();
-    res.as_string()
+  fn env_vars(&self) -> Result<Vec<(String, String)>, EnvironmentError> {
+    deserialize_return("js_env_vars", call0(&self.env_vars, "js_env_vars")?)
   }
 
-  fn env_vars(&self) -> Vec<(String, String)> {
-    let this = JsValue::null();
-    let res: JsValue = self.js_env_vars.call0(&this).unwrap();
-    serde_wasm_bindgen::from_value(res)
-      .map_err(|err| anyhow!("{err}"))
-      .unwrap_or_default()
-  }
-
-  fn atty_stderr(&self) -> bool {
-    let this = JsValue::null();
-    let res: JsValue = self.js_atty_stderr.call0(&this).unwrap();
-    res.as_bool().unwrap_or(false)
+  fn atty_stderr(&self) -> Result<bool, EnvironmentError> {
+    let returned = call0(&self.atty_stderr, "js_atty_stderr")?;
+    returned
+      .as_bool()
+      .ok_or_else(|| invalid_return("js_atty_stderr", "boolean", &returned))
   }
 
   fn stdin(&self) -> Self::Stdin {
-    JsAsyncRead::new(self.js_on_stdin.clone())
+    JsAsyncRead::new(self.stdin.clone())
   }
 
   fn stdout(&self) -> Self::Stdout {
-    JsAsyncWrite::new(self.js_on_stdout.clone())
+    JsAsyncWrite::new(self.stdout.clone())
   }
 
   fn stderr(&self) -> Self::Stderr {
-    JsAsyncWrite::new(self.js_on_stderr.clone())
+    JsAsyncWrite::new(self.stderr.clone())
   }
 
-  fn glob_files(&self, glob: &str) -> Result<Vec<std::path::PathBuf>, anyhow::Error> {
-    let this = JsValue::null();
-    let res: JsValue = self.js_glob_files.call1(&this, &JsValue::from_str(glob)).unwrap();
-    serde_wasm_bindgen::from_value(res).map_err(|err| anyhow!("{err}"))
+  fn glob_files(&self, pattern: &str) -> Result<Vec<PathBuf>, EnvironmentError> {
+    deserialize_return(
+      "js_glob_files",
+      call1(&self.glob_files, "js_glob_files", &JsValue::from_str(pattern))?,
+    )
   }
 
-  async fn read_file(&self, path: &Path) -> Result<Vec<u8>, anyhow::Error> {
-    let path_str = JsValue::from_str(&path.to_string_lossy());
-    let this = JsValue::null();
-    let res: JsValue = self.js_read_file.call1(&this, &path_str).unwrap();
-
-    let ret = JsFuture::from(Promise::from(res)).await.map_err(|err| anyhow!("{:?}", err))?;
-
-    Ok(Uint8Array::from(ret).to_vec())
+  fn to_file_path(&self, url: &Url) -> Result<Option<PathBuf>, EnvironmentError> {
+    optional_string(
+      "js_to_file_path",
+      &call1(&self.to_file_path, "js_to_file_path", &JsValue::from_str(url.as_str()))?,
+    )
+    .map(|path| path.map(Into::into))
   }
 
-  async fn write_file(&self, path: &Path, bytes: &[u8]) -> Result<(), anyhow::Error> {
-    let path_str = JsValue::from_str(&path.to_string_lossy());
-    let this = JsValue::null();
-    let res: JsValue = self
-      .js_write_file
-      .call2(&this, &path_str, &JsValue::from(Uint8Array::from(bytes)))
-      .unwrap();
-    let future = JsFuture::from(Promise::from(res)).await.map_err(|err| anyhow!("{:?}", err))?;
-
-    Ok(serde_wasm_bindgen::from_value(future).map_err(|err| anyhow!("{err}"))?)
+  fn to_file_url(&self, path: &Path) -> Result<Option<Url>, EnvironmentError> {
+    let Some(input) = optional_string(
+      "js_to_file_url",
+      &call1(&self.to_file_url, "js_to_file_url", &JsValue::from_str(path_string(path)?))?,
+    )?
+    else {
+      return Ok(None);
+    };
+    Url::parse(&input).map(Some).map_err(|source| EnvironmentError::InvalidUrl {
+      name: "js_to_file_url",
+      input,
+      source,
+    })
   }
 
-  fn to_file_path(&self, url: &Url) -> Option<std::path::PathBuf> {
-    let url_str = JsValue::from_str(url.as_str());
-    let this = JsValue::null();
-    let res: JsValue = self.js_to_file_path.call1(&this, &url_str).unwrap();
-
-    res.as_string().map(Into::into)
+  fn is_absolute(&self, path: &Path) -> Result<bool, EnvironmentError> {
+    let returned = call1(&self.is_absolute, "js_is_absolute", &JsValue::from_str(path_string(path)?))?;
+    returned
+      .as_bool()
+      .ok_or_else(|| invalid_return("js_is_absolute", "boolean", &returned))
   }
 
-  fn is_absolute(&self, path: &Path) -> bool {
-    let path_str = JsValue::from_str(&path.to_string_lossy());
-    let this = JsValue::null();
-    let res: JsValue = self.js_is_absolute.call1(&this, &path_str).unwrap();
-
-    res.is_truthy()
+  fn cwd(&self) -> Result<Option<PathBuf>, EnvironmentError> {
+    optional_string("js_cwd", &call0(&self.cwd, "js_cwd")?).map(|path| path.map(Into::into))
   }
+}
 
-  fn cwd(&self) -> Option<std::path::PathBuf> {
-    let this = JsValue::null();
-    let res: JsValue = self.js_cwd.call0(&this).unwrap();
-
-    res.as_string().map(Into::into)
-  }
-
-  async fn find_config_file(&self, from: &Path) -> Option<std::path::PathBuf> {
-    let path_str = JsValue::from_str(&from.to_string_lossy());
-    let this = JsValue::null();
-    let res: JsValue = self.js_find_config_file.call1(&this, &path_str).unwrap();
-
-    if res.is_undefined() {
-      return None;
+taplo_common::implement_local_environment! {
+  for WasmEnvironment {
+    spawn |_environment, future| {
+      spawn_local(future);
+      Ok(())
     }
+    read |environment, path| {
+      let returned = call1(
+        &environment.read_file,
+        "js_read_file",
+        &JsValue::from_str(path_string(path)?),
+      )?;
+      let resolved = await_promise("js_read_file", returned).await?;
+      if !resolved.is_instance_of::<Uint8Array>() {
+        return Err(invalid_return("js_read_file", "Promise<Uint8Array>", &resolved));
+      }
+      Ok(Uint8Array::from(resolved).to_vec())
+    }
+    write |environment, path, bytes| {
+      let returned = environment
+        .write_file
+        .call2(
+          &JsValue::null(),
+          &JsValue::from_str(path_string(path)?),
+          &JsValue::from(Uint8Array::from(bytes)),
+        )
+        .map_err(|error| EnvironmentError::Callback {
+          name:    "js_write_file",
+          message: js_error_message(&error),
+      })?;
+      let resolved = await_promise("js_write_file", returned).await?;
+      deserialize_return("js_write_file", resolved)
+    }
+    find_config |environment, from| {
+      optional_string(
+        "js_find_config_file",
+        &call1(
+          &environment.find_config_file,
+          "js_find_config_file",
+          &JsValue::from_str(path_string(from)?),
+        )?,
+      )
+      .map(|path| path.map(Into::into))
+    }
+  }
+}
 
-    res.as_string().map(Into::into)
+/// Borrow one path for the string-only JavaScript callback model.
+fn path_string(path: &Path) -> Result<&str, EnvironmentError> {
+  path.to_str().ok_or_else(|| EnvironmentError::InvalidPathUnicode {
+    path: path.to_owned()
+  })
+}
+
+/// Invoke `Date.prototype.toISOString` while retaining thrown exceptions as typed failures.
+fn date_to_timestamp(javascript_value: &JsValue) -> Result<String, EnvironmentError> {
+  let returned = Reflect::get(javascript_value, &JsValue::from_str("toISOString")).map_err(|error| EnvironmentError::Callback {
+    name:    "js_now",
+    message: js_error_message(&error),
+  })?;
+  let function = returned
+    .dyn_ref::<Function>()
+    .cloned()
+    .ok_or_else(|| EnvironmentError::InvalidReturnType {
+      name:     "js_now",
+      expected: "Date with callable toISOString",
+      actual:   "Date without callable toISOString".into(),
+    })?;
+  let timestamp = function.call0(javascript_value).map_err(|error| EnvironmentError::Callback {
+    name:    "js_now",
+    message: js_error_message(&error),
+  })?;
+  timestamp
+    .as_string()
+    .ok_or_else(|| invalid_return("js_now", "Date producing an RFC 3339 string", &timestamp))
+}
+
+/// Read and validate one required function property.
+fn callback(host: &JsValue, name: &'static str) -> Result<Function, EnvironmentError> {
+  let returned = Reflect::get(host, &JsValue::from_str(name)).map_err(|error| EnvironmentError::Callback {
+    name,
+    message: js_error_message(&error),
+  })?;
+  if returned.is_null() || returned.is_undefined() {
+    return Err(EnvironmentError::MissingCallback {
+      name,
+    });
+  }
+  returned
+    .dyn_ref::<Function>()
+    .cloned()
+    .ok_or(EnvironmentError::InvalidCallback {
+      name,
+    })
+}
+
+/// Invoke a zero-argument callback.
+fn call0(callback: &Function, name: &'static str) -> Result<JsValue, EnvironmentError> {
+  callback.call0(&JsValue::null()).map_err(|error| EnvironmentError::Callback {
+    name,
+    message: js_error_message(&error),
+  })
+}
+
+/// Invoke a one-argument callback.
+fn call1(callback: &Function, name: &'static str, argument: &JsValue) -> Result<JsValue, EnvironmentError> {
+  callback
+    .call1(&JsValue::null(), argument)
+    .map_err(|error| EnvironmentError::Callback {
+      name,
+      message: js_error_message(&error),
+    })
+}
+
+/// Await a value that must be a JavaScript promise.
+fn await_promise(name: &'static str, returned: JsValue) -> LocalWasmFuture<'static, Result<JsValue, EnvironmentError>> {
+  Box::pin(async move {
+    let actual = js_type(&returned);
+    let promise = returned
+      .dyn_ref::<Promise>()
+      .cloned()
+      .ok_or(EnvironmentError::InvalidReturnType {
+        name,
+        expected: "Promise",
+        actual,
+      })?;
+    JsFuture::from(promise).await.map_err(|error| EnvironmentError::Callback {
+      name,
+      message: js_error_message(&error),
+    })
+  })
+}
+
+/// Deserialize a callback result into one expected Rust value.
+fn deserialize_return<T: DeserializeOwned>(name: &'static str, returned: JsValue) -> Result<T, EnvironmentError> {
+  let actual = js_type(&returned);
+  serde_wasm_bindgen::from_value(returned).map_err(|decode_error| EnvironmentError::InvalidReturnType {
+    name,
+    expected: type_name::<T>(),
+    actual: format!("{actual}: {decode_error}"),
+  })
+}
+
+/// Decode an optional string callback result.
+fn optional_string(name: &'static str, returned: &JsValue) -> Result<Option<String>, EnvironmentError> {
+  if returned.is_null() || returned.is_undefined() {
+    Ok(None)
+  } else {
+    returned
+      .as_string()
+      .map(Some)
+      .ok_or_else(|| invalid_return(name, "string, null, or undefined", returned))
+  }
+}
+
+/// Construct an invalid-return error.
+fn invalid_return(name: &'static str, expected: &'static str, returned: &JsValue) -> EnvironmentError {
+  EnvironmentError::InvalidReturnType {
+    name,
+    expected,
+    actual: js_type(returned),
   }
 }

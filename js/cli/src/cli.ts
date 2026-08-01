@@ -2,10 +2,11 @@ import fsPromise from "fs/promises";
 import fs from "fs";
 import process from "process";
 import path from "path";
+import { pathToFileURL } from "node:url";
 import glob from "fast-glob";
 import fetch, { Headers, Request, Response } from "node-fetch";
 import loadTaplo from "../../../crates/taplo-wasm/Cargo.toml";
-import { convertEnv, Environment, prepareEnv } from "@taplo/core";
+import { asError, convertEnv, Environment, prepareEnv } from "@taplo/core";
 
 (async function main() {
   const taplo = await loadTaplo();
@@ -35,6 +36,7 @@ import { convertEnv, Environment, prepareEnv } from "@taplo/core";
     stdErrAtty: () => process.stderr.isTTY,
     stdin: process.stdin,
     stdout: process.stdout,
+    filePathToUrl: filePath => pathToFileURL(filePath).href,
     urlToFilePath: (url: string) => {
       const c = decodeURIComponent(url).slice("file://".length);
 
@@ -55,7 +57,8 @@ import { convertEnv, Environment, prepareEnv } from "@taplo/core";
 
   try {
     await taplo.run_cli(convertEnv(env), process.argv.slice(1));
-  } catch (err) {
+  } catch (error) {
+    process.stderr.write(`${asError(error).message}\n`);
     process.exitCode = 1;
   }
 })();

@@ -1,3 +1,3 @@
 # taplo-lsp
 
-The TOML language server. Wires `lsp-async-stub` to `taplo` + `taplo-common`, exposing one handler per LSP request. Generic over `taplo_common::environment::Environment`, so the same server runs natively and in WASM.
+The TOML language server. Shared handlers and immutable world snapshots are exposed through two honest runtime families: a thread-safe concurrent native server and a current-thread local server for WASM. Both use the same message classification, lifecycle, mutation-ordering, cancellation, and typed service logic without requiring JavaScript values to be `Send` or `Sync`.

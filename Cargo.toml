@@ -72,8 +72,8 @@ criterion        = { version = "0.8" }   # criterion -> clap
 pprof = { version = "0.16",  features = ["flamegraph", "criterion"], git = "https://github.com/strict-rs/strict-pprof-rs.git", branch = "strict"} # pprof -> criterion -> clap
 
 bpaf = {  version = "0.10", default-features = false, git = "https://github.com/strict-rs/strict-bpaf.git", branch = "sync"}
-template-core = { version = "0.2.0", git = "https://github.com/earthlings-dev/template-rs.git", branch = "main"}
-template-stask = { version = "0.2.0", git = "https://github.com/earthlings-dev/template-rs.git", branch = "main"}
+template-core = { version = "0.3.0", git = "https://github.com/earthlings-dev/template-rs.git", branch = "main"}
+template-stask = { version = "0.3.0", git = "https://github.com/earthlings-dev/template-rs.git", branch = "main"}
 trybuild = {  version = "1", git = "https://github.com/strict-rs/strict-trybuild.git", branch = "strict"}
 strict-test-support = { version = "0.1.0", git = "https://github.com/earthlings-dev/strict-test-support-rs.git", branch = "main"}
 
@@ -97,11 +97,6 @@ tracing-log = { git = "https://github.com/strict-rs/strict-tracing.git", branch 
 tracing-subscriber = { git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict" }
 rowan = { git = "https://github.com/strict-rs/strict-rowan.git", branch = "strict" }
 thiserror = { git = "https://github.com/strict-rs/strict-thiserror.git", branch = "upgrade" }
-taplo = { path = "crates/taplo" }
-taplo-cli = { path = "crates/taplo-cli" }
-taplo-common = { path = "crates/taplo-common" }
-taplo-lsp = { path = "crates/taplo-lsp" }
-taplo-wasm = { path = "crates/taplo-wasm" }
 
 # Original Taplo Release Profile
 # [profile.release]

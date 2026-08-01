@@ -1,10 +1,11 @@
 //! Source-preserving TOML queries and rewrites.
 //!
-//! [`Rewrite`] owns one parsed document and records non-overlapping source
-//! patches against it.  Call [`Rewrite::commit`] between structural phases
+//! [`crate::dom::rewrite::Rewrite`] owns one parsed document and records non-overlapping source
+//! patches against it. Call [`crate::dom::rewrite::Rewrite::commit`] between structural phases
 //! when a later edit depends on a shape created by an earlier edit.
 
 use core::fmt;
+use core::iter::once;
 use std::cmp::Reverse;
 use std::ops::Range;
 use std::sync::Arc;
@@ -13,12 +14,11 @@ use rowan::TextRange;
 use rowan::TextSize;
 use thiserror::Error;
 
-use super::FromSyntax;
 use super::Keys;
-use super::error::Error as DomError;
-use super::from_syntax::keys_from_syntax;
+use super::error::Diagnostic as DomDiagnostic;
+use super::error::QueryError;
+use super::keys_from_syntax;
 use super::node::ArrayKind;
-use super::node::DomNode;
 use super::node::Node;
 use super::node::TableKind;
 use crate::dom;
@@ -50,14 +50,18 @@ impl ExactPath {
   ///
   /// Returns [`RewriteError::InvalidPath`] when `path` is not an exact TOML
   /// key path.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the public constructor defines exact-path validation independently of the TryFrom convenience boundary"
+  )]
   pub fn parse(path: &str) -> Result<Self, RewriteError> {
     if path.is_empty() {
       return Ok(Self::default());
     }
 
     let synthetic = format!("{path} = true\n");
-    let parsed = parser::parse(&synthetic);
-    if !parsed.errors.is_empty() {
+    let parsed = parser::parse(&synthetic)?;
+    if !parsed.diagnostics().is_empty() {
       return Err(RewriteError::InvalidPath {
         path:   path.into(),
         reason: "the path is not an exact TOML key".into(),
@@ -86,7 +90,7 @@ impl ExactPath {
       });
     };
     let segments = keys_from_syntax(&key.into())
-      .map(|key| Arc::<str>::from(key.value()))
+      .map(|segment| Arc::<str>::from(segment.value()))
       .collect::<Vec<_>>();
     if segments.is_empty() {
       return Err(RewriteError::InvalidPath {
@@ -152,7 +156,7 @@ impl ExactPath {
   /// Return a path with one literal child appended.
   #[must_use]
   pub fn child(&self, segment: impl Into<Arc<str>>) -> Self {
-    Self::from_segments(self.segments.iter().cloned().chain(core::iter::once(segment.into())))
+    Self::from_segments(self.segments.iter().cloned().chain(once(segment.into())))
   }
 
   /// Return a path with every segment from `suffix` appended.
@@ -207,15 +211,35 @@ pub enum TomlKind {
   Boolean,
   /// A date or date-time scalar.
   DateTime,
-  /// An invalid DOM node retained by [`Rewrite::new`] compatibility.
+  /// An invalid DOM node supplied to [`Rewrite::new`].
   Invalid,
 }
 
-impl fmt::Display for TomlKind {
-  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-    write!(formatter, "{self:?}")
-  }
+/// Implement stable variant-name rendering for one fieldless public enum.
+macro_rules! impl_variant_display {
+  ($name:ident { $($variant:ident),+ $(,)? }) => {
+    impl fmt::Display for $name {
+      fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match *self {
+          $(Self::$variant => stringify!($variant),)+
+        })
+      }
+    }
+  };
 }
+
+impl_variant_display!(TomlKind {
+  Table,
+  InlineTable,
+  Array,
+  ArrayOfTables,
+  String,
+  Integer,
+  Float,
+  Boolean,
+  DateTime,
+  Invalid,
+});
 
 /// The result of one source mutation request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -230,11 +254,12 @@ pub enum EditOutcome {
   Removed,
 }
 
-impl fmt::Display for EditOutcome {
-  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-    write!(formatter, "{self:?}")
-  }
-}
+impl_variant_display!(EditOutcome {
+  Unchanged,
+  Inserted,
+  Replaced,
+  Removed,
+});
 
 /// Whether exact-entry removal may prune proven-empty regular parents.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -257,13 +282,13 @@ pub struct ValueView<'source> {
 impl<'source> ValueView<'source> {
   /// Return the exact source text for this value.
   #[must_use]
-  pub fn text(self) -> &'source str {
+  pub const fn text(self) -> &'source str {
     self.text
   }
 
   /// Return the parsed structural kind.
   #[must_use]
-  pub fn kind(self) -> TomlKind {
+  pub const fn kind(self) -> TomlKind {
     self.kind
   }
 }
@@ -280,21 +305,44 @@ pub struct EntryView<'source> {
 impl<'source> EntryView<'source> {
   /// Return the exact key/value source without attached line trivia.
   #[must_use]
-  pub fn text(self) -> &'source str {
+  pub const fn text(self) -> &'source str {
     self.text
   }
 
   /// Return the parsed value kind.
   #[must_use]
-  pub fn kind(self) -> TomlKind {
+  pub const fn kind(self) -> TomlKind {
     self.value.kind
   }
 
   /// Return the entry's value view.
   #[must_use]
-  pub fn value(self) -> ValueView<'source> {
+  pub const fn value(self) -> ValueView<'source> {
     self.value
   }
+}
+
+/// Generate the common typed constructor façade for validated TOML fragments.
+macro_rules! define_fragment_parsers {
+  (
+    $(
+      $(#[$metadata:meta])*
+      for $fragment:ident |$source:ident| $body:block
+    )+
+  ) => {
+    $(
+      impl $fragment {
+        /// Parse and validate one source fragment of this semantic type.
+        ///
+        /// # Errors
+        ///
+        /// Returns a typed syntax, semantic, or fragment-shape error when
+        /// `source` does not satisfy this fragment type's structural contract.
+        $(#[$metadata])*
+        pub fn parse($source: &str) -> Result<Self, RewriteError> $body
+      }
+    )+
+  };
 }
 
 /// A validated fragment containing exactly one TOML value.
@@ -307,29 +355,6 @@ pub struct ValueFragment {
 }
 
 impl ValueFragment {
-  /// Parse and validate exactly one TOML value.
-  ///
-  /// # Errors
-  ///
-  /// Returns a typed syntax, semantic, or fragment-shape error when `source`
-  /// does not contain exactly one value.
-  pub fn parse(source: &str) -> Result<Self, RewriteError> {
-    let synthetic = format!("fragment = {source}\n");
-    let rewrite = Rewrite::parse(&synthetic)?;
-    let path = ExactPath::from_segments(["fragment"]);
-    let view = rewrite.value(&path)?;
-    if view.text().trim() != source.trim() {
-      return Err(RewriteError::InvalidFragment {
-        kind:   FragmentKind::Value,
-        reason: "the fragment must contain exactly one TOML value".into(),
-      });
-    }
-    Ok(Self {
-      source: source.trim().into(),
-      kind:   view.kind(),
-    })
-  }
-
   /// Return the exact value source.
   #[must_use]
   pub fn as_str(&self) -> &str {
@@ -338,7 +363,7 @@ impl ValueFragment {
 
   /// Return the parsed structural kind.
   #[must_use]
-  pub fn kind(&self) -> TomlKind {
+  pub const fn kind(&self) -> TomlKind {
     self.kind
   }
 }
@@ -355,13 +380,99 @@ pub struct EntryFragment {
 }
 
 impl EntryFragment {
-  /// Parse and validate exactly one root key/value entry.
-  ///
-  /// # Errors
-  ///
-  /// Returns a typed syntax, semantic, or fragment-shape error when `source`
-  /// is not exactly one entry plus its attached trivia.
-  pub fn parse(source: &str) -> Result<Self, RewriteError> {
+  /// Return the entry key relative to its parent.
+  #[must_use]
+  pub const fn key(&self) -> &ExactPath {
+    &self.key
+  }
+
+  /// Return the exact entry source including attached trivia.
+  #[must_use]
+  pub fn as_str(&self) -> &str {
+    &self.source
+  }
+
+  /// Return the validated value fragment.
+  #[must_use]
+  pub const fn value(&self) -> &ValueFragment {
+    &self.value
+  }
+
+  /// Return source suitable for insertion after table positioning is chosen.
+  fn insertion_source(&self) -> &str {
+    self.source.trim()
+  }
+}
+
+/// A validated inline-array element and its attached comment trivia.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArrayElementFragment {
+  /// Source spelling retained for callers that copy fragments.
+  source:           Arc<str>,
+  /// Exact element value.
+  value:            ValueFragment,
+  /// Contiguous standalone comments attached before the element.
+  leading_comments: Arc<[Arc<str>]>,
+  /// Inline comment attached after the element.
+  trailing_comment: Option<Arc<str>>,
+}
+
+impl ArrayElementFragment {
+  /// Return the fragment's source spelling.
+  #[must_use]
+  pub fn as_str(&self) -> &str {
+    &self.source
+  }
+
+  /// Return the element value.
+  #[must_use]
+  pub const fn value(&self) -> &ValueFragment {
+    &self.value
+  }
+
+  /// Return the element value kind.
+  #[must_use]
+  pub const fn kind(&self) -> TomlKind {
+    self.value.kind()
+  }
+}
+
+/// A validated regular-table or array-of-tables semantic element.
+///
+/// The fragment includes its root header and every following strict-descendant
+/// header owned by that element.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TableBlockFragment {
+  /// Complete block source including attached trivia.
+  source: Arc<str>,
+  /// Header path.
+  path:   ExactPath,
+  /// Header kind.
+  kind:   TomlKind,
+}
+
+define_fragment_parsers! {
+  for ValueFragment |source| {
+    let synthetic = format!("fragment = {source}\n");
+    let rewrite = Rewrite::parse(&synthetic)?;
+    let path = ExactPath::from_segments(["fragment"]);
+    let view = rewrite.value(&path)?;
+    if view.text().trim() != source.trim() {
+      return Err(RewriteError::InvalidFragment {
+        kind:   FragmentKind::Value,
+        reason: "the fragment must contain exactly one TOML value".into(),
+      });
+    }
+    Ok(Self {
+      source: source.trim().into(),
+      kind:   view.kind(),
+    })
+  }
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the public constructor owns entry-fragment shape and attached-trivia validation as one reusable boundary"
+  )]
+  for EntryFragment |source| {
     let rewrite = Rewrite::parse(source)?;
     let entries = rewrite.top_level_entries()?;
     if entries.len() != 1 || !rewrite.header_records()?.is_empty() {
@@ -401,52 +512,7 @@ impl EntryFragment {
       value: parsed_value,
     })
   }
-
-  /// Return the entry key relative to its parent.
-  #[must_use]
-  pub fn key(&self) -> &ExactPath {
-    &self.key
-  }
-
-  /// Return the exact entry source including attached trivia.
-  #[must_use]
-  pub fn as_str(&self) -> &str {
-    &self.source
-  }
-
-  /// Return the validated value fragment.
-  #[must_use]
-  pub fn value(&self) -> &ValueFragment {
-    &self.value
-  }
-
-  /// Return source suitable for insertion after table positioning is chosen.
-  fn insertion_source(&self) -> &str {
-    self.source.trim()
-  }
-}
-
-/// A validated inline-array element and its attached comment trivia.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ArrayElementFragment {
-  /// Source spelling retained for callers that copy fragments.
-  source:           Arc<str>,
-  /// Exact element value.
-  value:            ValueFragment,
-  /// Contiguous standalone comments attached before the element.
-  leading_comments: Arc<[Arc<str>]>,
-  /// Inline comment attached after the element.
-  trailing_comment: Option<Arc<str>>,
-}
-
-impl ArrayElementFragment {
-  /// Parse and validate exactly one array element plus attached trivia.
-  ///
-  /// # Errors
-  ///
-  /// Returns a typed syntax, semantic, or fragment-shape error when `source`
-  /// contains zero or multiple elements.
-  pub fn parse(source: &str) -> Result<Self, RewriteError> {
+  for ArrayElementFragment |source| {
     let synthetic = format!("fragment = [\n{source}\n]\n");
     let rewrite = Rewrite::parse(&synthetic)?;
     let path = ExactPath::from_segments(["fragment"]);
@@ -487,49 +553,11 @@ impl ArrayElementFragment {
       ..fragment
     })
   }
-
-  /// Return the fragment's source spelling.
-  #[must_use]
-  pub fn as_str(&self) -> &str {
-    &self.source
-  }
-
-  /// Return the element value.
-  #[must_use]
-  pub fn value(&self) -> &ValueFragment {
-    &self.value
-  }
-
-  /// Return the element value kind.
-  #[must_use]
-  pub fn kind(&self) -> TomlKind {
-    self.value.kind()
-  }
-}
-
-/// A validated regular-table or array-of-tables semantic element.
-///
-/// The fragment includes its root header and every following strict-descendant
-/// header owned by that element.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TableBlockFragment {
-  /// Complete block source including attached trivia.
-  source: Arc<str>,
-  /// Header path.
-  path:   ExactPath,
-  /// Header kind.
-  kind:   TomlKind,
-}
-
-impl TableBlockFragment {
-  /// Parse and validate exactly one complete table element.
-  ///
-  /// # Errors
-  ///
-  /// Returns a typed syntax, semantic, or fragment-shape error when `source`
-  /// contains no root header, a second sibling/non-descendant header, or root
-  /// entries outside the block.
-  pub fn parse(source: &str) -> Result<Self, RewriteError> {
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the public constructor owns complete table-block hierarchy and source-boundary validation"
+  )]
+  for TableBlockFragment |source| {
     let rewrite = Rewrite::parse(source)?;
     let headers = rewrite.header_records()?;
     if headers.is_empty() || !rewrite.top_level_entries_before_first_header()?.is_empty() {
@@ -597,7 +625,9 @@ impl TableBlockFragment {
       kind:   element.kind,
     })
   }
+}
 
+impl TableBlockFragment {
   /// Return the exact complete block source.
   #[must_use]
   pub fn as_str(&self) -> &str {
@@ -606,13 +636,13 @@ impl TableBlockFragment {
 
   /// Return the block header path.
   #[must_use]
-  pub fn path(&self) -> &ExactPath {
+  pub const fn path(&self) -> &ExactPath {
     &self.path
   }
 
   /// Return [`TomlKind::Table`] or [`TomlKind::ArrayOfTables`].
   #[must_use]
-  pub fn kind(&self) -> TomlKind {
+  pub const fn kind(&self) -> TomlKind {
     self.kind
   }
 
@@ -668,9 +698,9 @@ pub struct Rewrite {
 impl Rewrite {
   /// Construct a rewrite from an existing root DOM node.
   ///
-  /// This compatibility constructor retains the original behavior and does not
+  /// This constructor accepts an already-built DOM and therefore cannot
   /// recover parser diagnostics that were discarded before the DOM was built.
-  /// New consumers should call [`Self::parse`].
+  /// Consumers starting from source should call [`Self::parse`].
   ///
   /// # Errors
   ///
@@ -699,15 +729,15 @@ impl Rewrite {
   /// Returns separate typed variants for parser syntax diagnostics and DOM
   /// semantic diagnostics.
   pub fn parse(source: &str) -> Result<Self, RewriteError> {
-    let parsed = parser::parse(source);
-    if !parsed.errors.is_empty() {
+    let parsed = parser::parse(source)?;
+    if !parsed.diagnostics().is_empty() {
       return Err(RewriteError::SyntaxDiagnostics {
-        diagnostics: parsed.errors,
+        diagnostics: parsed.diagnostics().to_vec(),
       });
     }
     let root = parsed.into_dom();
     if let Err(errors) = root.validate() {
-      let diagnostics = errors.map(SemanticDiagnostic::from_dom).collect::<Vec<_>>();
+      let diagnostics = errors.into_iter().map(SemanticDiagnostic::from_dom).collect::<Vec<_>>();
       return Err(RewriteError::SemanticDiagnostics {
         diagnostics,
       });
@@ -725,35 +755,22 @@ impl Rewrite {
     &self.source
   }
 
-  /// Add a compatibility patch such as [`Patch::RenameKeys`].
+  /// Add a low-level patch such as [`Patch::RenameKeys`].
   ///
   /// # Errors
   ///
   /// Returns a DOM query error or overlap error when a requested key range
   /// cannot be patched safely.
   pub fn add(&mut self, patch: impl Into<Patch>) -> Result<&mut Self, RewriteError> {
-    let patch = patch.into();
-    match patch {
+    let requested_patch = patch.into();
+    match requested_patch {
       Patch::RenameKeys {
         key,
         to,
       } => {
         let keys = key.parse::<Keys>()?;
-        let ranges = self
-          .root
-          .find_all_matches(keys, false)?
-          .filter_map(|(keys, _)| match keys.iter().last().cloned() {
-            Some(dom::KeyOrIndex::Key(key)) => Some(key),
-            _ => None,
-          })
-          .flat_map(|key| key.text_ranges().collect::<Vec<_>>())
-          .collect::<Vec<_>>();
-
-        self.validate_new_ranges(&ranges)?;
-
-        for range in ranges {
-          self.push_patch(range, PendingPatchKind::Replace(to.clone()))?;
-        }
+        let ranges = self.rename_key_ranges(&keys)?;
+        self.push_replacements(ranges, &to)?;
       }
     }
 
@@ -767,7 +784,7 @@ impl Rewrite {
     &self.patches
   }
 
-  /// Rename every key matched by the compatibility glob query.
+  /// Rename every key matched by the glob query.
   ///
   /// # Errors
   ///
@@ -790,13 +807,7 @@ impl Rewrite {
   pub fn value(&self, path: &ExactPath) -> Result<ValueView<'_>, RewriteError> {
     let node = self.node(path)?;
     let kind = node_kind(&node);
-    let Some(syntax) = node.syntax() else {
-      return Err(RewriteError::UnsupportedPlacement {
-        path:   path.clone(),
-        reason: "the DOM value has no source provenance".into(),
-      });
-    };
-    let range = text_range(syntax.text_range())?;
+    let range = Self::node_source_range(path, &node, "the DOM value has no source provenance")?;
     let text = self.slice(range)?;
     Ok(ValueView {
       text,
@@ -880,17 +891,11 @@ impl Rewrite {
   /// error.
   pub fn replace_value(&mut self, path: &ExactPath, fragment: &ValueFragment) -> Result<EditOutcome, RewriteError> {
     let node = self.node(path)?;
-    let Some(syntax) = node.syntax() else {
-      return Err(RewriteError::UnsupportedPlacement {
-        path:   path.clone(),
-        reason: "the DOM value has no source provenance".into(),
-      });
-    };
-    let range = text_range(syntax.text_range())?;
+    let range = Self::node_source_range(path, &node, "the DOM value has no source provenance")?;
     if self.slice(range.clone())? == fragment.as_str() {
       return Ok(EditOutcome::Unchanged);
     }
-    self.push_std_patch(range, fragment.source.clone())?;
+    self.push_std_patch(range, Arc::clone(&fragment.source))?;
     Ok(EditOutcome::Replaced)
   }
 
@@ -947,21 +952,15 @@ impl Rewrite {
   /// Returns a missing-parent, invalid-fragment, type, placement, range, or
   /// overlap error.
   pub fn upsert_value(&mut self, path: &ExactPath, fragment: &ValueFragment) -> Result<EditOutcome, RewriteError> {
-    if self.node(path).is_ok() {
-      return self.replace_value(path, fragment);
-    }
-    let Some(parent) = path.parent() else {
+    let Some((parent, key)) = path.parent().zip(path.key()) else {
       return Err(RewriteError::UnsupportedPlacement {
         path:   path.clone(),
         reason: "the document root cannot be replaced as an entry value".into(),
       });
     };
-    let Some(key) = path.key() else {
-      return Err(RewriteError::UnsupportedPlacement {
-        path:   path.clone(),
-        reason: "the document root has no entry key".into(),
-      });
-    };
+    if self.node(path).is_ok() {
+      return self.replace_value(path, fragment);
+    }
     let source = format!("{} = {}", render_key(key), fragment.as_str());
     let entry = EntryFragment::parse(&source)?;
     self.insert_entry(&parent, &entry)
@@ -1048,30 +1047,10 @@ impl Rewrite {
   /// Returns a missing-path, type mismatch, unsupported-placement, or source
   /// range error.
   pub fn array_elements(&self, path: &ExactPath) -> Result<Vec<ArrayElementFragment>, RewriteError> {
-    let node = self.node(path)?;
-    let Node::Array(array) = &node else {
-      return Err(RewriteError::TypeMismatch {
-        path:     path.clone(),
-        expected: "inline array",
-        found:    node_kind(&node),
-      });
-    };
-    if array.kind() != ArrayKind::Inline {
-      return Err(RewriteError::TypeMismatch {
-        path:     path.clone(),
-        expected: "inline array",
-        found:    TomlKind::ArrayOfTables,
-      });
-    }
-    let Some(syntax) = array.syntax().and_then(SyntaxElement::as_node) else {
-      return Err(RewriteError::UnsupportedPlacement {
-        path:   path.clone(),
-        reason: "the array has no source syntax".into(),
-      });
-    };
+    let syntax = self.inline_array_syntax(path)?;
     let mut fragments = Vec::new();
     for value_node in syntax.children().filter(|child| child.kind() == SyntaxKind::VALUE) {
-      fragments.push(self.array_element_fragment(syntax, &value_node)?);
+      fragments.push(self.array_element_fragment(&syntax, &value_node)?);
     }
     Ok(fragments)
   }
@@ -1082,8 +1061,22 @@ impl Rewrite {
   ///
   /// Returns a missing-path, type, placement, range, or overlap error.
   pub fn reconcile_array(&mut self, path: &ExactPath, elements: &[ArrayElementFragment]) -> Result<EditOutcome, RewriteError> {
+    let syntax = self.inline_array_syntax(path)?;
+    let interior = delimited_interior(&syntax, SyntaxKind::BRACKET_START, SyntaxKind::BRACKET_END)?;
+    let original = self.slice(interior.clone())?;
+    let detached_comments = self.detached_array_comments(&syntax)?;
+    let replacement = render_array_elements(original, elements, &detached_comments);
+    if original == replacement {
+      return Ok(EditOutcome::Unchanged);
+    }
+    self.push_std_patch(interior, replacement.into())?;
+    Ok(EditOutcome::Replaced)
+  }
+
+  /// Resolve one exact path to its source-backed inline-array syntax.
+  fn inline_array_syntax(&self, path: &ExactPath) -> Result<SyntaxNode, RewriteError> {
     let node = self.node(path)?;
-    let Node::Array(array) = &node else {
+    let Node::Array(ref array) = node else {
       return Err(RewriteError::TypeMismatch {
         path:     path.clone(),
         expected: "inline array",
@@ -1103,15 +1096,7 @@ impl Rewrite {
         reason: "the array has no source syntax".into(),
       });
     };
-    let interior = delimited_interior(syntax, SyntaxKind::BRACKET_START, SyntaxKind::BRACKET_END)?;
-    let original = self.slice(interior.clone())?;
-    let detached_comments = self.detached_array_comments(syntax)?;
-    let replacement = render_array_elements(original, elements, &detached_comments);
-    if original == replacement {
-      return Ok(EditOutcome::Unchanged);
-    }
-    self.push_std_patch(interior, replacement.into())?;
-    Ok(EditOutcome::Replaced)
+    Ok(syntax.clone())
   }
 
   /// Enumerate complete regular-table or array-of-tables elements for `path`.
@@ -1194,14 +1179,14 @@ impl Rewrite {
       .iter()
       .zip(matches.iter().skip(1))
       .enumerate()
-      .map(|(position, (first, second))| {
+      .map(|(position, (preceding, following))| {
         let slot = position.checked_add(1).ok_or(RewriteError::InvalidSourceRange {
           start: position,
           end:   usize::MAX,
         })?;
         Ok(TableBlockGap {
           slot,
-          source: self.slice(first.block.end..second.block.start)?.into(),
+          source: self.slice(preceding.block.end..following.block.start)?.into(),
         })
       })
       .collect::<Result<Vec<_>, RewriteError>>()?;
@@ -1230,7 +1215,7 @@ impl Rewrite {
     patches.sort_by_key(|patch| patch.range.start());
 
     let mut rendered = String::with_capacity(self.source.len());
-    let mut cursor = 0usize;
+    let mut cursor = 0_usize;
     for patch in patches {
       let range = text_range(patch.range)?;
       if range.start > range.end || range.end > self.source.len() {
@@ -1247,8 +1232,8 @@ impl Rewrite {
         end:   range.start,
       })?;
       rendered.push_str(unchanged);
-      match &patch.kind {
-        PendingPatchKind::Replace(replacement) => rendered.push_str(replacement),
+      match patch.kind {
+        PendingPatchKind::Replace(ref replacement) => rendered.push_str(replacement),
       }
       cursor = range.end;
     }
@@ -1290,7 +1275,7 @@ impl Rewrite {
     Ok(node)
   }
 
-  /// Resolve one literal key, crossing one unique AoT element when needed.
+  /// Resolve one literal key, crossing one unique array-of-tables element when needed.
   fn exact_child(node: Node, segment: &str, path: &ExactPath) -> Result<Node, RewriteError> {
     match node {
       Node::Table(table) => table.get(segment).ok_or_else(|| RewriteError::MissingPath {
@@ -1300,36 +1285,40 @@ impl Rewrite {
         let table = Self::unique_array_table_element(&array, path)?;
         Self::exact_child(table, segment, path)
       }
-      _ => Err(RewriteError::MissingPath {
-        path: path.clone()
-      }),
+      Node::Array(_) | Node::Bool(_) | Node::Str(_) | Node::Integer(_) | Node::Float(_) | Node::Date(_) | Node::Invalid(_) => {
+        Err(RewriteError::MissingPath {
+          path: path.clone()
+        })
+      }
     }
   }
 
-  /// Resolve a table insertion parent, unwrapping one terminal AoT element.
+  /// Resolve a table insertion parent, unwrapping one terminal array-of-tables element.
   fn table_node(&self, path: &ExactPath) -> Result<Node, RewriteError> {
     let node = self.node(path)?;
     match node {
       Node::Array(array) if array.kind() == ArrayKind::Tables => Self::unique_array_table_element(&array, path),
-      other => Ok(other),
+      other @ (Node::Table(_)
+      | Node::Array(_)
+      | Node::Bool(_)
+      | Node::Str(_)
+      | Node::Integer(_)
+      | Node::Float(_)
+      | Node::Date(_)
+      | Node::Invalid(_)) => Ok(other),
     }
   }
 
   /// Resolve the sole table element in an array of tables.
   fn unique_array_table_element(array: &super::node::Array, path: &ExactPath) -> Result<Node, RewriteError> {
-    let (count, element) = {
-      let elements = array.items().read();
-      (elements.len(), elements.first().cloned())
-    };
-    match (count, element) {
-      (0, _) => Err(RewriteError::MissingPath {
+    let elements = array.items();
+    let count = elements.len();
+    match elements.first() {
+      None => Err(RewriteError::MissingPath {
         path: path.clone()
       }),
-      (1, Some(element)) => Ok(element),
-      (1, None) => Err(RewriteError::MissingPath {
-        path: path.clone()
-      }),
-      _ => Err(RewriteError::AmbiguousMatches {
+      Some(element) if count == 1 => Ok(element),
+      Some(_) => Err(RewriteError::AmbiguousMatches {
         path: path.clone(),
         count,
       }),
@@ -1383,13 +1372,13 @@ impl Rewrite {
       .map(|header| {
         let path = path_from_header(&header)?;
         let core = text_range(header.text_range())?;
-        let Some(key) = header.children().find(|child| child.kind() == SyntaxKind::KEY) else {
+        let Some(key_syntax) = header.children().find(|child| child.kind() == SyntaxKind::KEY) else {
           return Err(RewriteError::InvalidFragment {
             kind:   FragmentKind::TableBlock,
             reason: "the table header has no key syntax".into(),
           });
         };
-        let key = text_range(key.text_range())?;
+        let key = text_range(key_syntax.text_range())?;
         let start = self.attached_start(core.start)?;
         let kind = if header.kind() == SyntaxKind::TABLE_ARRAY_HEADER {
           TomlKind::ArrayOfTables
@@ -1399,7 +1388,7 @@ impl Rewrite {
         Ok(HeaderRecord {
           path,
           kind,
-          core: core.clone(),
+          core,
           key,
           block: start..self.source.len(),
         })
@@ -1424,13 +1413,7 @@ impl Rewrite {
         Some(end) => end,
         None => self.attached_end(header.core.end)?,
       };
-      completed.push(HeaderRecord {
-        path:  header.path.clone(),
-        kind:  header.kind,
-        core:  header.core.clone(),
-        key:   header.key.clone(),
-        block: header.block.start..end,
-      });
+      completed.push(header.with_block(header.block.start..end));
     }
     Ok(completed)
   }
@@ -1442,19 +1425,13 @@ impl Rewrite {
   fn semantic_block_records(&self, path: &ExactPath) -> Result<Vec<HeaderRecord>, RewriteError> {
     let headers = self.header_records()?;
     let mut elements = Vec::new();
-    for (position, header) in headers.iter().enumerate().filter(|(_, header)| header.path == *path) {
+    for (position, header) in headers.iter().enumerate().filter(|candidate| candidate.1.path == *path) {
       let following = headers.iter().skip(position.saturating_add(1));
       let end = following
         .take_while(|candidate| path.is_strict_parent_of(&candidate.path))
         .last()
         .map_or(header.block.end, |descendant| descendant.block.end);
-      elements.push(HeaderRecord {
-        path:  header.path.clone(),
-        kind:  header.kind,
-        core:  header.core.clone(),
-        key:   header.key.clone(),
-        block: header.block.start..end,
-      });
+      elements.push(header.with_block(header.block.start..end));
     }
     Ok(elements)
   }
@@ -1623,8 +1600,8 @@ impl Rewrite {
     let mut remaining = String::with_capacity(before.len().saturating_add(after.len()));
     remaining.push_str(before);
     remaining.push_str(after);
-    let parsed = parser::parse(&remaining);
-    if !parsed.errors.is_empty() {
+    let parsed = parser::parse(&remaining)?;
+    if !parsed.diagnostics().is_empty() {
       return Ok(false);
     }
     let syntax = parsed.into_syntax();
@@ -1673,26 +1650,14 @@ impl Rewrite {
 
   /// Extract one array value and attached comments.
   fn array_element_fragment(&self, array: &SyntaxNode, element: &SyntaxNode) -> Result<ArrayElementFragment, RewriteError> {
-    let core = text_range(element.text_range())?;
-    let interior = delimited_interior(array, SyntaxKind::BRACKET_START, SyntaxKind::BRACKET_END)?;
-    let preceding_comma_end = array
-      .children_with_tokens()
-      .filter(|syntax| syntax.kind() == SyntaxKind::COMMA)
-      .filter_map(|comma| text_range(comma.text_range()).ok())
-      .filter(|comma| comma.end <= core.start)
-      .map(|comma| comma.end)
-      .last()
-      .unwrap_or(interior.start);
-    let start = self.attached_start(core.start)?.max(preceding_comma_end);
-    let line_end = self.line_end(core.end)?.min(interior.end);
-    let value_source = self.slice(core.clone())?.trim();
-    let node = Node::from_syntax(element.clone().into());
+    let (node, ranges) = self.array_element_ranges(array, element)?;
+    let value_source = self.slice(ranges.core.clone())?.trim();
     let value_fragment = ValueFragment {
       source: value_source.into(),
       kind:   node_kind(&node),
     };
-    let leading = self.slice(start..core.start)?;
-    let trailing = self.slice(core.end..line_end)?;
+    let leading = self.slice(ranges.attached.start..ranges.core.start)?;
+    let trailing = self.slice(ranges.core.end..ranges.line_end)?;
     let leading_comments = leading
       .lines()
       .map(str::trim)
@@ -1707,7 +1672,7 @@ impl Rewrite {
       .map(Arc::<str>::from);
     let mut fragment_source = String::from(leading);
     fragment_source.push_str(value_source);
-    if let Some(comment) = &trailing_comment {
+    if let Some(comment) = trailing_comment.as_ref() {
       fragment_source.push(' ');
       fragment_source.push_str(comment);
     }
@@ -1725,21 +1690,9 @@ impl Rewrite {
       .children()
       .filter(|child| child.kind() == SyntaxKind::VALUE)
       .map(|element| {
-        let core = text_range(element.text_range())?;
-        let interior = delimited_interior(array, SyntaxKind::BRACKET_START, SyntaxKind::BRACKET_END)?;
-        let preceding_comma_end = array
-          .children_with_tokens()
-          .filter(|syntax| syntax.kind() == SyntaxKind::COMMA)
-          .filter_map(|comma| text_range(comma.text_range()).ok())
-          .filter(|comma| comma.end <= core.start)
-          .map(|comma| comma.end)
-          .last()
-          .unwrap_or(interior.start);
-        let start = self.attached_start(core.start)?.max(preceding_comma_end);
-        let line_end = self.line_end(core.end)?.min(interior.end);
-        let trailing = self.slice(core.end..line_end)?;
-        let end = if trailing.contains('#') { line_end } else { core.end };
-        Ok(start..end)
+        self
+          .array_element_ranges(array, &element)
+          .map(|(_node, ranges)| ranges.attached)
       })
       .collect::<Result<Vec<_>, RewriteError>>()?;
 
@@ -1762,6 +1715,37 @@ impl Rewrite {
       });
     }
     Ok(detached)
+  }
+
+  /// Calculate one array value's DOM node, exact source core, line end, and comment attachment
+  /// range.
+  fn array_element_ranges(&self, array: &SyntaxNode, element: &SyntaxNode) -> Result<(Node, ArrayElementRanges), RewriteError> {
+    let node = super::node_from_syntax(element.clone().into());
+    let Some(value_syntax) = node.syntax() else {
+      return Err(RewriteError::InvalidFragment {
+        kind:   FragmentKind::ArrayElement,
+        reason: "the array element has no source-backed value".into(),
+      });
+    };
+    let core = text_range(value_syntax.text_range())?;
+    let interior = delimited_interior(array, SyntaxKind::BRACKET_START, SyntaxKind::BRACKET_END)?;
+    let preceding_comma_end = array
+      .children_with_tokens()
+      .filter(|syntax| syntax.kind() == SyntaxKind::COMMA)
+      .filter_map(|comma| text_range(comma.text_range()).ok())
+      .filter(|comma| comma.end <= core.start)
+      .map(|comma| comma.end)
+      .last()
+      .unwrap_or(interior.start);
+    let start = self.attached_start(core.start)?.max(preceding_comma_end);
+    let line_end = self.line_end(core.end)?.min(interior.end);
+    let trailing = self.slice(core.end..line_end)?;
+    let end = if trailing.contains('#') { line_end } else { core.end };
+    Ok((node, ArrayElementRanges {
+      core,
+      line_end,
+      attached: start..end,
+    }))
   }
 
   /// Calculate one entry's comment-attached line range.
@@ -1805,13 +1789,12 @@ impl Rewrite {
     let prefix = self.source.get(..offset).ok_or(RewriteError::InvalidUtf8Range {
       start: 0, end: offset
     })?;
-    match prefix.rfind('\n') {
-      Some(newline) => newline.checked_add(1).ok_or(RewriteError::InvalidSourceRange {
+    prefix.rfind('\n').map_or(Ok(0), |newline| {
+      newline.checked_add(1).ok_or(RewriteError::InvalidSourceRange {
         start: newline,
         end:   usize::MAX,
-      }),
-      None => Ok(0),
-    }
+      })
+    })
   }
 
   /// Return the byte offset immediately after the containing line ending.
@@ -1820,16 +1803,15 @@ impl Rewrite {
       start: offset,
       end:   self.source.len(),
     })?;
-    match suffix.find('\n') {
-      Some(relative) => offset
+    suffix.find('\n').map_or(Ok(self.source.len()), |relative| {
+      offset
         .checked_add(relative)
         .and_then(|newline| newline.checked_add(1))
         .ok_or(RewriteError::InvalidSourceRange {
           start: offset,
           end:   usize::MAX,
-        }),
-      None => Ok(self.source.len()),
-    }
+        })
+    })
   }
 
   /// Slice source only after validating bounds and UTF-8 boundaries.
@@ -1848,15 +1830,51 @@ impl Rewrite {
 
   /// Add a standard byte range patch after converting it to Rowan offsets.
   fn push_std_patch(&mut self, range: Range<usize>, replacement: Arc<str>) -> Result<(), RewriteError> {
-    let start = TextSize::try_from(range.start).map_err(|_| RewriteError::InvalidSourceRange {
+    let start = TextSize::try_from(range.start).map_err(|_conversion_error| RewriteError::InvalidSourceRange {
       start: range.start,
       end:   range.end,
     })?;
-    let end = TextSize::try_from(range.end).map_err(|_| RewriteError::InvalidSourceRange {
+    let end = TextSize::try_from(range.end).map_err(|_conversion_error| RewriteError::InvalidSourceRange {
       start: range.start,
       end:   range.end,
     })?;
     self.push_patch(TextRange::new(start, end), PendingPatchKind::Replace(replacement))
+  }
+
+  /// Collect exact syntax ranges for every key segment selected by one query.
+  fn rename_key_ranges(&self, keys: &Keys) -> Result<Vec<TextRange>, RewriteError> {
+    Ok(
+      self
+        .root
+        .find_all_matches(keys, false)?
+        .filter_map(|(matched, _)| match matched.iter().last().cloned() {
+          Some(dom::KeyOrIndex::Key(key)) => Some(key),
+          _ => None,
+        })
+        .flat_map(|key| key.text_ranges().collect::<Vec<_>>())
+        .collect(),
+    )
+  }
+
+  /// Validate and install one atomic family of equal replacement patches.
+  fn push_replacements(&mut self, ranges: Vec<TextRange>, replacement: &Arc<str>) -> Result<(), RewriteError> {
+    self.validate_new_ranges(&ranges)?;
+    for range in ranges {
+      self.push_patch(range, PendingPatchKind::Replace(Arc::clone(replacement)))?;
+    }
+    Ok(())
+  }
+
+  /// Resolve a DOM node's exact source range or return contextual provenance failure.
+  fn node_source_range(path: &ExactPath, node: &Node, reason: &'static str) -> Result<Range<usize>, RewriteError> {
+    node
+      .syntax()
+      .map(SyntaxElement::text_range)
+      .ok_or_else(|| RewriteError::UnsupportedPlacement {
+        path:   path.clone(),
+        reason: reason.into(),
+      })
+      .and_then(text_range)
   }
 
   /// Add a patch only if it neither touches nor overlaps an existing patch.
@@ -1902,16 +1920,16 @@ fn ranges_touch(left: TextRange, right: TextRange) -> bool {
 
 impl fmt::Display for Rewrite {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-    self.render().map_err(|_| fmt::Error)?.fmt(formatter)
+    self.render().map_err(|_rewrite_error| fmt::Error)?.fmt(formatter)
   }
 }
 
-/// Compatibility patch requests accepted by [`Rewrite::add`].
+/// Patch requests accepted by [`Rewrite::add`].
 #[derive(Debug)]
 pub enum Patch {
-  /// Rename every key matched by the legacy glob query.
+  /// Rename every key matched by the glob query.
   RenameKeys {
-    /// Legacy dotted/glob query.
+    /// Dotted/glob query.
     key: Arc<str>,
     /// Replacement key spelling.
     to:  Arc<str>,
@@ -1963,13 +1981,13 @@ pub struct DiagnosticRange {
 impl DiagnosticRange {
   /// Return the inclusive start byte offset.
   #[must_use]
-  pub fn start(self) -> u32 {
+  pub const fn start(self) -> u32 {
     self.start
   }
 
   /// Return the exclusive end byte offset.
   #[must_use]
-  pub fn end(self) -> u32 {
+  pub const fn end(self) -> u32 {
     self.end
   }
 
@@ -1989,14 +2007,14 @@ pub enum SemanticDiagnosticKind {
   UnexpectedSyntax,
   /// A string contained an invalid escape sequence.
   InvalidEscapeSequence,
+  /// A scalar token could not be decoded into its advertised value kind.
+  MalformedScalar,
   /// Two keys conflict semantically.
   ConflictingKeys,
   /// A value used as a table was not a table.
   ExpectedTable,
   /// A value used as an array of tables was not an array of tables.
   ExpectedArrayOfTables,
-  /// A compatibility DOM query failed.
-  Query,
 }
 
 /// Owned, thread-safe projection of a DOM diagnostic.
@@ -2019,7 +2037,7 @@ pub struct SemanticDiagnostic {
 impl SemanticDiagnostic {
   /// Return the stable diagnostic category.
   #[must_use]
-  pub fn kind(&self) -> SemanticDiagnosticKind {
+  pub const fn kind(&self) -> SemanticDiagnosticKind {
     self.kind
   }
 
@@ -2031,35 +2049,44 @@ impl SemanticDiagnostic {
 
   /// Return the primary source range, when available.
   #[must_use]
-  pub fn range(&self) -> Option<DiagnosticRange> {
+  pub const fn range(&self) -> Option<DiagnosticRange> {
     self.range
   }
 
   /// Return the related source range, when available.
   #[must_use]
-  pub fn related_range(&self) -> Option<DiagnosticRange> {
+  pub const fn related_range(&self) -> Option<DiagnosticRange> {
     self.related_range
   }
 
   /// Consume a DOM diagnostic while retaining no DOM-backed handles.
-  fn from_dom(diagnostic: DomError) -> Self {
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the conversion boundary deliberately strips DOM handles while preserving typed category and source coordinates"
+  )]
+  fn from_dom(diagnostic: DomDiagnostic) -> Self {
     let message = Arc::<str>::from(diagnostic.to_string());
     let (kind, range, related_range) = match diagnostic {
-      DomError::UnexpectedSyntax {
+      DomDiagnostic::UnexpectedSyntax {
         syntax,
       } => (
         SemanticDiagnosticKind::UnexpectedSyntax,
         Some(DiagnosticRange::from_text_range(syntax.text_range())),
         None,
       ),
-      DomError::InvalidEscapeSequence {
+      DomDiagnostic::InvalidEscapeSequence {
         string,
       } => (
         SemanticDiagnosticKind::InvalidEscapeSequence,
         Some(DiagnosticRange::from_text_range(string.text_range())),
         None,
       ),
-      DomError::ConflictingKeys {
+      DomDiagnostic::MalformedScalar(malformed) => (
+        SemanticDiagnosticKind::MalformedScalar,
+        Some(DiagnosticRange::from_text_range(malformed.syntax().text_range())),
+        None,
+      ),
+      DomDiagnostic::ConflictingKeys {
         key,
         other,
       } => (
@@ -2067,7 +2094,7 @@ impl SemanticDiagnostic {
         key.text_ranges().next().map(DiagnosticRange::from_text_range),
         other.text_ranges().next().map(DiagnosticRange::from_text_range),
       ),
-      DomError::ExpectedTable {
+      DomDiagnostic::ExpectedTable {
         not_table,
         required_by,
       } => (
@@ -2075,7 +2102,7 @@ impl SemanticDiagnostic {
         not_table.text_ranges().next().map(DiagnosticRange::from_text_range),
         required_by.text_ranges().next().map(DiagnosticRange::from_text_range),
       ),
-      DomError::ExpectedArrayOfTables {
+      DomDiagnostic::ExpectedArrayOfTables {
         not_array_of_tables,
         required_by,
       } => (
@@ -2083,7 +2110,6 @@ impl SemanticDiagnostic {
         not_array_of_tables.text_ranges().next().map(DiagnosticRange::from_text_range),
         required_by.text_ranges().next().map(DiagnosticRange::from_text_range),
       ),
-      DomError::Query(_) => (SemanticDiagnosticKind::Query, None, None),
     };
     Self {
       kind,
@@ -2106,11 +2132,17 @@ pub enum RewriteError {
   /// A rewrite must own the document root.
   #[error("only the root node can be patched")]
   RootNodeExpected,
+  /// Rowan could not construct the lossless syntax tree.
+  #[error(transparent)]
+  Parse(#[from] parser::ParseFailure),
+  /// A DOM lookup or glob query failed.
+  #[error(transparent)]
+  Query(#[from] QueryError),
   /// The parser reported one or more syntax diagnostics.
   #[error("the TOML source has syntax diagnostics: {diagnostics:?}")]
   SyntaxDiagnostics {
     /// All parser diagnostics in source order.
-    diagnostics: Vec<parser::Error>,
+    diagnostics: Vec<parser::Diagnostic>,
   },
   /// The DOM reported one or more semantic diagnostics.
   #[error("the TOML source has semantic diagnostics: {diagnostics:?}")]
@@ -2185,24 +2217,7 @@ pub enum RewriteError {
     /// Actionable placement reason.
     reason: Arc<str>,
   },
-  /// A compatibility DOM query failed.
-  #[error("DOM query failed: {diagnostic}")]
-  Dom {
-    /// Owned diagnostic projection without DOM-backed syntax or key handles.
-    diagnostic: SemanticDiagnostic,
-  },
 }
-
-impl From<DomError> for RewriteError {
-  fn from(diagnostic: DomError) -> Self {
-    Self::Dom {
-      diagnostic: SemanticDiagnostic::from_dom(diagnostic),
-    }
-  }
-}
-
-/// Backwards-compatible name for [`RewriteError`].
-pub type Error = RewriteError;
 
 /// One table header and the complete source block that it owns.
 #[derive(Clone, Debug)]
@@ -2217,6 +2232,27 @@ struct HeaderRecord {
   key:   Range<usize>,
   /// Attached header and owned content, excluding detached following trivia.
   block: Range<usize>,
+}
+
+impl HeaderRecord {
+  /// Clone this record while replacing only the complete owned block range.
+  fn with_block(&self, block: Range<usize>) -> Self {
+    Self {
+      block,
+      ..self.clone()
+    }
+  }
+}
+
+/// Source ranges that define one inline-array element and its attached trivia.
+#[derive(Clone, Debug)]
+struct ArrayElementRanges {
+  /// Exact value syntax.
+  core:     Range<usize>,
+  /// End of the value's containing source line within the array.
+  line_end: usize,
+  /// Leading standalone comments and optional trailing same-line comment.
+  attached: Range<usize>,
 }
 
 /// One blank-separated array comment retained at its structural slot.
@@ -2239,11 +2275,11 @@ struct TableBlockGap {
 
 /// Convert a Rowan source range without truncation.
 fn text_range(range: TextRange) -> Result<Range<usize>, RewriteError> {
-  let start = usize::try_from(u32::from(range.start())).map_err(|_| RewriteError::InvalidSourceRange {
+  let start = usize::try_from(u32::from(range.start())).map_err(|_conversion_error| RewriteError::InvalidSourceRange {
     start: usize::MAX,
     end:   usize::MAX,
   })?;
-  let end = usize::try_from(u32::from(range.end())).map_err(|_| RewriteError::InvalidSourceRange {
+  let end = usize::try_from(u32::from(range.end())).map_err(|_conversion_error| RewriteError::InvalidSourceRange {
     start,
     end: usize::MAX,
   })?;
@@ -2252,12 +2288,12 @@ fn text_range(range: TextRange) -> Result<Range<usize>, RewriteError> {
 
 /// Return the structural TOML kind represented by a DOM node.
 fn node_kind(node: &Node) -> TomlKind {
-  match node {
-    Node::Table(table) => match table.kind() {
+  match *node {
+    Node::Table(ref table) => match table.kind() {
       TableKind::Inline => TomlKind::InlineTable,
       TableKind::Regular | TableKind::Pseudo => TomlKind::Table,
     },
-    Node::Array(array) => match array.kind() {
+    Node::Array(ref array) => match array.kind() {
       ArrayKind::Inline => TomlKind::Array,
       ArrayKind::Tables => TomlKind::ArrayOfTables,
     },
@@ -2277,23 +2313,25 @@ fn entry_syntax(node: &Node) -> Option<SyntaxNode> {
 
 /// Extract a literal path from one entry's key syntax.
 fn path_from_entry(entry: &SyntaxNode) -> Result<ExactPath, RewriteError> {
-  let Some(key) = entry.children().find(|child| child.kind() == SyntaxKind::KEY) else {
-    return Err(RewriteError::InvalidFragment {
-      kind:   FragmentKind::Entry,
-      reason: "the entry has no key syntax".into(),
-    });
-  };
-  Ok(ExactPath::from_segments(
-    keys_from_syntax(&key.into()).map(|segment| Arc::<str>::from(segment.value())),
-  ))
+  path_from_key_owner(entry, FragmentKind::Entry)
 }
 
 /// Extract a literal path from one table header.
 fn path_from_header(header: &SyntaxNode) -> Result<ExactPath, RewriteError> {
-  let Some(key) = header.children().find(|child| child.kind() == SyntaxKind::KEY) else {
+  path_from_key_owner(header, FragmentKind::TableBlock)
+}
+
+/// Extract a literal path from the key syntax owned by one typed fragment.
+fn path_from_key_owner(owner: &SyntaxNode, kind: FragmentKind) -> Result<ExactPath, RewriteError> {
+  let Some(key) = owner.children().find(|child| child.kind() == SyntaxKind::KEY) else {
+    let reason = match kind {
+      FragmentKind::Entry => "the entry has no key syntax",
+      FragmentKind::TableBlock => "the table header has no key syntax",
+      FragmentKind::Value | FragmentKind::ArrayElement => "the fragment kind cannot own key syntax",
+    };
     return Err(RewriteError::InvalidFragment {
-      kind:   FragmentKind::TableBlock,
-      reason: "the table header has no key syntax".into(),
+      kind,
+      reason: reason.into(),
     });
   };
   Ok(ExactPath::from_segments(
@@ -2347,7 +2385,10 @@ fn render_key(key: &str) -> String {
       '\t' => rendered.push_str("\\t"),
       '\u{0008}' => rendered.push_str("\\b"),
       '\u{000C}' => rendered.push_str("\\f"),
-      control if control.is_control() => rendered.push_str(&format!("\\u{:04X}", u32::from(control))),
+      control if control.is_control() => {
+        let escaped_control = format!("\\u{:04X}", u32::from(control));
+        rendered.push_str(&escaped_control);
+      }
       other => rendered.push(other),
     }
   }
@@ -2368,6 +2409,10 @@ fn infer_indent(source: &str) -> Option<&str> {
 }
 
 /// Render ordered array fragments using the existing array's broad style.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the named renderer owns array element ordering, comment slots, comma style, and multiline preservation together"
+)]
 fn render_array_elements(original: &str, elements: &[ArrayElementFragment], detached_comments: &[DetachedArrayComment]) -> String {
   if elements.is_empty() {
     if detached_comments.is_empty() {
@@ -2422,7 +2467,7 @@ fn render_array_elements(original: &str, elements: &[ArrayElementFragment], deta
     if !is_last || trailing_comma {
       rendered.push(',');
     }
-    if let Some(comment) = &element.trailing_comment {
+    if let Some(comment) = element.trailing_comment.as_ref() {
       rendered.push(' ');
       rendered.push_str(comment);
     }
@@ -2467,7 +2512,11 @@ fn render_table_blocks(blocks: &[TableBlockFragment], gaps: &[TableBlockGap]) ->
 }
 
 #[cfg(test)]
+/// Exact-path query, fragment, transaction, trivia, and structural reconciliation contracts.
 mod tests {
+  use core::iter::empty;
+  use core::ops::Range;
+
   use strict_test_support::TestFailure;
   use strict_test_support::ensure;
   use strict_test_support::ensure_eq;
@@ -2478,19 +2527,24 @@ mod tests {
   use super::EditOutcome;
   use super::EntryFragment;
   use super::ExactPath;
+  use super::FragmentKind;
   use super::RemoveEmptyParents;
   use super::Rewrite;
   use super::RewriteError;
+  use super::SemanticDiagnostic;
   use super::SemanticDiagnosticKind;
   use super::TableBlockFragment;
   use super::TomlKind;
   use super::ValueFragment;
+  use crate::dom::Key;
+  use crate::dom::Keys;
+  use crate::dom::error::QueryError;
   use crate::parser::parse;
 
-  /// Preserve the legacy constructor in focused compatibility tests.
+  /// Construct a rewrite fixture from a cleanly parsed document.
   fn rewrite(source: &str) -> Result<Rewrite, TestFailure> {
-    let parsed = parse(source);
-    ensure(parsed.errors.is_empty(), "the rewrite fixture must parse cleanly")?;
+    let parsed = ensure_ok(parse(source), "the rewrite fixture tree must construct")?;
+    ensure(parsed.diagnostics().is_empty(), "the rewrite fixture must parse cleanly")?;
     ensure_ok(Rewrite::new(parsed.into_dom()), "a parsed document root must be rewriteable")
   }
 
@@ -2499,29 +2553,116 @@ mod tests {
     ensure_ok(ExactPath::parse(source), "the fixture path must be exact")
   }
 
-  /// Require an owned public error boundary without making the DOM itself
-  /// thread-safe.
+  /// Require three optional source positions to exist in strict order.
+  fn ensure_ordered_positions(
+    first: Option<usize>,
+    second: Option<usize>,
+    third: Option<usize>,
+    context: &'static str,
+  ) -> Result<(), TestFailure> {
+    let first_position = ensure_some(first, context)?;
+    let second_position = ensure_some(second, context)?;
+    let third_position = ensure_some(third, context)?;
+    ensure(
+      (first_position < second_position, second_position < third_position) == (true, true),
+      context,
+    )
+  }
+
+  /// Require one rewrite operation to succeed with its exact structural effect.
+  fn ensure_edit_outcome(
+    result: Result<EditOutcome, RewriteError>,
+    expected: EditOutcome,
+    operation_context: &'static str,
+    outcome_context: &'static str,
+  ) -> Result<(), TestFailure> {
+    ensure_eq(&ensure_ok(result, operation_context)?, &expected, outcome_context)
+  }
+
+  /// Project every real DOM diagnostic from one tolerant parse into rewrite-owned data.
+  fn semantic_diagnostics(source: &str) -> Result<Vec<SemanticDiagnostic>, TestFailure> {
+    let parsed = ensure_ok(parse(source), "the semantic-diagnostic fixture tree must construct")?;
+    let root = parsed.into_dom();
+    let diagnostics = ensure_some(
+      root.validate().err(),
+      "the semantic-diagnostic fixture must be rejected by DOM validation",
+    )?;
+    Ok(diagnostics.into_iter().map(SemanticDiagnostic::from_dom).collect())
+  }
+
+  /// Insert one validated entry and render the committed source transaction.
+  fn render_entry_insertion(source: &str, parent: &ExactPath, entry_source: &str) -> Result<String, TestFailure> {
+    let mut document = ensure_ok(Rewrite::parse(source), "the entry-insertion fixture must parse")?;
+    let entry = ensure_ok(EntryFragment::parse(entry_source), "the inserted entry fragment must validate")?;
+    ensure_eq(
+      &ensure_ok(
+        document.insert_entry(parent, &entry),
+        "the entry must be insertable at its selected parent",
+      )?,
+      &EditOutcome::Inserted,
+      "entry insertion must report newly inserted source",
+    )?;
+    ensure_ok(document.render(), "the entry insertion must render")
+  }
+
+  /// Queue one raw patch and return the failed transaction with its typed render error.
+  fn failed_patch_render(source: &str, range: Range<usize>, replacement: &str) -> Result<(Rewrite, RewriteError), TestFailure> {
+    let mut document = ensure_ok(Rewrite::parse(source), "the invalid-range fixture must parse")?;
+    ensure_ok(
+      document.push_std_patch(range, replacement.into()),
+      "the Rowan-representable patch must be queued",
+    )?;
+    let error = ensure_some(document.render().err(), "the invalid patch must fail rendering")?;
+    Ok((document, error))
+  }
+
+  /// Apply one structural reconciliation and render its exact committed source.
+  fn render_reconciliation(
+    source: &str,
+    expected_outcome: EditOutcome,
+    reconcile: impl FnOnce(&mut Rewrite) -> Result<EditOutcome, RewriteError>,
+  ) -> Result<String, TestFailure> {
+    let mut document = ensure_ok(Rewrite::parse(source), "the reconciliation fixture must parse")?;
+    ensure_eq(
+      &ensure_ok(reconcile(&mut document), "the structural reconciliation must succeed")?,
+      &expected_outcome,
+      "the reconciliation must report its structural source effect",
+    )?;
+    ensure_ok(document.render(), "the reconciled source must render")
+  }
+
+  /// Enforce the rewrite API's concurrent-ownership contract at compile time.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the generic constraint gives the concurrency contract test one explicit compile-time assertion boundary"
+  )]
   fn require_send_sync<T: Send + Sync>() {}
 
+  /// Apply the shared nested-key rename transaction and render its result.
+  fn render_nested_renames(source: &str, deepest_query: &str) -> Result<String, TestFailure> {
+    let mut patches = rewrite(source)?;
+    let root_renamed = ensure_ok(patches.rename_keys("table", "table_new"), "the root key must be renameable")?;
+    let middle_renamed = ensure_ok(
+      root_renamed.rename_keys("table.middle", "middle_new"),
+      "the middle key must be renameable",
+    )?;
+    let inner_renamed = ensure_ok(
+      middle_renamed.rename_keys("table.middle.inner", "inner_new"),
+      "the inner key must be renameable",
+    )?;
+    let deepest_renamed = ensure_ok(
+      inner_renamed.rename_keys(deepest_query, "inner2_new"),
+      "the deepest key must be renameable",
+    )?;
+    ensure_ok(deepest_renamed.render(), "the nested-key patches must render")
+  }
+
+  /// Apply differently sized key replacements in descending source order.
   #[test]
   fn rename_keys() -> Result<(), TestFailure> {
     let toml = "\n[table.middle.inner]\n[table.middle.inner.inner]\n";
     let expected = "\n[table_new.middle_new.inner_new]\n[table_new.middle_new.inner_new.inner2_new]\n";
-    let mut patches = rewrite(toml)?;
-    ensure_ok(patches.rename_keys("table", "table_new"), "the outer key must be renameable")?;
-    ensure_ok(
-      patches.rename_keys("table.middle", "middle_new"),
-      "the middle key must be renameable",
-    )?;
-    ensure_ok(
-      patches.rename_keys("table.middle.inner", "inner_new"),
-      "the inner key must be renameable",
-    )?;
-    ensure_ok(
-      patches.rename_keys("table.middle.inner.inner", "inner2_new"),
-      "the deepest key must be renameable",
-    )?;
-    let rendered = ensure_ok(patches.render(), "legacy patches must render")?;
+    let rendered = render_nested_renames(toml, "table.middle.inner.inner")?;
     ensure_eq(
       &rendered.as_str(),
       &expected,
@@ -2529,37 +2670,47 @@ mod tests {
     )
   }
 
+  /// Rename every matching segment across repeated and nested array-of-tables headers.
   #[test]
   fn rename_keys_array_of_tables() -> Result<(), TestFailure> {
     let toml = "\n[[table.middle.inner]]\n[[table.middle.inner]]\n[table.middle.inner.inner]\n";
     let expected =
       "\n[[table_new.middle_new.inner_new]]\n[[table_new.middle_new.inner_new]]\n[table_new.middle_new.inner_new.inner2_new]\n";
-    let mut patches = rewrite(toml)?;
-    ensure_ok(patches.rename_keys("table", "table_new"), "the array-table root must be renameable")?;
-    ensure_ok(
-      patches.rename_keys("table.middle", "middle_new"),
-      "the array-table middle must be renameable",
-    )?;
-    ensure_ok(
-      patches.rename_keys("table.middle.inner", "inner_new"),
-      "the array-table inner must be renameable",
-    )?;
-    ensure_ok(
-      patches.rename_keys("table.middle.inner.*.inner", "inner2_new"),
-      "the nested array-table key must be renameable",
-    )?;
-    let rendered = ensure_ok(patches.render(), "legacy array-table patches must render")?;
+    let rendered = render_nested_renames(toml, "table.middle.inner.*.inner")?;
     ensure_eq(&rendered.as_str(), &expected, "all matching array-table ranges must be rewritten")
   }
 
+  /// Keep exact paths literal while reserving an empty path for the document root.
   #[test]
   fn exact_paths_are_literal_and_root_is_empty() -> Result<(), TestFailure> {
-    let root = ExactPath::from_segments(core::iter::empty::<&str>());
-    ensure(root.is_root(), "an empty segment sequence must identify the root")?;
-    let quoted = path("patch.\"https://example.com/repo\"")?;
+    let root = ensure_ok(ExactPath::parse(""), "an empty path must parse as the document root")?;
+    ensure(
+      [root.is_root(), root.is_empty(), root.key().is_none(), root.parent().is_none()] == [true, true, true, true],
+      "the document root must have no segments, key, or parent",
+    )?;
+    ensure_eq(
+      &root,
+      &ExactPath::from_segments(empty::<&str>()),
+      "both root constructors must agree",
+    )?;
+    ensure_eq(&root.to_string().as_str(), &"", "the document root must render as an empty path")?;
+
+    let quoted = ensure_ok(
+      ExactPath::try_from("patch.\"https://example.com/repo\""),
+      "TryFrom must accept an exact quoted path",
+    )?;
     ensure(
       quoted.segments().collect::<Vec<_>>() == ["patch", "https://example.com/repo"],
       "quoted punctuation must remain one literal segment",
+    )?;
+    let child = quoted.child("feature flags");
+    let parent = ensure_some(child.parent(), "a child path must expose its parent")?;
+    ensure(parent == quoted, "removing the final child must restore the original path")?;
+    let suffix = ExactPath::from_segments(["*", "line\nbreak"]);
+    let extended = child.extend(&suffix);
+    ensure(
+      extended.segments().collect::<Vec<_>>() == ["patch", "https://example.com/repo", "feature flags", "*", "line\nbreak"],
+      "path extension must preserve every literal suffix segment in order",
     )?;
     ensure(
       matches!(ExactPath::parse("items.*"), Err(RewriteError::InvalidPath { .. })),
@@ -2577,6 +2728,75 @@ mod tests {
     )
   }
 
+  /// Render every literal key class without changing its decoded value.
+  #[test]
+  fn exact_paths_render_literal_keys_canonically() -> Result<(), TestFailure> {
+    for (key, expected) in [
+      ("bare_1-key", "bare_1-key"),
+      ("", "\"\""),
+      ("with space", "\"with space\""),
+      ("\"", "\"\\\"\""),
+      ("\\", "\"\\\\\""),
+      ("\n", "\"\\n\""),
+      ("\r", "\"\\r\""),
+      ("\t", "\"\\t\""),
+      ("\u{0008}", "\"\\b\""),
+      ("\u{000c}", "\"\\f\""),
+      ("\u{0001}", "\"\\u0001\""),
+      ("caf\u{e9}", "\"caf\u{e9}\""),
+    ] {
+      let rendered = ExactPath::from_segments([key]).to_string();
+      ensure_eq(
+        &rendered.as_str(),
+        &expected,
+        "literal key rendering must use the canonical lossless TOML spelling",
+      )?;
+      let reparsed = ensure_ok(ExactPath::parse(&rendered), "a rendered literal key must parse again")?;
+      ensure(
+        reparsed.segments().eq([key]),
+        "a rendered literal key must decode to the original segment",
+      )?;
+    }
+    Ok(())
+  }
+
+  /// Keep public fieldless-enum rendering stable for diagnostics and command output.
+  #[test]
+  fn public_enum_display_is_stable() -> Result<(), TestFailure> {
+    for (kind, expected) in [
+      (TomlKind::Table, "Table"),
+      (TomlKind::InlineTable, "InlineTable"),
+      (TomlKind::Array, "Array"),
+      (TomlKind::ArrayOfTables, "ArrayOfTables"),
+      (TomlKind::String, "String"),
+      (TomlKind::Integer, "Integer"),
+      (TomlKind::Float, "Float"),
+      (TomlKind::Boolean, "Boolean"),
+      (TomlKind::DateTime, "DateTime"),
+      (TomlKind::Invalid, "Invalid"),
+    ] {
+      ensure_eq(
+        &kind.to_string().as_str(),
+        &expected,
+        "TOML kinds must retain their stable variant-name rendering",
+      )?;
+    }
+    for (outcome, expected) in [
+      (EditOutcome::Unchanged, "Unchanged"),
+      (EditOutcome::Inserted, "Inserted"),
+      (EditOutcome::Replaced, "Replaced"),
+      (EditOutcome::Removed, "Removed"),
+    ] {
+      ensure_eq(
+        &outcome.to_string().as_str(),
+        &expected,
+        "edit outcomes must retain their stable variant-name rendering",
+      )?;
+    }
+    Ok(())
+  }
+
+  /// Reject both parser and DOM diagnostics before a rewrite transaction is created.
   #[test]
   fn parse_rejects_syntax_and_semantic_diagnostics() -> Result<(), TestFailure> {
     ensure(
@@ -2613,20 +2833,125 @@ mod tests {
     )
   }
 
+  /// Project every DOM diagnostic family into owned typed ranges and messages.
   #[test]
-  fn rewrite_errors_are_send_sync_without_claiming_dom_is() -> Result<(), TestFailure> {
-    require_send_sync::<RewriteError>();
+  fn semantic_diagnostic_projection_preserves_all_families() -> Result<(), TestFailure> {
+    for (source, expected_kind, expected_nonempty, expected_related, expected_message) in [
+      (
+        "missing =\nnext = 1\n",
+        SemanticDiagnosticKind::UnexpectedSyntax,
+        false,
+        false,
+        "the syntax was not expected here:",
+      ),
+      (
+        "\"\\q\" = 1\n",
+        SemanticDiagnosticKind::InvalidEscapeSequence,
+        true,
+        false,
+        "the string contains invalid escape sequence(s)",
+      ),
+      (
+        "value = 999999999999999999999999999999\n",
+        SemanticDiagnosticKind::MalformedScalar,
+        true,
+        false,
+        "the integer scalar could not be decoded:",
+      ),
+      (
+        "a = 1\na = 2\n",
+        SemanticDiagnosticKind::ConflictingKeys,
+        true,
+        true,
+        "conflicting keys",
+      ),
+      (
+        "a = 1\n[a.b]\n",
+        SemanticDiagnosticKind::ExpectedTable,
+        true,
+        true,
+        "expected table",
+      ),
+      (
+        "a = 1\n[[a]]\n",
+        SemanticDiagnosticKind::ExpectedArrayOfTables,
+        true,
+        true,
+        "expected array of tables",
+      ),
+    ] {
+      let diagnostics = semantic_diagnostics(source)?;
+      let diagnostic = ensure_some(
+        diagnostics.iter().find(|diagnostic| diagnostic.kind() == expected_kind),
+        "the fixture must produce its expected semantic diagnostic family",
+      )?;
+      ensure(
+        (
+          diagnostic.message().starts_with(expected_message),
+          diagnostic.to_string() == diagnostic.message(),
+        ) == (true, true),
+        "the owned diagnostic must preserve both its message and Display contract",
+      )?;
+      let primary = ensure_some(
+        diagnostic.range(),
+        "a source-backed semantic diagnostic must preserve its primary range",
+      )?;
+      ensure(
+        (
+          primary.start() <= primary.end(),
+          (primary.start() < primary.end()) == expected_nonempty,
+        ) == (true, true),
+        "a semantic diagnostic must retain an ordered range with the source family's exact width polarity",
+      )?;
+      ensure(
+        diagnostic.related_range().is_some() == expected_related,
+        "only paired semantic diagnostics must retain a related range",
+      )?;
+      if let Some(related) = diagnostic.related_range() {
+        ensure(
+          related.start() < related.end(),
+          "a paired semantic diagnostic must retain a nonempty related range",
+        )?;
+      }
+    }
     Ok(())
   }
 
+  /// Require owned rewrite failures to cross concurrent execution boundaries safely.
+  #[test]
+  fn rewrite_errors_are_send_and_sync() {
+    require_send_sync::<RewriteError>();
+  }
+
+  /// Render an untouched non-ASCII document without changing any UTF-8 byte.
   #[test]
   fn untouched_and_non_ascii_documents_render_byte_for_byte() -> Result<(), TestFailure> {
-    let source = "# café\n\"ключ\" = \"値\"\n";
+    let source = "# caf\u{e9}\n\"\u{43a}\u{43b}\u{44e}\u{447}\" = \"\u{5024}\"\n";
     let rewrite = ensure_ok(Rewrite::parse(source), "valid non-ASCII TOML must parse")?;
     let rendered = ensure_ok(rewrite.render(), "an untouched document must render")?;
     ensure_eq(&rendered.as_str(), &source, "untouched UTF-8 bytes must be identical")
   }
 
+  /// Forward `Display` through the same validated source transaction as `render`.
+  #[test]
+  fn display_matches_render_for_pending_rewrites() -> Result<(), TestFailure> {
+    let mut rewrite = ensure_ok(Rewrite::parse("value = 1\n"), "the display fixture must parse")?;
+    let replacement = ensure_ok(ValueFragment::parse("2"), "the displayed replacement must validate")?;
+    ensure_edit_outcome(
+      rewrite.replace_value(&path("value")?, &replacement),
+      EditOutcome::Replaced,
+      "the displayed value must be replaceable",
+      "the displayed mutation must report replacement",
+    )?;
+    let rendered = ensure_ok(rewrite.render(), "the pending display transaction must render")?;
+    ensure_eq(
+      &rewrite.to_string(),
+      &rendered,
+      "Display must publish the same complete source as the fallible renderer",
+    )
+  }
+
+  /// Return exact source slices and structural kinds for values and entries.
   #[test]
   fn values_and_entries_are_exact_and_typed() -> Result<(), TestFailure> {
     let source = "# attached\nvalue  =  [1, 2] # trailing\nother = true\n";
@@ -2641,13 +2966,142 @@ mod tests {
       &"value  =  [1, 2] # trailing",
       "entry lookup must retain internal spacing and its inline comment",
     )?;
+    ensure_eq(&entry.kind(), &TomlKind::Array, "entry lookup must expose its value kind")?;
+    ensure_eq(
+      &entry.value().text(),
+      &"[1, 2]",
+      "entry lookup must expose the same exact value view",
+    )?;
+    let value_fragment = ensure_ok(rewrite.value_fragment(&value_path), "the value must be extractable")?;
+    ensure_eq(
+      &value_fragment.as_str(),
+      &"[1, 2]",
+      "value extraction must retain the exact value spelling",
+    )?;
+    ensure_eq(
+      &value_fragment.kind(),
+      &TomlKind::Array,
+      "value extraction must retain the parsed structural kind",
+    )?;
     let fragment = ensure_ok(rewrite.entry_fragment(&value_path), "the entry must be extractable")?;
     ensure(
-      fragment.as_str().contains("# attached") && fragment.as_str().contains("# trailing"),
+      [
+        fragment.as_str().contains("# attached"),
+        fragment.as_str().contains("# trailing"),
+      ] == [true, true],
       "the extracted entry must retain attached comments",
+    )?;
+    ensure(fragment.key() == &value_path, "entry extraction must retain its exact key")?;
+    ensure_eq(
+      &fragment.value().kind(),
+      &TomlKind::Array,
+      "entry extraction must retain its validated value fragment",
     )
   }
 
+  /// Classify every source-backed value family through the public exact-value query.
+  #[test]
+  fn value_queries_classify_scalar_and_composite_families() -> Result<(), TestFailure> {
+    let rewrite = ensure_ok(
+      Rewrite::parse(
+        "boolean = true\nstring = \"value\"\ninteger = 1\nfloat = 1.5\ndate = 1979-05-27T07:32:00Z\narray = [1]\ninline = \
+         {}\n[regular]\nchild = 1\n[[items]]\nchild = 2\n",
+      ),
+      "the value-kind fixture must parse",
+    )?;
+    for (query, expected) in [
+      ("boolean", TomlKind::Boolean),
+      ("string", TomlKind::String),
+      ("integer", TomlKind::Integer),
+      ("float", TomlKind::Float),
+      ("date", TomlKind::DateTime),
+      ("array", TomlKind::Array),
+      ("inline", TomlKind::InlineTable),
+      ("regular", TomlKind::Table),
+      ("items", TomlKind::ArrayOfTables),
+    ] {
+      let value = ensure_ok(
+        rewrite.value(&path(query)?),
+        "every source-backed TOML family must support an exact value query",
+      )?;
+      ensure_eq(
+        &value.kind(),
+        &expected,
+        "exact value queries must preserve the structural TOML family",
+      )?;
+    }
+    Ok(())
+  }
+
+  /// Reject document roots and table headers where a key/value entry is required.
+  #[test]
+  fn entry_operations_reject_non_entry_paths_without_mutation() -> Result<(), TestFailure> {
+    let mut rewrite = ensure_ok(Rewrite::parse("[table]\nvalue = 1\n"), "the non-entry path fixture must parse")?;
+    ensure(
+      matches!(rewrite.entry(&ExactPath::default()), Err(RewriteError::MissingPath { .. })),
+      "the document root must not be projected as a key/value entry",
+    )?;
+    let table = path("table")?;
+    ensure(
+      matches!(rewrite.entry(&table), Err(RewriteError::UnsupportedPlacement { .. })),
+      "a regular table header must not be projected as a key/value entry",
+    )?;
+    ensure(
+      matches!(
+        rewrite.remove_entry(&table, RemoveEmptyParents::Keep),
+        Err(RewriteError::UnsupportedPlacement { .. })
+      ),
+      "entry removal must reject a regular table header",
+    )?;
+    ensure(
+      rewrite.patches().is_empty(),
+      "rejected non-entry operations must not queue a source patch",
+    )
+  }
+
+  /// Expose validated array-element and table-block metadata without reparsing at call sites.
+  #[test]
+  fn structural_fragments_expose_their_validated_metadata() -> Result<(), TestFailure> {
+    let element = ensure_ok(
+      ArrayElementFragment::parse("# leading\n\"value\" # trailing"),
+      "an array element with attached comments must validate",
+    )?;
+    ensure_eq(
+      &element.as_str(),
+      &"# leading\n\"value\" # trailing",
+      "array-element extraction must retain its attached source spelling",
+    )?;
+    ensure_eq(
+      &element.value().as_str(),
+      &"\"value\"",
+      "an array element must expose its exact validated value",
+    )?;
+    ensure_eq(
+      &element.kind(),
+      &TomlKind::String,
+      "an array element must expose its validated value kind",
+    )?;
+
+    let block_source = "# block\n[[items]]\nname = \"value\"\n";
+    let block = ensure_ok(TableBlockFragment::parse(block_source), "an array-table block must validate")?;
+    ensure_eq(
+      &block.as_str(),
+      &block_source,
+      "table-block extraction must retain its complete source",
+    )?;
+    ensure_eq(
+      &block.kind(),
+      &TomlKind::ArrayOfTables,
+      "table-block extraction must expose its header kind",
+    )?;
+    ensure_eq(
+      block.path(),
+      &path("items")?,
+      "table-block extraction must expose its exact header path",
+    )
+  }
+
+  /// Limit an extracted inline entry to its own key, value, and internal trivia.
   #[test]
   fn inline_entry_fragments_stay_inside_the_inline_table() -> Result<(), TestFailure> {
     let rewrite = ensure_ok(
@@ -2665,11 +3119,25 @@ mod tests {
     )
   }
 
+  /// Replace only a value range and publish source, DOM, and patches transactionally.
   #[test]
   fn replace_value_preserves_neighboring_bytes_and_commits_transactionally() -> Result<(), TestFailure> {
     let source = "# keep\nvalue  =  1 # keep too\nneighbor = 2\n";
     let mut rewrite = ensure_ok(Rewrite::parse(source), "the replacement fixture must parse")?;
-    let replacement = ensure_ok(ValueFragment::parse("\"café\""), "the replacement must be a value")?;
+    let unchanged = ensure_ok(ValueFragment::parse("1"), "the existing value must validate as a fragment")?;
+    ensure_eq(
+      &ensure_ok(
+        rewrite.replace_value(&path("value")?, &unchanged),
+        "an identical value must remain replaceable",
+      )?,
+      &EditOutcome::Unchanged,
+      "an identical value must report an unchanged transaction",
+    )?;
+    ensure(
+      rewrite.patches().is_empty(),
+      "an unchanged replacement must not queue a source patch",
+    )?;
+    let replacement = ensure_ok(ValueFragment::parse("\"caf\u{e9}\""), "the replacement must be a value")?;
     ensure_eq(
       &ensure_ok(
         rewrite.replace_value(&path("value")?, &replacement),
@@ -2678,7 +3146,7 @@ mod tests {
       &EditOutcome::Replaced,
       "a different value must report replacement",
     )?;
-    let expected = "# keep\nvalue  =  \"café\" # keep too\nneighbor = 2\n";
+    let expected = "# keep\nvalue  =  \"caf\u{e9}\" # keep too\nneighbor = 2\n";
     let rendered = ensure_ok(rewrite.render(), "the replacement must render")?;
     ensure_eq(&rendered.as_str(), &expected, "only the value bytes may change")?;
     ensure_ok(rewrite.commit(), "the valid rendered document must commit")?;
@@ -2687,74 +3155,179 @@ mod tests {
     ensure_eq(&committed.as_str(), &expected, "commit must replace the source and DOM together")
   }
 
+  /// Leave committed source and queued patches intact when validation rejects a commit.
   #[test]
   fn failed_commit_retains_source_and_patches() -> Result<(), TestFailure> {
     let mut rewrite = ensure_ok(Rewrite::parse("value = 1\n"), "the transaction fixture must parse")?;
-    ensure_ok(rewrite.rename_keys("value", "bad key"), "legacy rename accepts source text")?;
+    let invalid_rename = ensure_ok(rewrite.rename_keys("value", "bad key"), "rename accepts source text")?;
     ensure(
-      matches!(rewrite.commit(), Err(RewriteError::SyntaxDiagnostics { .. })),
+      matches!(invalid_rename.commit(), Err(RewriteError::SyntaxDiagnostics { .. })),
       "an invalid complete result must fail commit",
     )?;
-    ensure_eq(&rewrite.source(), &"value = 1\n", "failed commit must retain the committed source")?;
-    ensure_eq(&rewrite.patches().len(), &1, "failed commit must retain pending patches")
+    ensure_eq(
+      &invalid_rename.source(),
+      &"value = 1\n",
+      "failed commit must retain the committed source",
+    )?;
+    ensure_eq(&invalid_rename.patches().len(), &1, "failed commit must retain pending patches")
   }
 
+  /// Insert entries at root, regular-table, and inline-table ownership boundaries.
   #[test]
   fn insert_and_upsert_cover_root_regular_and_inline_tables() -> Result<(), TestFailure> {
-    let mut root = ensure_ok(Rewrite::parse("[table]\nold = 1\n"), "the root insertion fixture must parse")?;
-    let entry = ensure_ok(
-      EntryFragment::parse("# new\nroot = true\n"),
-      "the root entry fragment must validate",
-    )?;
-    ensure_ok(root.insert_entry(&ExactPath::default(), &entry), "a root entry must be insertable")?;
-    let root_rendered = ensure_ok(root.render(), "the root insertion must render")?;
+    let root_rendered = render_entry_insertion("[table]\nold = 1\n", &ExactPath::default(), "# new\nroot = true\n")?;
     ensure(
       root_rendered.starts_with("# new\nroot = true\n\n[table]"),
       "root insertion must precede table blocks",
     )?;
 
-    let mut regular = ensure_ok(Rewrite::parse("[table]\nold = 1\n\n[other]\nx = 2\n"), "regular fixture must parse")?;
-    let inserted = ensure_ok(EntryFragment::parse("new = 2"), "the regular entry must validate")?;
-    ensure_ok(
-      regular.insert_entry(&path("table")?, &inserted),
-      "a regular-table entry must be insertable",
-    )?;
-    let regular_rendered = ensure_ok(regular.render(), "the regular insertion must render")?;
+    let regular_rendered = render_entry_insertion("[table]\nold = 1\n\n[other]\nx = 2\n", &path("table")?, "new = 2")?;
     ensure_eq(
       &regular_rendered.as_str(),
       &"[table]\nold = 1\nnew = 2\n\n[other]\nx = 2\n",
       "regular insertion must stay in the selected table block",
     )?;
 
-    let mut inline = ensure_ok(Rewrite::parse("value = { old = 1 }\n"), "inline fixture must parse")?;
-    let inline_entry = ensure_ok(EntryFragment::parse("new = 2"), "the inline entry must validate")?;
-    ensure_ok(
-      inline.insert_entry(&path("value")?, &inline_entry),
-      "an inline-table entry must be insertable",
-    )?;
-    let inline_rendered = ensure_ok(inline.render(), "the inline insertion must render")?;
+    let inline_rendered = render_entry_insertion("value = { old = 1 }\n", &path("value")?, "new = 2")?;
     ensure_eq(
       &inline_rendered.as_str(),
       &"value = { old = 1, new = 2 }\n",
       "inline insertion must preserve braces and spacing",
     )?;
 
-    let mut multiline = ensure_ok(
-      Rewrite::parse("value = {\n  old = 1,\n  }\n"),
-      "the multiline inline-table fixture must parse",
+    let empty_inline_rendered = render_entry_insertion("value = {}\n", &path("value")?, "new = 2")?;
+    ensure_eq(
+      &empty_inline_rendered.as_str(),
+      &"value = { new = 2 }\n",
+      "empty inline insertion must establish canonical interior spacing",
     )?;
-    ensure_ok(
-      multiline.insert_entry(&path("value")?, &inline_entry),
-      "a multiline inline-table entry must be insertable",
-    )?;
-    let multiline_rendered = ensure_ok(multiline.render(), "the multiline inline insertion must render")?;
+
+    let multiline_rendered = render_entry_insertion("value = {\n  old = 1,\n  }\n", &path("value")?, "new = 2")?;
     ensure_eq(
       &multiline_rendered.as_str(),
       &"value = {\n  old = 1,\n  new = 2\n  }\n",
       "multiline insertion must reuse the existing comma and closing indentation",
+    )?;
+
+    let multiline_without_comma = render_entry_insertion("value = {\n  old = 1\n  }\n", &path("value")?, "new = 2")?;
+    ensure_eq(
+      &multiline_without_comma.as_str(),
+      &"value = {\n  old = 1,\n  new = 2\n  }\n",
+      "multiline insertion must add the required separator when the preceding entry has no comma",
     )
   }
 
+  /// Distinguish duplicate, unchanged, replacement, and insertion outcomes at one table boundary.
+  #[test]
+  fn entry_upserts_and_table_creation_report_exact_outcomes() -> Result<(), TestFailure> {
+    let source = "root = 1\n[table]\nold = 1\n";
+    let mut rewrite = ensure_ok(Rewrite::parse(source), "the upsert fixture must parse")?;
+    ensure_eq(
+      &ensure_ok(
+        rewrite.create_tables(&ExactPath::default()),
+        "creating the document root must remain valid",
+      )?,
+      &EditOutcome::Unchanged,
+      "the document root must already exist",
+    )?;
+    let table = path("table")?;
+    ensure_eq(
+      &ensure_ok(rewrite.create_tables(&table), "an existing regular table must remain valid")?,
+      &EditOutcome::Unchanged,
+      "an existing regular table must not queue another header",
+    )?;
+
+    let existing = ensure_ok(EntryFragment::parse("old = 1"), "the existing entry must validate")?;
+    let replacement = ensure_ok(EntryFragment::parse("old = 2"), "the replacement entry must validate")?;
+    let inserted = ensure_ok(EntryFragment::parse("new = true"), "the new entry must validate")?;
+    ensure(
+      matches!(
+        rewrite.insert_entry(&table, &existing),
+        Err(RewriteError::AmbiguousMatches {
+          count: 1,
+          ..
+        })
+      ),
+      "direct insertion must reject an existing exact entry",
+    )?;
+    ensure_edit_outcome(
+      rewrite.upsert_entry(&table, &existing),
+      EditOutcome::Unchanged,
+      "an identical entry must be upsertable",
+      "an identical upsert must remain unchanged",
+    )?;
+
+    ensure_edit_outcome(
+      rewrite.upsert_entry(&table, &replacement),
+      EditOutcome::Replaced,
+      "an existing entry value must be replaceable",
+      "a changed upsert must report replacement",
+    )?;
+    ensure_edit_outcome(
+      rewrite.upsert_entry(&table, &inserted),
+      EditOutcome::Inserted,
+      "a missing entry must be insertable",
+      "a missing upsert must report insertion",
+    )?;
+    let rendered = ensure_ok(rewrite.render(), "the mixed upsert transaction must render")?;
+    ensure_eq(
+      &rendered.as_str(),
+      &"root = 1\n[table]\nold = 2\nnew = true\n",
+      "mixed upserts must change only the selected value and append the missing entry",
+    )
+  }
+
+  /// Replace and insert exact values while rejecting root replacement before mutation.
+  #[test]
+  fn value_upserts_replace_insert_and_reject_the_document_root() -> Result<(), TestFailure> {
+    let replacement = ensure_ok(ValueFragment::parse("2"), "the replacement value must validate")?;
+    let mut existing = ensure_ok(
+      Rewrite::parse("[table]\nvalue = 1\n"),
+      "the existing-value upsert fixture must parse",
+    )?;
+    ensure_edit_outcome(
+      existing.upsert_value(&path("table.value")?, &replacement),
+      EditOutcome::Replaced,
+      "an existing exact value must be upsertable",
+      "an existing exact value must report replacement",
+    )?;
+    ensure_eq(
+      &ensure_ok(existing.render(), "the replaced value upsert must render")?,
+      &"[table]\nvalue = 2\n".to_owned(),
+      "value upsert replacement must preserve the surrounding entry and table",
+    )?;
+
+    let mut missing = ensure_ok(
+      Rewrite::parse("[table]\nvalue = 1\n"),
+      "the missing-value upsert fixture must parse",
+    )?;
+    ensure_edit_outcome(
+      missing.upsert_value(&path("table.added")?, &replacement),
+      EditOutcome::Inserted,
+      "a missing exact value with an existing parent must be upsertable",
+      "a missing exact value must report insertion",
+    )?;
+    ensure_eq(
+      &ensure_ok(missing.render(), "the inserted value upsert must render")?,
+      &"[table]\nvalue = 1\nadded = 2\n".to_owned(),
+      "value upsert insertion must append only the rendered key/value entry",
+    )?;
+
+    let mut root = ensure_ok(Rewrite::parse("value = 1\n"), "the root-rejection upsert fixture must parse")?;
+    ensure(
+      matches!(
+        root.upsert_value(&ExactPath::default(), &replacement),
+        Err(RewriteError::UnsupportedPlacement { .. })
+      ),
+      "the document root must reject value upsert with its typed placement failure",
+    )?;
+    ensure(
+      root.patches().is_empty(),
+      "a rejected root value upsert must not queue a partial patch",
+    )
+  }
+
+  /// Require a commit between parent-table creation and a dependent child insertion.
   #[test]
   fn explicit_parent_creation_requires_a_separate_committed_phase() -> Result<(), TestFailure> {
     let mut rewrite = ensure_ok(Rewrite::parse("root = true\n"), "the creation fixture must parse")?;
@@ -2768,9 +3341,13 @@ mod tests {
     )?;
     ensure_ok(rewrite.commit(), "the created table phase must commit")?;
     let entry = ensure_ok(EntryFragment::parse("value = 1"), "the dependent entry must validate")?;
-    ensure_ok(
-      rewrite.insert_entry(&path("outer.inner")?, &entry),
-      "a dependent edit must use the reparsed table",
+    ensure_eq(
+      &ensure_ok(
+        rewrite.insert_entry(&path("outer.inner")?, &entry),
+        "a dependent edit must use the reparsed table",
+      )?,
+      &EditOutcome::Inserted,
+      "the dependent entry must report insertion into the committed table",
     )?;
     let rendered = ensure_ok(rewrite.render(), "the dependent edit must render")?;
     ensure(
@@ -2779,13 +3356,76 @@ mod tests {
     )
   }
 
+  /// Preserve the document boundary while rejecting non-table creation prefixes.
+  #[test]
+  fn table_creation_preserves_boundaries_and_rejects_non_table_prefixes() -> Result<(), TestFailure> {
+    let mut empty = ensure_ok(Rewrite::parse(""), "the empty table-creation fixture must parse")?;
+    ensure_edit_outcome(
+      empty.create_tables(&path("outer.inner")?),
+      EditOutcome::Inserted,
+      "nested tables must be creatable in an empty document",
+      "empty-document table creation must report inserted source",
+    )?;
+    ensure_eq(
+      &ensure_ok(empty.render(), "empty-document table creation must render")?,
+      &"[outer]\n\n[outer.inner]\n".to_owned(),
+      "table creation in an empty document must not manufacture a leading boundary",
+    )?;
+
+    let mut no_trailing_newline = ensure_ok(Rewrite::parse("root = true"), "the no-trailing-newline creation fixture must parse")?;
+    ensure_edit_outcome(
+      no_trailing_newline.create_tables(&path("outer.inner")?),
+      EditOutcome::Inserted,
+      "nested tables must be creatable after a terminal root entry",
+      "nested table creation must report inserted source",
+    )?;
+    ensure_eq(
+      &ensure_ok(no_trailing_newline.render(), "the no-trailing-newline table creation must render")?,
+      &"root = true\n\n[outer]\n\n[outer.inner]\n".to_owned(),
+      "table creation must establish exactly one source and table-block boundary",
+    )?;
+
+    for (source, expected_kind) in [
+      ("outer = 1\n", TomlKind::Integer),
+      ("outer = { value = 1 }\n", TomlKind::InlineTable),
+    ] {
+      let mut incompatible = ensure_ok(Rewrite::parse(source), "the incompatible-prefix fixture must parse")?;
+      ensure(
+        matches!(
+          incompatible.create_tables(&path("outer.inner")?),
+          Err(RewriteError::TypeMismatch {
+            expected: "regular table",
+            found,
+            ..
+          }) if found == expected_kind
+        ),
+        "table creation must reject an existing scalar or inline-table prefix with its exact kind",
+      )?;
+      ensure(
+        incompatible.patches().is_empty(),
+        "a rejected table creation must not queue a partial source mutation",
+      )?;
+      ensure_eq(
+        &ensure_ok(incompatible.render(), "the rejected table creation must remain renderable")?,
+        &source.to_owned(),
+        "a rejected table creation must leave the committed source byte-identical",
+      )?;
+    }
+    Ok(())
+  }
+
+  /// Remove one entry with its attached comments while preserving blank-separated trivia.
   #[test]
   fn exact_removal_preserves_siblings_and_comment_boundaries() -> Result<(), TestFailure> {
     let source = "# detached\n\n# attached\nremove = 1 # inline\nkeep = 2\n";
     let mut rewrite = ensure_ok(Rewrite::parse(source), "the removal fixture must parse")?;
-    ensure_ok(
-      rewrite.remove_entry(&path("remove")?, RemoveEmptyParents::Keep),
-      "the exact root entry must be removable",
+    ensure_eq(
+      &ensure_ok(
+        rewrite.remove_entry(&path("remove")?, RemoveEmptyParents::Keep),
+        "the exact root entry must be removable",
+      )?,
+      &EditOutcome::Removed,
+      "exact entry removal must report removed source",
     )?;
     let rendered = ensure_ok(rewrite.render(), "the removal must render")?;
     ensure_eq(
@@ -2795,15 +3435,62 @@ mod tests {
     )
   }
 
+  /// Remove every positional inline-table entry with a valid comma boundary.
+  #[test]
+  fn inline_table_removal_is_comma_aware_at_every_position() -> Result<(), TestFailure> {
+    for (selected, expected) in [
+      ("first", "value = {middle=2,last=3}\n"),
+      ("middle", "value = {first=1,last=3}\n"),
+      ("last", "value = {first=1,middle=2}\n"),
+    ] {
+      let mut document = ensure_ok(
+        Rewrite::parse("value = {first=1,middle=2,last=3}\n"),
+        "the positional inline-removal fixture must parse",
+      )?;
+      ensure_edit_outcome(
+        document.remove_entry(&ExactPath::from_segments(["value", selected]), RemoveEmptyParents::Keep),
+        EditOutcome::Removed,
+        "the selected inline-table entry must be removable",
+        "inline-table removal must report removed source",
+      )?;
+      ensure_eq(
+        &ensure_ok(document.render(), "the positional inline removal must render")?,
+        &expected.to_owned(),
+        "inline removal must retain every unselected entry and exactly one valid comma boundary",
+      )?;
+    }
+
+    let mut only = ensure_ok(
+      Rewrite::parse("value = {only=1}\n"),
+      "the single-entry inline-removal fixture must parse",
+    )?;
+    ensure_edit_outcome(
+      only.remove_entry(&path("value.only")?, RemoveEmptyParents::Prune),
+      EditOutcome::Removed,
+      "the only inline-table entry must be removable",
+      "single-entry inline removal must report removed source",
+    )?;
+    ensure_eq(
+      &ensure_ok(only.render(), "the emptied inline table must render")?,
+      &"value = {}\n".to_owned(),
+      "removing the only inline entry must preserve the owning value as an empty inline table",
+    )
+  }
+
+  /// Prune only concrete empty ancestors that have no retained comment ownership.
   #[test]
   fn removal_prunes_only_proven_empty_comment_free_parent_tables() -> Result<(), TestFailure> {
     let mut nested = ensure_ok(
       Rewrite::parse("[outer]\n[outer.inner]\nremove = 1\n"),
       "the nested prune fixture must parse",
     )?;
-    ensure_ok(
-      nested.remove_entry(&path("outer.inner.remove")?, RemoveEmptyParents::Prune),
-      "the only nested entry must be removable with pruning",
+    ensure_eq(
+      &ensure_ok(
+        nested.remove_entry(&path("outer.inner.remove")?, RemoveEmptyParents::Prune),
+        "the only nested entry must be removable with pruning",
+      )?,
+      &EditOutcome::Removed,
+      "nested pruning must report removal of the selected entry",
     )?;
     let nested_rendered = ensure_ok(nested.render(), "the nested prune must render")?;
     ensure_eq(
@@ -2816,9 +3503,13 @@ mod tests {
       Rewrite::parse("# retained table context\n[table]\nremove = 1\n"),
       "the commented prune fixture must parse",
     )?;
-    ensure_ok(
-      commented.remove_entry(&path("table.remove")?, RemoveEmptyParents::Prune),
-      "the entry beneath a commented table must be removable",
+    ensure_eq(
+      &ensure_ok(
+        commented.remove_entry(&path("table.remove")?, RemoveEmptyParents::Prune),
+        "the entry beneath a commented table must be removable",
+      )?,
+      &EditOutcome::Removed,
+      "comment-preserving pruning must still report removal of the selected entry",
     )?;
     let commented_rendered = ensure_ok(commented.render(), "the commented removal must render")?;
     ensure_eq(
@@ -2828,6 +3519,7 @@ mod tests {
     )
   }
 
+  /// Reconcile array order, attached comments, detached slots, commas, and empty state.
   #[test]
   fn arrays_reconcile_elements_comments_order_and_empty_state() -> Result<(), TestFailure> {
     let source = "values = [\n  # detached\n\n  # first\n  \"a\", # inline\n  \"b\",\n]\n";
@@ -2838,7 +3530,11 @@ mod tests {
     let first = ensure_some(elements.first(), "the first array fragment must exist")?;
     let second = ensure_some(elements.get(1), "the second array fragment must exist")?;
     ensure(
-      first.as_str().contains("# first") && first.as_str().contains("# inline") && !first.as_str().contains("\"b\""),
+      [
+        first.as_str().contains("# first"),
+        first.as_str().contains("# inline"),
+        first.as_str().contains("\"b\""),
+      ] == [true, true, false],
       "the first fragment must retain only its own value and attached comments",
     )?;
     ensure(
@@ -2851,31 +3547,41 @@ mod tests {
       "the second fragment must not capture its preceding sibling",
     )?;
     elements.reverse();
-    ensure_ok(rewrite.reconcile_array(&values, &elements), "array elements must be reorderable")?;
+    ensure_eq(
+      &ensure_ok(rewrite.reconcile_array(&values, &elements), "array elements must be reorderable")?,
+      &EditOutcome::Replaced,
+      "reordering array elements must report replacement of the array interior",
+    )?;
     let rendered = ensure_ok(rewrite.render(), "the reordered array must render")?;
     ensure(rendered.contains("\"b\","), "the second element must move first")?;
     ensure(
-      rendered.contains("# first") && rendered.contains("# inline"),
+      [rendered.contains("# first"), rendered.contains("# inline")] == [true, true],
       "attached comments must survive reconciliation",
     )?;
-    let detached_position = rendered.find("# detached");
-    let moved_first_position = rendered.find("\"b\"");
-    let attached_position = rendered.find("# first");
-    ensure(
-      matches!(
-        (detached_position, moved_first_position, attached_position),
-        (Some(detached), Some(first_value), Some(attached)) if detached < first_value && first_value < attached
-      ),
+    ensure_ordered_positions(
+      rendered.find("# detached"),
+      rendered.find("\"b\""),
+      rendered.find("# first"),
       "blank-separated comments must remain at their structural slot instead of moving with an element",
     )?;
 
-    let mut empty = ensure_ok(Rewrite::parse("values = [1, 2]\n"), "the empty-array fixture must parse")?;
-    ensure_ok(empty.reconcile_array(&values, &[]), "an array must reconcile to empty")?;
-    let empty_rendered = ensure_ok(empty.render(), "the empty array must render")?;
+    let empty_rendered = render_reconciliation("values = [1, 2]\n", EditOutcome::Replaced, |document| {
+      document.reconcile_array(&values, &[])
+    })?;
     ensure_eq(
       &empty_rendered.as_str(),
       &"values = []\n",
       "empty reconciliation must retain the brackets",
+    )?;
+
+    let detached_only_source = "values = [\n  # retained\n\n  1,\n]\n";
+    let detached_only = render_reconciliation(detached_only_source, EditOutcome::Replaced, |document| {
+      document.reconcile_array(&values, &[])
+    })?;
+    ensure_eq(
+      &detached_only.as_str(),
+      &"values = [\n  # retained\n\n]\n",
+      "empty reconciliation must retain blank-separated comments at their array slot",
     )?;
 
     let no_trailing_source = "values = [\n  1 # last\n]\n";
@@ -2900,6 +3606,7 @@ mod tests {
     )
   }
 
+  /// Preserve one-line terminal-comma policy and untouched empty-array interior trivia.
   #[test]
   fn one_line_arrays_preserve_terminal_comma_style_and_empty_trivia() -> Result<(), TestFailure> {
     let values = path("values")?;
@@ -2931,9 +3638,13 @@ mod tests {
     let mut no_comma = ensure_ok(Rewrite::parse("values = [1, 2   ]\n"), "the one-line no-comma array must parse")?;
     let mut no_comma_elements = ensure_ok(no_comma.array_elements(&values), "the no-comma elements must be extractable")?;
     no_comma_elements.reverse();
-    ensure_ok(
-      no_comma.reconcile_array(&values, &no_comma_elements),
-      "the no-comma elements must reconcile",
+    ensure_eq(
+      &ensure_ok(
+        no_comma.reconcile_array(&values, &no_comma_elements),
+        "the no-comma elements must reconcile",
+      )?,
+      &EditOutcome::Replaced,
+      "reordering a no-comma array must report replacement",
     )?;
     let no_comma_rendered = ensure_ok(no_comma.render(), "the no-comma array must render")?;
     ensure_eq(
@@ -2959,6 +3670,57 @@ mod tests {
     )
   }
 
+  /// Reject incompatible reconciliation targets and fragments before queuing patches.
+  #[test]
+  fn reconciliation_rejects_wrong_types_and_paths_without_partial_mutation() -> Result<(), TestFailure> {
+    let values = path("values")?;
+    for (source, expected_kind) in [
+      ("values = 1\n", TomlKind::Integer),
+      ("[[values]]\nname = \"one\"\n", TomlKind::ArrayOfTables),
+    ] {
+      let mut incompatible = ensure_ok(Rewrite::parse(source), "the incompatible-array fixture must parse")?;
+      ensure(
+        matches!(
+          incompatible.reconcile_array(&values, &[]),
+          Err(RewriteError::TypeMismatch {
+            expected: "inline array",
+            found,
+            ..
+          }) if found == expected_kind
+        ),
+        "array reconciliation must reject scalar and array-of-tables targets with their exact kinds",
+      )?;
+      ensure(
+        incompatible.patches().is_empty(),
+        "a rejected array reconciliation must not queue a partial source mutation",
+      )?;
+    }
+
+    let mut blocks = ensure_ok(
+      Rewrite::parse("[[items]]\nname = \"one\"\n"),
+      "the mismatched-block target fixture must parse",
+    )?;
+    let wrong_path = ensure_ok(
+      TableBlockFragment::parse("[[other]]\nname = \"two\"\n"),
+      "the mismatched table block must be independently valid",
+    )?;
+    ensure(
+      matches!(
+        blocks.reconcile_table_blocks(&path("items")?, &[wrong_path]),
+        Err(RewriteError::InvalidFragment {
+          kind: FragmentKind::TableBlock,
+          ..
+        })
+      ),
+      "table-block reconciliation must reject a valid fragment owned by another exact path",
+    )?;
+    ensure(
+      blocks.patches().is_empty(),
+      "a rejected table-block reconciliation must not queue a partial source mutation",
+    )
+  }
+
+  /// Extract and reorder complete table blocks without disturbing unrelated blocks.
   #[test]
   fn table_blocks_copy_reorder_and_remove_as_complete_units() -> Result<(), TestFailure> {
     let source = "# one\n[[items]]\nname = \"a\"\n\n# two\n[[items]]\nname = \"b\"\n\n[other]\nkeep = true\n";
@@ -2966,10 +3728,26 @@ mod tests {
     let items = path("items")?;
     let mut blocks = ensure_ok(rewrite.table_blocks(&items), "array-table blocks must be extractable")?;
     ensure_eq(&blocks.len(), &2, "both array-table blocks must be enumerated")?;
+    ensure_eq(
+      &ensure_ok(
+        rewrite.reconcile_table_blocks(&items, &blocks),
+        "unchanged array-table blocks must remain reconcilable",
+      )?,
+      &EditOutcome::Unchanged,
+      "the original block sequence must not queue a replacement",
+    )?;
+    ensure(
+      rewrite.patches().is_empty(),
+      "unchanged table-block reconciliation must not queue a source patch",
+    )?;
     blocks.reverse();
-    ensure_ok(
-      rewrite.reconcile_table_blocks(&items, &blocks),
-      "array-table blocks must be reorderable",
+    ensure_eq(
+      &ensure_ok(
+        rewrite.reconcile_table_blocks(&items, &blocks),
+        "array-table blocks must be reorderable",
+      )?,
+      &EditOutcome::Replaced,
+      "reordering array-table blocks must report replacement",
     )?;
     let rendered = ensure_ok(rewrite.render(), "reordered blocks must render")?;
     let first_b = rendered.find("name = \"b\"");
@@ -2990,6 +3768,78 @@ mod tests {
     ensure_eq(parsed.path(), &items, "block parsing must retain the exact header path")
   }
 
+  /// Insert missing table blocks and leave an absent empty sequence unchanged.
+  #[test]
+  fn missing_table_block_reconciliation_distinguishes_empty_and_inserted() -> Result<(), TestFailure> {
+    let items = path("items")?;
+    let empty_block = ensure_ok(
+      TableBlockFragment::parse("[[items]]\nname = \"only\"\n"),
+      "the empty-document table block must validate",
+    )?;
+    let mut empty_document = ensure_ok(Rewrite::parse(""), "the empty block target must parse")?;
+    ensure_edit_outcome(
+      empty_document.reconcile_table_blocks(&items, &[empty_block]),
+      EditOutcome::Inserted,
+      "a table-block sequence must be insertable into an empty document",
+      "empty-document table-block reconciliation must report inserted source",
+    )?;
+    ensure_eq(
+      &ensure_ok(empty_document.render(), "the empty-document table block must render")?,
+      &"[[items]]\nname = \"only\"\n".to_owned(),
+      "table-block insertion into an empty document must not prepend blank lines",
+    )?;
+
+    let mut rewrite = ensure_ok(Rewrite::parse("root = true\n"), "the missing-block fixture must parse")?;
+    ensure_eq(
+      &ensure_ok(
+        rewrite.reconcile_table_blocks(&items, &[]),
+        "an absent empty block sequence must remain reconcilable",
+      )?,
+      &EditOutcome::Unchanged,
+      "an absent empty block sequence must remain unchanged",
+    )?;
+    let block = ensure_ok(
+      TableBlockFragment::parse("[[items]]\nname = \"new\"\n"),
+      "the inserted table block must validate",
+    )?;
+    ensure_eq(
+      &ensure_ok(
+        rewrite.reconcile_table_blocks(&items, &[block]),
+        "a missing table-block sequence must be insertable",
+      )?,
+      &EditOutcome::Inserted,
+      "a missing nonempty block sequence must report insertion",
+    )?;
+    let rendered = ensure_ok(rewrite.render(), "the inserted table block must render")?;
+    ensure_eq(
+      &rendered.as_str(),
+      &"root = true\n\n[[items]]\nname = \"new\"\n",
+      "table-block insertion must preserve the existing root entry and establish one block boundary",
+    )?;
+
+    let mut unterminated = ensure_ok(Rewrite::parse("root = true"), "the unterminated missing-block fixture must parse")?;
+    let first = ensure_ok(
+      TableBlockFragment::parse("[[items]]\nname = \"first\""),
+      "the first unterminated table block must validate",
+    )?;
+    let second = ensure_ok(
+      TableBlockFragment::parse("[[items]]\nname = \"second\""),
+      "the second unterminated table block must validate",
+    )?;
+    ensure_edit_outcome(
+      unterminated.reconcile_table_blocks(&items, &[first, second]),
+      EditOutcome::Inserted,
+      "unterminated table blocks must be insertable after an unterminated document",
+      "unterminated table-block insertion must report inserted source",
+    )?;
+    ensure_eq(
+      &ensure_ok(unterminated.render(), "the unterminated table-block insertion must render")?,
+      &"root = true\n\n[[items]]\nname = \"first\"\n[[items]]\nname = \"second\"".to_owned(),
+      "table-block rendering must establish boundaries without manufacturing a terminal newline",
+    )
+  }
+
+  /// Keep detached inter-block and tail comments at their structural slots during reconciliation.
   #[test]
   fn table_blocks_keep_detached_comments_at_structural_slots() -> Result<(), TestFailure> {
     let source =
@@ -3011,9 +3861,13 @@ mod tests {
       "the second fragment must include its attached comment but exclude detached tail trivia",
     )?;
     blocks.reverse();
-    ensure_ok(
-      reorder.reconcile_table_blocks(&items, &blocks),
-      "the detached-comment table blocks must reorder",
+    ensure_eq(
+      &ensure_ok(
+        reorder.reconcile_table_blocks(&items, &blocks),
+        "the detached-comment table blocks must reorder",
+      )?,
+      &EditOutcome::Replaced,
+      "reordering blocks around detached comments must report replacement",
     )?;
     let reordered = ensure_ok(reorder.render(), "the reordered detached-comment blocks must render")?;
     ensure_eq(
@@ -3022,13 +3876,9 @@ mod tests {
       "attached comments must follow their blocks while detached inter-block and tail comments retain their slots",
     )?;
 
-    let mut remove = ensure_ok(Rewrite::parse(source), "the detached-comment removal fixture must parse")?;
-    ensure_eq(
-      &ensure_ok(remove.reconcile_table_blocks(&items, &[]), "all table blocks must be removable")?,
-      &EditOutcome::Removed,
-      "removing every matching block must report removal",
-    )?;
-    let removed = ensure_ok(remove.render(), "the detached comments must render after block removal")?;
+    let removed = render_reconciliation(source, EditOutcome::Removed, |document| {
+      document.reconcile_table_blocks(&items, &[])
+    })?;
     ensure_eq(
       &removed.as_str(),
       &"\n# detached between\n\n\n# detached tail\n",
@@ -3036,6 +3886,7 @@ mod tests {
     )
   }
 
+  /// Treat an array-table parent and all strict descendants as one movable semantic element.
   #[test]
   fn array_table_elements_include_all_descendant_blocks() -> Result<(), TestFailure> {
     let source = "[[contracts.toml]]\nname = \"first\"\n[[contracts.toml.keys]]\nname = \"a\"\n\n[[contracts.toml]]\nname = \
@@ -3047,14 +3898,20 @@ mod tests {
     let first = ensure_some(blocks.first(), "the first semantic parent element must exist")?;
     let second = ensure_some(blocks.get(1), "the second semantic parent element must exist")?;
     ensure(
-      first.as_str().contains("name = \"first\"")
-        && first.as_str().contains("[[contracts.toml.keys]]")
-        && first.as_str().contains("name = \"a\"")
-        && !first.as_str().contains("name = \"second\""),
+      [
+        first.as_str().contains("name = \"first\""),
+        first.as_str().contains("[[contracts.toml.keys]]"),
+        first.as_str().contains("name = \"a\""),
+        first.as_str().contains("name = \"second\""),
+      ] == [true, true, true, false],
       "the first fragment must include its descendants and stop at its sibling",
     )?;
     ensure(
-      second.as_str().contains("name = \"second\"") && second.as_str().contains("name = \"b\"") && !second.as_str().contains("[other]"),
+      [
+        second.as_str().contains("name = \"second\""),
+        second.as_str().contains("name = \"b\""),
+        second.as_str().contains("[other]"),
+      ] == [true, true, false],
       "the second fragment must include descendants and stop at the first non-descendant",
     )?;
 
@@ -3065,19 +3922,19 @@ mod tests {
     ensure_eq(parsed.path(), &contracts, "nested block parsing must retain the root header path")?;
 
     blocks.reverse();
-    ensure_ok(
-      rewrite.reconcile_table_blocks(&contracts, &blocks),
-      "complete parent elements must reconcile as ordered units",
+    ensure_eq(
+      &ensure_ok(
+        rewrite.reconcile_table_blocks(&contracts, &blocks),
+        "complete parent elements must reconcile as ordered units",
+      )?,
+      &EditOutcome::Replaced,
+      "reordering complete parent elements must report replacement",
     )?;
     let rendered = ensure_ok(rewrite.render(), "nested parent reordering must render")?;
-    let second_position = rendered.find("name = \"second\"");
-    let second_key_position = rendered.find("name = \"b\"");
-    let first_position = rendered.find("name = \"first\"");
-    ensure(
-      matches!(
-        (second_position, second_key_position, first_position),
-        (Some(parent), Some(descendant), Some(next_parent)) if parent < descendant && descendant < next_parent
-      ),
+    ensure_ordered_positions(
+      rendered.find("name = \"second\""),
+      rendered.find("name = \"b\""),
+      rendered.find("name = \"first\""),
       "reordering must keep each descendant block with its owning parent",
     )?;
     ensure(
@@ -3086,12 +3943,18 @@ mod tests {
     )
   }
 
+  /// Rebase only the root and descendant headers of a validated table block.
   #[test]
   fn table_blocks_rebase_root_and_descendant_headers_only() -> Result<(), TestFailure> {
     let source = "# contract\n[workspace.metadata.config.contract]\nkind = \"toml\"\n\n# \
                   key\n[[workspace.metadata.config.contract.keys]]\nname = \"version\"\n";
     let expected = "# contract\n[contracts]\nkind = \"toml\"\n\n# key\n[[contracts.keys]]\nname = \"version\"\n";
     let block = ensure_ok(TableBlockFragment::parse(source), "the migration block must parse")?;
+    let unchanged = ensure_ok(block.rebase(block.path()), "rebasing to the existing root path must remain valid")?;
+    ensure(
+      unchanged == block,
+      "rebasing to the existing root path must preserve the validated block exactly",
+    )?;
     let contracts = path("contracts")?;
     let rebased = ensure_ok(block.rebase(&contracts), "the complete hierarchy must be rebaseable")?;
     ensure_eq(rebased.path(), &contracts, "rebasing must expose the new root path")?;
@@ -3106,6 +3969,7 @@ mod tests {
     )
   }
 
+  /// Permit exact traversal through one array-table element and reject multiple matches.
   #[test]
   fn exact_operations_traverse_only_one_array_table_element() -> Result<(), TestFailure> {
     let parent = path("managed-children.repositories")?;
@@ -3121,13 +3985,17 @@ mod tests {
     )?;
 
     let replacement = ensure_ok(ValueFragment::parse("\"strict\""), "the replacement branch must validate")?;
-    ensure_ok(
+    ensure_edit_outcome(
       rewrite.replace_value(&branch, &replacement),
+      EditOutcome::Replaced,
       "a child beneath one array-table element must be replaceable",
+      "replacing the array-table child must report replacement",
     )?;
-    ensure_ok(
+    ensure_edit_outcome(
       rewrite.remove_entry(&name, RemoveEmptyParents::Keep),
+      EditOutcome::Removed,
       "a child beneath one array-table element must be removable",
+      "removing the array-table child must report removal",
     )?;
     let rendered = ensure_ok(rewrite.render(), "the unique array-table edits must render")?;
     ensure_eq(
@@ -3138,9 +4006,13 @@ mod tests {
 
     ensure_ok(rewrite.commit(), "the unique array-table edits must commit before insertion")?;
     let enabled = ensure_ok(EntryFragment::parse("enabled = true"), "the inserted child must validate")?;
-    ensure_ok(
-      rewrite.insert_entry(&parent, &enabled),
-      "one array-table element must be a valid exact insertion parent",
+    ensure_eq(
+      &ensure_ok(
+        rewrite.insert_entry(&parent, &enabled),
+        "one array-table element must be a valid exact insertion parent",
+      )?,
+      &EditOutcome::Inserted,
+      "inserting beneath one array-table element must report insertion",
     )?;
     let inserted = ensure_ok(rewrite.render(), "the array-table insertion must render")?;
     ensure(
@@ -3176,6 +4048,7 @@ mod tests {
     )
   }
 
+  /// Reject fragments containing extra values, entries, headers, or detached trivia.
   #[test]
   fn fragment_validation_rejects_wrong_shapes() -> Result<(), TestFailure> {
     ensure(
@@ -3187,8 +4060,23 @@ mod tests {
       "an entry fragment must reject multiple entries",
     )?;
     ensure(
+      matches!(EntryFragment::parse("a = 1\n[table]\n"), Err(RewriteError::InvalidFragment { .. })),
+      "an entry fragment must reject a table header after its sole root entry",
+    )?;
+    ensure(
+      matches!(
+        EntryFragment::parse("# detached\n\na = 1\n"),
+        Err(RewriteError::InvalidFragment { .. })
+      ),
+      "an entry fragment must reject blank-separated trivia outside its attachment range",
+    )?;
+    ensure(
       matches!(ArrayElementFragment::parse("1, 2"), Err(RewriteError::InvalidFragment { .. })),
       "an array-element fragment must reject multiple elements",
+    )?;
+    ensure(
+      matches!(ArrayElementFragment::parse(""), Err(RewriteError::InvalidFragment { .. })),
+      "an array-element fragment must reject a missing element",
     )?;
     ensure(
       matches!(
@@ -3205,6 +4093,24 @@ mod tests {
       "a table-block fragment must reject multiple headers",
     )?;
     ensure(
+      matches!(TableBlockFragment::parse("root = 1\n"), Err(RewriteError::InvalidFragment { .. })),
+      "a table-block fragment must reject source without a table header",
+    )?;
+    ensure(
+      matches!(
+        TableBlockFragment::parse("root = 1\n[a]\nx = 1\n"),
+        Err(RewriteError::InvalidFragment { .. })
+      ),
+      "a table-block fragment must reject root entries before its table header",
+    )?;
+    ensure(
+      matches!(
+        TableBlockFragment::parse("# detached\n\n[a]\nx = 1\n"),
+        Err(RewriteError::InvalidFragment { .. })
+      ),
+      "a table-block fragment must reject blank-separated source before its owned block",
+    )?;
+    ensure(
       matches!(
         TableBlockFragment::parse("[[items]]\nname = \"one\"\n\n# detached tail\n"),
         Err(RewriteError::InvalidFragment { .. })
@@ -3213,6 +4119,8 @@ mod tests {
     )
   }
 
+  /// Preserve distinct typed errors for missing paths, type mismatches, queries, ambiguity, and
+  /// ranges.
   #[test]
   fn query_and_mutation_failures_retain_typed_boundaries() -> Result<(), TestFailure> {
     let rewrite = ensure_ok(Rewrite::parse("scalar = 1\n"), "the typed-error fixture must parse")?;
@@ -3236,19 +4144,17 @@ mod tests {
     )?;
 
     let mut query = ensure_ok(Rewrite::parse("value = 1\n"), "the query-error fixture must parse")?;
-    let query_diagnostic = match query.rename_keys("[", "replacement") {
-      Err(RewriteError::Dom {
-        diagnostic,
-      }) => Some(diagnostic),
-      _ => None,
-    };
-    let diagnostic = ensure_some(
-      query_diagnostic.as_ref(),
-      "a malformed compatibility query must retain an owned DOM diagnostic",
-    )?;
     ensure(
-      diagnostic.kind() == SemanticDiagnosticKind::Query,
-      "a compatibility query failure must retain its stable category",
+      matches!(
+        query.rename_keys("[", "replacement"),
+        Err(RewriteError::Query(QueryError::InvalidKey(_)))
+      ),
+      "a malformed textual query must retain its typed parse-diagnostic failure",
+    )?;
+    let invalid_glob = Keys::from(Key::new("["));
+    ensure(
+      matches!(query.root.find_all_matches(&invalid_glob, false), Err(QueryError::InvalidGlob(_))),
+      "a decoded key containing invalid glob syntax must retain its typed glob failure",
     )?;
 
     let mut ambiguous = ensure_ok(
@@ -3265,28 +4171,26 @@ mod tests {
       "non-contiguous exact table matches must return an ambiguity error",
     )?;
 
-    let mut invalid_range = ensure_ok(Rewrite::parse("value = 1\n"), "the range-error fixture must parse")?;
-    ensure_ok(
-      invalid_range.push_std_patch(0..100, "replacement".into()),
-      "an out-of-bounds range within Rowan coordinates may be queued",
-    )?;
+    let (_invalid_range, invalid_range_error) = failed_patch_render("value = 1\n", 0..100, "replacement")?;
     ensure(
-      matches!(invalid_range.render(), Err(RewriteError::InvalidSourceRange { .. })),
+      matches!(invalid_range_error, RewriteError::InvalidSourceRange { .. }),
       "an out-of-bounds pending range must return an invalid-source-range error",
     )
   }
 
+  /// Reject overlapping key patches without appending any part of the failed request.
   #[test]
   fn overlapping_and_touching_patches_are_rejected_without_partial_addition() -> Result<(), TestFailure> {
     let mut patches = rewrite("[table]\nvalue = 1\n")?;
-    ensure_ok(patches.rename_keys("table", "first"), "the first replacement must be accepted")?;
+    let first_rename = ensure_ok(patches.rename_keys("table", "first"), "the first replacement must be accepted")?;
     ensure(
-      matches!(patches.rename_keys("table", "second"), Err(RewriteError::Overlap)),
+      matches!(first_rename.rename_keys("table", "second"), Err(RewriteError::Overlap)),
       "a second replacement over the same source range must be rejected",
     )?;
-    ensure_eq(&patches.patches().len(), &1, "failed addition must not leave a partial patch")
+    ensure_eq(&first_rename.patches().len(), &1, "failed addition must not leave a partial patch")
   }
 
+  /// Reject adjacent and non-UTF-8 ranges without mutating committed render state.
   #[test]
   fn touching_and_non_utf8_ranges_fail_without_mutating_render_state() -> Result<(), TestFailure> {
     let mut touching = ensure_ok(Rewrite::parse("ab = 1\n"), "the touching-range fixture must parse")?;
@@ -3300,27 +4204,30 @@ mod tests {
     )?;
     ensure_eq(&touching.patches().len(), &1, "a rejected touching range must not add a patch")?;
 
-    let mut utf8 = ensure_ok(Rewrite::parse("\"é\" = 1\n"), "the UTF-8 range fixture must parse")?;
-    ensure_ok(
-      utf8.push_std_patch(2..2, "".into()),
-      "a Rowan-representable byte offset may be queued",
-    )?;
+    let (utf8, utf8_error) = failed_patch_render("\"\u{e9}\" = 1\n", 2..2, "")?;
     ensure(
-      matches!(utf8.render(), Err(RewriteError::InvalidUtf8Range { .. })),
+      matches!(utf8_error, RewriteError::InvalidUtf8Range { .. }),
       "render must reject a byte offset inside a UTF-8 code point",
     )?;
-    ensure_eq(&utf8.source(), &"\"é\" = 1\n", "failed render must retain the original source")?;
+    ensure_eq(&utf8.source(), &"\"\u{e9}\" = 1\n", "failed render must retain the original source")?;
     ensure_eq(&utf8.patches().len(), &1, "failed render must retain the pending transaction")
   }
 
+  /// Require the rewrite constructor to own a document-root syntax node.
   #[test]
   fn non_root_nodes_are_rejected() -> Result<(), TestFailure> {
-    let parsed = parse("value = 1");
-    ensure(parsed.errors.is_empty(), "the non-root fixture must parse cleanly")?;
-    let value = ensure_ok(parsed.into_dom().try_get("value"), "the fixture value must exist")?;
+    let parsed = ensure_ok(parse("value = 1\n[table]\nchild = 2\n"), "the non-root fixture tree must construct")?;
+    ensure(parsed.diagnostics().is_empty(), "the non-root fixture must parse cleanly")?;
+    let root = parsed.into_dom();
+    let value = ensure_some(root.get_key("value"), "the fixture value must exist")?;
+    let table = ensure_some(root.get_key("table"), "the fixture table must exist")?;
     ensure(
       matches!(Rewrite::new(value), Err(RewriteError::RootNodeExpected)),
-      "only a root syntax node may own a rewrite",
+      "a scalar token must not own a rewrite",
+    )?;
+    ensure(
+      matches!(Rewrite::new(table), Err(RewriteError::RootNodeExpected)),
+      "a source-backed non-root syntax node must not own a rewrite",
     )
   }
 }

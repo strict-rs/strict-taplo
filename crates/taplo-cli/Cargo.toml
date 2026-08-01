@@ -11,9 +11,12 @@ homepage     = { workspace = true }
 license      = { workspace = true }
 repository   = { workspace = true }
 
+[lints]
+workspace = true
+
 [features]
 default     = ["completions", "lint", "lsp", "rustls-tls", "toml-test"]
-lint        = ["reqwest", "taplo-common/reqwest", "taplo-common/schema"]
+lint        = ["taplo-common/reqwest", "taplo-common/schema"]
 lsp         = ["async-ctrlc", "lint", "taplo-lsp"]
 native-tls  = ["taplo-common/native-tls", "taplo-lsp?/native-tls"]
 rustls-tls  = ["taplo-common/rustls-tls", "taplo-lsp?/rustls-tls"]
@@ -25,29 +28,22 @@ taplo        = { workspace = true, features = ["serde"] }
 taplo-common = { workspace = true }
 taplo-lsp    = { workspace = true, default-features = false, optional = true }
 
-anyhow             = { workspace = true }
 clap               = { workspace = true, features = ["derive", "cargo", "env", "default"] }
 codespan-reporting = { workspace = true }
-futures            = { workspace = true }
 glob               = { workspace = true }
-hex                = { workspace = true }
 itertools          = { workspace = true }
-once_cell          = { workspace = true }
-regex              = { workspace = true }
-reqwest            = { workspace = true, features = ["json"], optional = true }
 schemars           = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }
-time               = { workspace = true, features = ["parsing"] }
+thiserror          = { workspace = true }
 toml               = { workspace = true }
 tracing            = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["env-filter"] }
 url                = { workspace = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-lsp-async-stub = { workspace = true, features = ["tokio-tcp", "tokio-stdio"] }
+taplo-lsp-async = { workspace = true, features = ["tokio-tcp", "tokio-stdio"] }
 
-ansi_term     = { workspace = true }
+anstyle       = { workspace = true }
 async-ctrlc   = { workspace = true, features = ["stream"], optional = true }
 clap_complete = { workspace = true, optional = true }
 prettydiff    = { workspace = true, default-features = false }               # `prettydiff` is also a CLI that pulls in `clap` by default
@@ -59,6 +55,8 @@ tokio = { workspace = true, features = ["sync", "parking_lot", "io-util"] }
 
 [dev-dependencies]
 strict-test-support = { workspace = true }
+taplo-test-support  = { workspace = true }
+time                = { workspace = true }
 
 [package.metadata.auto-tag]
 enabled = true

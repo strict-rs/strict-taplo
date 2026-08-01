@@ -12,26 +12,25 @@ repository   = { workspace = true }
 [lib]
 crate-type = ["cdylib"]
 
+[lints]
+workspace = true
+
 [dependencies]
-lsp-async-stub = { workspace = true }
+taplo-lsp-async = { workspace = true, optional = true }
 taplo          = { workspace = true, features = ["serde"] }
 taplo-cli      = { workspace = true, optional = true, default-features = false }
-taplo-common   = { workspace = true, default-features = false, features = ["rustls-tls", "schema", "reqwest"] }
+taplo-common   = { workspace = true, default-features = false, features = ["schema", "reqwest"] }
 taplo-lsp      = { workspace = true, optional = true, default-features = false }
 
-anyhow                   = { workspace = true }
-async-trait              = { workspace = true }
-clap                     = { workspace = true, features = ["derive"] }
+clap                     = { workspace = true, features = ["derive"], optional = true }
 console_error_panic_hook = { workspace = true }
 futures                  = { workspace = true }
-getrandom                = { workspace = true, features = ["wasm_js"] }
-indexmap                 = { workspace = true }
 serde                    = { workspace = true, features = ["derive"] }
 serde-wasm-bindgen       = { workspace = true }
-serde_json               = { workspace = true }
 time                     = { workspace = true, features = ["parsing"] }
 tokio                    = { workspace = true }
-tracing                  = { workspace = true }
+tracing                  = { workspace = true, optional = true }
+thiserror                = { workspace = true }
 url                      = { workspace = true }
 
 # Bump all together since it's a monorepo
@@ -41,5 +40,5 @@ wasm-bindgen-futures = { workspace = true }
 
 [features]
 default = ["cli", "lsp"]
-cli     = ["taplo-cli"]
-lsp     = ["taplo-lsp"]
+cli     = ["dep:clap", "dep:taplo-cli", "dep:tracing"]
+lsp     = ["dep:taplo-lsp-async", "dep:taplo-lsp"]

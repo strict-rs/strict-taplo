@@ -1,3 +1,5 @@
+//! Public command-line argument and subcommand value contracts.
+
 use std::path::PathBuf;
 
 use clap::Args;
@@ -8,11 +10,13 @@ use clap::crate_version;
 #[cfg(feature = "lint")]
 use url::Url;
 
-#[derive(Clone, Parser)]
+/// Top-level Taplo command-line arguments.
+#[derive(Clone, Debug, Parser)]
 #[clap(name = "taplo")]
 #[clap(bin_name = "taplo")]
 #[clap(version = crate_version!())]
 pub struct TaploArgs {
+  /// ANSI color policy for user-facing output.
   #[clap(long, value_enum, global = true, default_value = "auto")]
   pub colors:    Colors,
   /// Enable a verbose logging format.
@@ -21,11 +25,13 @@ pub struct TaploArgs {
   /// Enable logging spans.
   #[clap(long, global = true)]
   pub log_spans: bool,
+  /// Selected Taplo subcommand.
   #[clap(subcommand)]
   pub cmd:       TaploCommand,
 }
 
-#[derive(Clone, Args)]
+/// Options shared by commands that load configuration or use the schema cache.
+#[derive(Clone, Debug, Args)]
 pub struct GeneralArgs {
   /// Path to the Taplo configuration file.
   #[clap(long, short, env = "TAPLO_CONFIG")]
@@ -40,7 +46,8 @@ pub struct GeneralArgs {
   pub no_auto_config: bool,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
+/// ANSI color-selection policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum Colors {
   /// Determine whether to colorize output automatically.
   Auto,
@@ -50,7 +57,8 @@ pub enum Colors {
   Never,
 }
 
-#[derive(Clone, Subcommand)]
+/// Supported Taplo command families.
+#[derive(Clone, Debug, Subcommand)]
 pub enum TaploCommand {
   /// Lint TOML documents.
   #[clap(visible_aliases = &["check", "validate"])]
@@ -67,6 +75,7 @@ pub enum TaploCommand {
   /// Language server operations.
   #[cfg(feature = "lsp")]
   Lsp {
+    /// Language-server transport and shared configuration options.
     #[clap(flatten)]
     cmd: LspCommand,
   },
@@ -74,6 +83,7 @@ pub enum TaploCommand {
   /// Operations with the Taplo config file.
   #[clap(visible_aliases = &["cfg"])]
   Config {
+    /// Configuration operation.
     #[clap(subcommand)]
     cmd: ConfigCommand,
   },
@@ -81,37 +91,39 @@ pub enum TaploCommand {
   /// Extract a value from the given TOML document.
   Get(GetCommand),
 
-  /// Start a decoder for `toml-test` (https://github.com/BurntSushi/toml-test).
+  /// Start a decoder for [`toml-test`](https://github.com/BurntSushi/toml-test).
   #[cfg(feature = "toml-test")]
   TomlTest {},
 
   /// Generate completions for Taplo CLI
   #[cfg(feature = "completions")]
-  Completions { shell: String },
+  Completions {
+    /// Shell whose completion script should be generated.
+    shell: String,
+  },
 }
 
-#[derive(Clone, Args)]
+/// TOML formatting command options.
+#[derive(Clone, Debug, Args)]
 pub struct FormatCommand {
+  /// Shared configuration and cache options.
   #[clap(flatten)]
   pub general: GeneralArgs,
 
   /// A formatter option given as a "key=value", can be set multiple times.
   ///
-  /// The valid options and values are available here: https://taplo.tamasfe.dev/configuration/formatter-options.html
+  /// The valid options and values are documented in the
+  /// [formatter options reference](https://taplo.tamasfe.dev/configuration/formatter-options.html).
   #[clap(long = "option", short)]
   pub options: Vec<String>,
 
-  /// Ignore syntax errors and force formatting.
-  #[clap(long, short)]
-  pub force: bool,
+  /// Input acceptance policy.
+  #[clap(flatten)]
+  pub input: FormatInputPolicy,
 
-  /// Dry-run and report any files that are not correctly formatted.
-  #[clap(long)]
-  pub check: bool,
-
-  /// Print the differences in patch formatting to `stdout`
-  #[clap(long)]
-  pub diff: bool,
+  /// Output and application policy.
+  #[clap(flatten)]
+  pub output: FormatOutputPolicy,
 
   /// Paths or glob patterns to TOML documents.
   ///
@@ -126,18 +138,42 @@ pub struct FormatCommand {
   pub stdin_filepath: Option<String>,
 }
 
+/// Formatting policy for malformed source input.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Args)]
+pub struct FormatInputPolicy {
+  /// Ignore syntax errors and force formatting.
+  #[clap(long, short)]
+  pub force: bool,
+}
+
+/// Formatting output and file-application policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Args)]
+pub struct FormatOutputPolicy {
+  /// Dry-run and report any files that are not correctly formatted.
+  #[clap(long)]
+  pub check: bool,
+
+  /// Print differences in patch formatting to `stdout`.
+  #[clap(long)]
+  pub diff: bool,
+}
+
 #[cfg(feature = "lsp")]
-#[derive(Clone, Args)]
+/// Language-server command options.
+#[derive(Clone, Debug, Args)]
 pub struct LspCommand {
+  /// Shared configuration and cache options.
   #[clap(flatten)]
   pub general: GeneralArgs,
 
+  /// Selected language-server transport.
   #[clap(subcommand)]
   pub io: LspCommandIo,
 }
 
 #[cfg(feature = "lsp")]
-#[derive(Clone, Subcommand)]
+/// Language-server I/O transport.
+#[derive(Clone, Debug, Subcommand)]
 pub enum LspCommandIo {
   /// Run the language server and listen on a TCP address.
   Tcp {
@@ -149,7 +185,8 @@ pub enum LspCommandIo {
   Stdio {},
 }
 
-#[derive(Clone, Subcommand)]
+/// Configuration inspection operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Subcommand)]
 pub enum ConfigCommand {
   /// Print the default `.taplo.toml` configuration file.
   Default,
@@ -158,8 +195,10 @@ pub enum ConfigCommand {
 }
 
 #[cfg(feature = "lint")]
-#[derive(Clone, Args)]
+/// TOML lint and schema-validation command options.
+#[derive(Clone, Debug, Args)]
 pub struct LintCommand {
+  /// Shared configuration and cache options.
   #[clap(flatten)]
   pub general: GeneralArgs,
 
@@ -187,7 +226,8 @@ pub struct LintCommand {
   pub files: Vec<String>,
 }
 
-#[derive(Clone, Args)]
+/// TOML query and output command options.
+#[derive(Clone, Debug, Args)]
 pub struct GetCommand {
   /// The format specifying how the output is printed.
   ///
@@ -235,11 +275,11 @@ pub struct GetCommand {
   ///
   /// Examples:
   ///
-  /// - table.array[1].foo
-  /// - table.array.1.foo
-  /// - table.array[*].foo
-  /// - table.array.*.foo
-  /// - dependencies.tokio-*.version
+  /// - `table.array[1].foo`
+  /// - `table.array.1.foo`
+  /// - `table.array[*].foo`
+  /// - `table.array.*.foo`
+  /// - `dependencies.tokio-*.version`
   pub pattern: Option<String>,
 
   /// A string that separates array values when printing to stdout.
@@ -250,7 +290,8 @@ pub struct GetCommand {
   pub separator: Option<String>,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
+/// Query output representation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum OutputFormat {
   /// Extract the value outputting it in a text format.
   Value,

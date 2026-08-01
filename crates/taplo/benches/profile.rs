@@ -1,3 +1,5 @@
+//! Profile lossless parsing and immutable DOM construction against the representative TOML corpus.
+
 use std::hint::black_box;
 
 use criterion::Criterion;
@@ -7,16 +9,27 @@ use criterion::criterion_main;
 use pprof::criterion::Output;
 #[cfg(unix)]
 use pprof::criterion::PProfProfiler;
+use taplo::parser::Parse;
 use taplo::parser::parse;
 
-pub fn syntax(c: &mut Criterion) {
+/// Register the lossless syntax-parsing benchmark and return its Criterion handle.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the named syntax benchmark is a distinct Criterion registration target for parser-only profiling"
+)]
+fn syntax(criterion: &mut Criterion) -> &mut Criterion {
   let source = include_str!("../../../test-data/example.toml");
-  c.bench_function("parse-toml", |b| b.iter(|| parse(black_box(source))));
+  criterion.bench_function("parse-toml", |bencher| bencher.iter(|| parse(black_box(source))))
 }
 
-pub fn dom(c: &mut Criterion) {
+/// Register the parsing-plus-DOM benchmark and return its Criterion handle.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the named DOM benchmark is a distinct Criterion registration target for semantic-tree profiling"
+)]
+fn dom(criterion: &mut Criterion) -> &mut Criterion {
   let source = include_str!("../../../test-data/example.toml");
-  c.bench_function("toml-dom", |b| b.iter(|| parse(black_box(source)).into_dom()));
+  criterion.bench_function("toml-dom", |bencher| bencher.iter(|| parse(black_box(source)).map(Parse::into_dom)))
 }
 
 #[cfg(unix)]

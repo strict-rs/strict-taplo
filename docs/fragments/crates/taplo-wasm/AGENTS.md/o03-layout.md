@@ -1,4 +1,4 @@
 ## Layout
 
-- `environment.rs` — `WasmEnvironment`, the `taplo_common::environment::Environment` implementation backed by a JS-provided interface (filesystem, clock, stdio, HTTP).
-- `lsp.rs` — `TaploWasmLsp` and `WasmLspInterface`, bridging `taplo-lsp` messages to JS.
+- `environment.rs` — `WasmEnvironment`, a fallibly constructed `Environment + LocalEnvironment` backed by validated JS callbacks. Missing functions, thrown/rejected calls, invalid return types, malformed timestamps, and serialization failures remain typed.
+- `lsp.rs` — `TaploWasmLsp` and `WasmLspInterface`, bridging the local `taplo-lsp` runtime to JavaScript without unsafe `Send`/`Sync` declarations.

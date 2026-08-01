@@ -1,0 +1,52 @@
+name: Continuous integration
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - release-*
+    paths-ignore:
+      - "site/**/*"
+  workflow_dispatch: {}
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  standard:
+    name: Standard repository gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+      - name: Install template command
+        run: cargo install --git https://github.com/takumi-earth/rust-template.git --branch main --locked template-cli
+      - name: Initialize repository tooling
+        run: template init
+      - name: Run canonical CI
+        run: template ci
+
+  taplo_extensions:
+    name: Taplo-specific gates
+    needs:
+      - standard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+      - name: Install template command
+        run: cargo install --git https://github.com/takumi-earth/rust-template.git --branch main --locked template-cli
+      - name: Initialize repository tooling
+        run: template init
+      - name: Run TOML 1.1 conformance
+        run: just x toml-conformance
+      - name: Compile the WASM feature matrix
+        run: just x wasm-matrix
+      - name: Build JavaScript wrappers
+        run: just x js-build
+      - name: Check Taplo self-formatting
+        run: just x taplo-self-format

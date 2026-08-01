@@ -2,7 +2,7 @@
 
 # taplo-cli
 
-The `taplo` binary and the library behind it. Depends on `taplo`, `taplo-common`, and (optionally) `taplo-lsp`; generic over `taplo_common::environment::Environment` so the CLI logic is reused by `taplo-wasm`.
+The `taplo` binary and the typed library boundary behind it. Depends on `taplo`, `taplo-common`, and (optionally) `taplo-lsp`; native execution uses `ConcurrentEnvironment` and the concurrent LSP server, while the reusable non-LSP command logic remains available to the local WASM adapter.
 
 ## Layout
 
@@ -26,8 +26,8 @@ Read exact versions from `Cargo.toml`.
 
 ## toml-test conformance harness
 
-The `toml-test` subcommand reads TOML on stdin and emits toml-test's tagged JSON, driving the external decoder-conformance suite. Build the decoder with `cargo build --bin taplo --no-default-features --features "rustls-tls,toml-test"`. The repo's CI runs it against `toml-test`; consult `.github/workflows/ci.yaml` for the `-toml` version and skip-list before changing parser behavior.
+The `toml-test` subcommand reads TOML on stdin and emits `toml-test`'s tagged JSON. `just x toml-conformance` owns the checksum-verified pinned runner and requires the TOML 1.1 suite to pass without a permanent skip list. A newly incompatible upstream case is a stop-and-review decision, not a silent exclusion.
 
 ## Self-formatting (dogfood)
 
-The CLI formats this repo's own TOML per the root `taplo.toml`, and CI asserts `taplo fmt --check` produces no diff. After changing formatter output, run `cargo run -- fmt` and commit the reformatted TOML — formatting is expected to be idempotent.
+The CLI formats this repo's own TOML per the root `taplo.toml`. `just x taplo-self-format` runs the repository-owned dogfood check through the guarded extension surface; successful formatting must remain idempotent.

@@ -1,16 +1,9 @@
-## Source of most of the invalid/valid tests:
+# TOML behavior fixtures
 
-These are the spec tests for TOML used by @iarna/toml.
+The `invalid/` corpus contains TOML source that must produce at least one recoverable parser or semantic DOM diagnostic. The library still constructs a lossless syntax tree for every fixture so editor recovery remains exercised.
 
-The errors folder contains TOML files that should cause a parser to report an error.
+The `valid/` corpus contains representative TOML 1.1 documents that must produce neither parser nor semantic DOM diagnostics. It covers scalar forms, strings, dotted keys, tables, inline tables, arrays, arrays of tables, comments, and Unicode.
 
-The values folder contains TOML files and paired YAML or JSON files.  The
-YAML files should parse to a structure that's deeply equal to the TOML
-structure.  The JSON files match the patterns found in [BurntSushi 0.4 TOML
-tests](https://github.com/BurntSushi/toml-test#json-encoding).
+The `taplo` crate discovers both directories at test runtime, filters for `.toml` files, sorts the paths deterministically, and evaluates every fixture. The corpus is deliberately data-driven; do not regenerate a compiled Rust module from these files.
 
-We introduce the following new types to match TOML 0.5.0:
-
-* _datetime-local_ - A datetime without a timezone. Floating.
-* _date_ - A date without any time component
-* _time_ - A time without any date component
+The `analytics/` and `rewrite/` directories remain owned by their existing specialized behavior suites. Full TOML language conformance is exercised separately by the checksum-pinned `just x toml-conformance` repository extension.

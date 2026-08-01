@@ -4,5 +4,5 @@
 # Rolling stable: `stable` resolves to whatever `rustup update stable` last
 # pulled. No MSRV pin — the template tracks the current stable toolchain.
 channel    = "stable"
-profile    = "minimal"
 components = ["rustfmt", "clippy", "rust-src"]
+targets    = ["wasm32-unknown-unknown"]

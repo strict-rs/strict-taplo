@@ -5,37 +5,35 @@ version      = { workspace = true }
 rust-version = { workspace = true }
 categories   = ["parser-implementations", "parsing"]
 keywords     = ["toml", "parser", "formatter", "linter"]
-readme       = false
+readme       = "../../README.md"
 authors      = { workspace = true }
 edition      = { workspace = true }
 homepage     = { workspace = true }
 license      = { workspace = true }
 repository   = { workspace = true }
 
+[lints]
+workspace = true
+
 [features]
 default = ["serde"]
 schema  = ["schemars"]
 
 [dependencies]
-arc-swap   = { workspace = true }
-either     = { workspace = true }
 globset    = { workspace = true }
 itertools  = { workspace = true }
 logos      = { workspace = true }
-once_cell  = { workspace = true }
 rowan      = { workspace = true }
 serde_json = { workspace = true }
 thiserror  = { workspace = true }
 time       = { workspace = true, features = ["parsing", "formatting", "macros"] }
-tracing    = { workspace = true }
 
 schemars = { workspace = true, optional = true }
 serde    = { workspace = true, features = ["derive"], optional = true }
 
 [dev-dependencies]
-assert-json-diff = { workspace = true }
 criterion        = { workspace = true }   # criterion -> clap
-difference       = { workspace = true }
+proptest         = { workspace = true }
 serde_json       = { workspace = true }
 strict-test-support = { workspace = true }
 toml             = { workspace = true }

@@ -1,19 +1,29 @@
-fn main() {
+//! Demonstrates the distinction between fatal tree construction failures and recoverable TOML
+//! diagnostics.
+
+use taplo::parser::ParseFailure;
+use taplo::parser::parse;
+
+/// Parse one document, inspect its recoverable diagnostics, and freeze its DOM.
+///
+/// # Errors
+///
+/// Returns [`ParseFailure`] when the lossless syntax tree cannot be constructed.
+fn main() -> Result<(), ParseFailure> {
   const SOURCE: &str = "value = 1
 value = 2
 
 [table]
 string = 'some string'";
 
-  let parse_result = taplo::parser::parse(SOURCE);
+  let parse_result = parse(SOURCE)?;
 
-  // Check for syntax errors.
-  // These are not carried over to DOM errors.
-  assert!(parse_result.errors.is_empty());
+  // Recoverable syntax diagnostics are available separately from a fatal tree-construction
+  // failure.
+  let _syntax_diagnostics = parse_result.diagnostics();
 
-  // let root_node = parse_result.into_dom();
+  // DOM construction remains available for syntactically imperfect documents.
+  let _root_node = parse_result.into_dom();
 
-  // Check for semantic errors.
-  // In this example "value" is a duplicate key.
-  // assert_eq!(root_node.errors().len(), 1);
+  Ok(())
 }

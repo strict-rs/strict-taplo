@@ -1,0 +1,16 @@
+string = "TOML"
+literal = 'C:\Users\nodejs\templates'
+integer = 42
+negative = -17
+hexadecimal = 0xDEAD_BEEF
+octal = 0o755
+binary = 0b1101_0010
+float = 6.626e-34
+positive_infinity = inf
+negative_infinity = -inf
+not_a_number = nan
+enabled = true
+offset_datetime = 1979-05-27T07:32:00-08:00
+local_datetime = 1979-05-27T07:32:00
+local_date = 1979-05-27
+local_time = 07:32:00
