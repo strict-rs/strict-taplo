@@ -22,8 +22,8 @@ taplo-common = { version = "0.16.0", path = "crates/taplo-common", default-featu
 taplo-lsp    = { version = "0.16.0", path = "crates/taplo-lsp", default-features = false }
 taplo-test-support = { version = "0.16.0", path = "crates/taplo-test-support" }
 
-clap               = { version = "4.6.2", default-features = false, features = ["std"] }
-futures            = { version = "0.3.33" }
+clap               = { version = "4.6.6", default-features = false, features = ["std"] }
+futures            = { version = "0.3.34" }
 getrandom          = { version = "0.4", default-features = false }
 glob               = { version = "0.3" }
 globset            = "0.4"
@@ -35,13 +35,13 @@ parking_lot        = "0.12"
 regex              = { version = "1.13" }
 reqwest            = { version = "0.13.4", default-features = false }
 rowan              = { version = "0.17.0", git = "https://github.com/strict-rs/strict-rowan.git", branch = "strict"}
-schemars           = { version = "1.2.1" }
+schemars           = { version = "1.2.2" }
 serde              = { version = "1" }
 serde_json         = "1"
 sha1               = { version = "0.11.0" }
 thiserror          = { version = "2", git = "https://github.com/strict-rs/strict-thiserror.git", branch = "upgrade"}
-time               = { version = "0.3.53" }
-tokio              = { version = "1.53.0", default-features = false }
+time               = { version = "0.3.55" }
+tokio              = { version = "1.53.1", default-features = false }
 toml               = "1.1"
 tracing            = { version = "0.4.0", git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict"}
 tracing-subscriber = { version = "0.4.0", git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict"}
@@ -51,11 +51,11 @@ url                = { version = "2.5.8" }
 logos      = { version = "0.17.0", git = "https://github.com/strict-rs/strict-logos.git", branch = "upgrade" }
 codespan-reporting = { version = "0.13.1" }
 async-ctrlc   = { version = "1.2.0", features = ["stream"] }
-clap_complete = { version = "4.6.7" }
+clap_complete = { version = "4.6.9" }
 prettydiff    = { version = "0.9.0", default-features = false }               # `prettydiff` is also a CLI that pulls in `clap` by default
 json_value_merge   = { version = "2.0.1" }
-jsonschema         = { version = "0.48.1", default-features = false }
-lru                = { version = "0.18.1" }
+jsonschema         = { version = "0.49.9", default-features = false }
+lru                = { version = "0.18.2" }
 percent-encoding   = { version = "2.3.2" }
 rustls             = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 semver             = { version = "1.0.28", features = ["serde"] }
@@ -63,9 +63,9 @@ figment     = { version = "0.10.19", features = ["json"] }
 console_error_panic_hook = { version = "0.1.7" }
 serde-wasm-bindgen       = { version = "0.6.5" }
 # Bump all together since it's a monorepo
-js-sys               = { version = "0.3.103" }
-wasm-bindgen         = { version = "0.2.126" }
-wasm-bindgen-futures = { version = "0.4.76" }
+js-sys               = { version = "0.3.104" }
+wasm-bindgen         = { version = "0.2.127" }
+wasm-bindgen-futures = { version = "0.4.77" }
 
 # Consolidated Dev Deps
 criterion        = { version = "0.8" }   # criterion -> clap
