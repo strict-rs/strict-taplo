@@ -457,8 +457,8 @@ mod tests {
   /// Construct and prepare one configuration fixture at the shared workspace root.
   fn prepared_config(global_options: Options, rule: Vec<Rule>) -> Result<Config, TestFailure> {
     let mut config = Config {
-      global_options,
       rule,
+      global_options,
       ..Config::default()
     };
     ensure_result(

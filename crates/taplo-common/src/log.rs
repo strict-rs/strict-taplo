@@ -109,6 +109,11 @@ where
 /// Returns [`EnvironmentError`] when terminal or environment-variable host
 /// facts cannot be read.
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(
+  clippy::single_call_fn,
+  reason = "the native logging entry point owns the blocking-writer adapter that binds process-wide tracing to the host environment's \
+            asynchronous stderr"
+)]
 pub fn setup_stderr_logging(
   environment: &(impl Environment + Send + Sync),
   spans: bool,
@@ -216,8 +221,10 @@ where
   })
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
+  use std::io::Error as IoError;
   use std::io::ErrorKind;
   use std::io::Write as _;
 
@@ -226,6 +233,7 @@ mod tests {
   use strict_test_support::ensure_contains;
   use strict_test_support::ensure_eq;
   use strict_test_support::ensure_ok;
+  use tokio::runtime::Builder;
 
   use super::BlockingWrite;
   use super::install_stderr_logging;
@@ -251,11 +259,11 @@ mod tests {
 
     environment.set_stdout_failure(true);
     ensure(
-      writer.write(b"blocked").as_ref().err().map(std::io::Error::kind) == Some(ErrorKind::PermissionDenied),
+      writer.write(b"blocked").as_ref().err().map(IoError::kind) == Some(ErrorKind::PermissionDenied),
       "the blocking writer must preserve the asynchronous stream failure kind",
     )?;
     ensure(
-      writer.flush().as_ref().err().map(std::io::Error::kind) == Some(ErrorKind::PermissionDenied),
+      writer.flush().as_ref().err().map(IoError::kind) == Some(ErrorKind::PermissionDenied),
       "the blocking writer must preserve flush failures independently",
     )?;
 
@@ -316,7 +324,7 @@ mod tests {
     )?;
 
     let runtime = ensure_ok(
-      tokio::runtime::Builder::new_current_thread().enable_all().build(),
+      Builder::new_current_thread().enable_all().build(),
       "the native logging test runtime must initialize",
     )?;
     let native_environment = NativeEnvironment::from_handle(runtime.handle().clone());

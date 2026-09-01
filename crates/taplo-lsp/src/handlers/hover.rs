@@ -63,6 +63,7 @@ macro_rules! define_hover_future_family {
     ///
     /// Returns [`RpcError`] when parameters, coordinates, schema data, serialization, or snapshot
     /// freshness cannot be validated.
+    #[allow(clippy::single_call_fn, reason = "one hover entry point per execution family, registered exactly once by its runtime family")]
     pub(super) fn $hover<E: $environment>(
       world: &WorldState<E, $transport<E>>,
       params: Params<HoverParams>,
@@ -288,6 +289,7 @@ mod tests {
   use super::is_primitive;
   use super::key_documentation;
   use super::primitive_documentation;
+  use crate::LocalTestFuture;
   use crate::handlers::test_support::SchemaFixture;
   use crate::handlers::test_support::concurrent_world;
   use crate::handlers::test_support::install_schema_document;
@@ -331,56 +333,62 @@ mod tests {
   }
 
   /// Install one local hover document together with its exact manual schema association.
-  async fn prepared_local_hover_world(fixture: &SchemaFixture) -> Result<LocalWorld<TestEnvironment>, TestFailure> {
-    let world = local_world()?;
-    install_schema_document(
-      replace_local_document(&world, &fixture.document, HOVER_SOURCE, "the local hover document must install"),
-      world.document_snapshot(&fixture.document),
-      &fixture.document,
-      &fixture.schema_url,
-      hover_schema(),
-      "the local hover document must expose a snapshot",
-    )
-    .await?;
-    Ok(world)
+  fn prepared_local_hover_world(fixture: &SchemaFixture) -> LocalTestFuture<'_, LocalWorld<TestEnvironment>> {
+    Box::pin(async move {
+      let world = local_world()?;
+      install_schema_document(
+        replace_local_document(&world, &fixture.document, HOVER_SOURCE, "the local hover document must install"),
+        world.document_snapshot(&fixture.document),
+        &fixture.document,
+        &fixture.schema_url,
+        hover_schema(),
+        "the local hover document must expose a snapshot",
+      )
+      .await?;
+      Ok(world)
+    })
   }
 
   /// Execute one local hover request through its complete public wire representation.
-  async fn local_hover_at(
-    world: &LocalWorld<TestEnvironment>,
-    document: &Url,
+  fn local_hover_at<'operation>(
+    world: &'operation LocalWorld<TestEnvironment>,
+    document: &'operation Url,
     line: u32,
     character: u32,
     context: &'static str,
-  ) -> Result<Option<Hover>, TestFailure> {
-    ensure_ok(
-      hover_local(
-        world,
-        Params::from(Some(position_params::<HoverParams>(
-          document,
-          line,
-          character,
-          "the hover request fixture must decode",
-        )?)),
+  ) -> LocalTestFuture<'operation, Option<Hover>> {
+    Box::pin(async move {
+      ensure_ok(
+        hover_local(
+          world,
+          Params::from(Some(position_params::<HoverParams>(
+            document,
+            line,
+            character,
+            "the hover request fixture must decode",
+          )?)),
+        )
+        .await,
+        context,
       )
-      .await,
-      context,
-    )
+    })
   }
 
   /// Execute one local hover request and require concrete content.
-  async fn required_local_hover_at(
-    world: &LocalWorld<TestEnvironment>,
-    document: &Url,
+  fn required_local_hover_at<'operation>(
+    world: &'operation LocalWorld<TestEnvironment>,
+    document: &'operation Url,
     line: u32,
     character: u32,
     execution_context: &'static str,
     presence_context: &'static str,
-  ) -> Result<Hover, TestFailure> {
-    ensure_some(
-      local_hover_at(world, document, line, character, execution_context).await?,
-      presence_context,
-    )
+  ) -> LocalTestFuture<'operation, Hover> {
+    Box::pin(async move {
+      ensure_some(
+        local_hover_at(world, document, line, character, execution_context).await?,
+        presence_context,
+      )
+    })
   }
 
   /// Construct the complete schema shared by both hover execution families.
@@ -434,6 +442,11 @@ mod tests {
   }
 
   /// Require one hover to retain exact Markdown regardless of its selected primitive range.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the name distinguishes this assertion from `ensure_hover_content_and_range`, marking the expectations that deliberately pin \
+              documentation without pinning a primitive's selected range"
+  )]
   fn ensure_hover_content(hover: &Hover, expected_content: &str, context: &'static str) -> Result<(), TestFailure> {
     ensure(
       hover_observation(hover).is_some_and(|observation| observation.0 == expected_content),
@@ -672,11 +685,10 @@ mod tests {
           &local, &fixture.document, expectation.line, expectation.character, expectation.execution_context, expectation.presence_context,
         )
         .await?;
-        if let Some(expected_range) = expectation.range {
-          ensure_hover_content_and_range(&hover, expectation.content, expected_range, expectation.assertion_context)?;
-        } else {
-          ensure_hover_content(&hover, expectation.content, expectation.assertion_context)?;
-        }
+        expectation.range.map_or_else(
+          || ensure_hover_content(&hover, expectation.content, expectation.assertion_context),
+          |expected_range| ensure_hover_content_and_range(&hover, expectation.content, expected_range, expectation.assertion_context),
+        )?;
       }
       Ok(())
     })

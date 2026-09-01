@@ -712,6 +712,10 @@ mod tests {
 
   #[cfg(feature = "tokio-stdio")]
   /// Reject one independently executing transport notification.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the rejecting handler fixture names the failing-notification contract exercised by the handler-failure test"
+  )]
   fn reject_transport_work(_context: ConcurrentContext<()>, _params: Params<()>) -> Ready<Result<(), ServerError>> {
     ready(Err(ServerError::ExitBeforeShutdown))
   }

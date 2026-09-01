@@ -1183,6 +1183,10 @@ impl<'p> Parser<'p> {
 }
 
 /// Return whether one signed or unsigned decimal component has forbidden leading zeroes.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the named predicate owns the signed and unsigned leading-zero rule shared by integer and float validation"
+)]
 fn is_zero_padded(source: &str) -> bool {
   (source.starts_with('0') && source != "0") || (source.starts_with("+0") && source != "+0") || (source.starts_with("-0") && source != "-0")
 }

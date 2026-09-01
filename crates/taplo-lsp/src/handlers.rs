@@ -235,6 +235,7 @@ mod test_support {
   use taplo_common::schema::transport::local_http_client;
   use url::Url;
 
+  use crate::LocalTestFuture;
   #[cfg(not(target_arch = "wasm32"))]
   use crate::world::ConcurrentWorld;
   use crate::world::DocumentSnapshot;
@@ -326,6 +327,11 @@ mod test_support {
   }
 
   /// Decode one rename request through its public wire shape.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the named decoder marks rename as the one positioned request that also carries `newName`, so its wire shape stays distinct \
+              from `position_params` over the shared builder"
+  )]
   pub(super) fn rename_params<P: DeserializeOwned>(
     document: &Url,
     line: u32,
@@ -337,14 +343,16 @@ mod test_support {
   }
 
   /// Install one source revision in a local handler world.
-  pub(super) async fn replace_local_document(
-    world: &LocalWorld<TestEnvironment>,
-    document: &Url,
-    source: &str,
+  pub(super) fn replace_local_document<'operation>(
+    world: &'operation LocalWorld<TestEnvironment>,
+    document: &'operation Url,
+    source: &'operation str,
     context: &'static str,
-  ) -> Result<(), TestFailure> {
-    drop(ensure_ok(world.replace_document(document, source).await, context)?);
-    Ok(())
+  ) -> LocalTestFuture<'operation, ()> {
+    Box::pin(async move {
+      drop(ensure_ok(world.replace_document(document, source).await, context)?);
+      Ok(())
+    })
   }
 
   /// Install one source revision in a concurrent handler world.
@@ -365,6 +373,11 @@ mod test_support {
   }
 
   /// Install one exact manual association and its complete in-memory schema.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the named fixture keeps the exact-URL association and its schema body installed together, so no scenario can associate a \
+              schema URL whose document is never resolvable"
+  )]
   pub(super) fn install_schema<T: SchemaTransport>(snapshot: &DocumentSnapshot<T>, document: &Url, schema_url: &Url, schema: Value) {
     snapshot
       .schemas
@@ -380,14 +393,14 @@ mod test_support {
   /// Commit one source replacement, then install its schema into the resulting snapshot.
   pub(super) async fn install_schema_document<T: SchemaTransport>(
     replacement: impl Future<Output = Result<(), TestFailure>>,
-    snapshot: impl Future<Output = Option<DocumentSnapshot<T>>>,
+    pending_snapshot: impl Future<Output = Option<DocumentSnapshot<T>>>,
     document: &Url,
     schema_url: &Url,
     schema: Value,
     snapshot_context: &'static str,
   ) -> Result<(), TestFailure> {
     replacement.await?;
-    let snapshot = ensure_some(snapshot.await, snapshot_context)?;
+    let snapshot = ensure_some(pending_snapshot.await, snapshot_context)?;
     install_schema(&snapshot, document, schema_url, schema);
     Ok(())
   }
@@ -485,6 +498,11 @@ mod uri;
 
 /// Construct the current-thread server from the shared handler registry.
 #[must_use]
+#[allow(
+  clippy::single_call_fn,
+  reason = "one of the crate's four documented public entry points; its consumer contract is the published `taplo-lsp` API, not the \
+            in-crate call count"
+)]
 pub fn create_local_server<E: LocalEnvironment>() -> LocalServer<LocalWorld<E>> {
   runtime::create_local_server()
 }
@@ -492,6 +510,11 @@ pub fn create_local_server<E: LocalEnvironment>() -> LocalServer<LocalWorld<E>> 
 /// Construct the native multi-threaded server from the shared handler registry.
 #[cfg(not(target_arch = "wasm32"))]
 #[must_use]
+#[allow(
+  clippy::single_call_fn,
+  reason = "one of the crate's four documented public entry points; its consumer contract is the published `taplo-lsp` API, not the \
+            in-crate call count"
+)]
 pub fn create_concurrent_server<E: ConcurrentEnvironment>() -> ConcurrentServer<ConcurrentWorld<E>> {
   runtime::create_concurrent_server()
 }
@@ -531,6 +554,7 @@ mod tests {
   use super::semantic_tokens::semantic_tokens_concurrent;
   use super::semantic_tokens::semantic_tokens_local;
   use super::uri;
+  use crate::LocalTestFuture;
   use crate::handlers::test_support::concurrent_world;
   use crate::handlers::test_support::local_world as handler_local_world;
   use crate::handlers::test_support::replace_concurrent_document;
@@ -556,15 +580,15 @@ mod tests {
 
   /// Resolve one document projection through both generated handler families.
   async fn projection_pair<R>(
-    local: impl Future<Output = Result<Option<R>, RpcError>>,
-    concurrent: impl Future<Output = Result<Option<R>, RpcError>>,
+    pending_local: impl Future<Output = Result<Option<R>, RpcError>>,
+    pending_concurrent: impl Future<Output = Result<Option<R>, RpcError>>,
     local_execution: &'static str,
     local_presence: &'static str,
     concurrent_execution: &'static str,
     concurrent_presence: &'static str,
   ) -> Result<(R, R), TestFailure> {
-    let local = ensure_some(ensure_ok(local.await, local_execution)?, local_presence)?;
-    let concurrent = ensure_some(ensure_ok(concurrent.await, concurrent_execution)?, concurrent_presence)?;
+    let local = ensure_some(ensure_ok(pending_local.await, local_execution)?, local_presence)?;
+    let concurrent = ensure_some(ensure_ok(pending_concurrent.await, concurrent_execution)?, concurrent_presence)?;
     Ok((local, concurrent))
   }
 
@@ -621,22 +645,24 @@ mod tests {
   }
 
   /// Install the same projection source through both public world execution families.
-  async fn projection_fixture() -> Result<ProjectionFixture, TestFailure> {
-    let document = document_url()?;
-    let local = handler_local_world()?;
-    replace_local_document(&local, &document, PROJECTION_SOURCE, "the local projection document must install").await?;
-    let concurrent = concurrent_world()?;
-    replace_concurrent_document(
-      &concurrent,
-      &document,
-      PROJECTION_SOURCE,
-      "the concurrent projection document must install",
-    )
-    .await?;
-    Ok(ProjectionFixture {
-      document,
-      local,
-      concurrent,
+  fn projection_fixture() -> LocalTestFuture<'static, ProjectionFixture> {
+    Box::pin(async {
+      let document = document_url()?;
+      let local = handler_local_world()?;
+      replace_local_document(&local, &document, PROJECTION_SOURCE, "the local projection document must install").await?;
+      let concurrent = concurrent_world()?;
+      replace_concurrent_document(
+        &concurrent,
+        &document,
+        PROJECTION_SOURCE,
+        "the concurrent projection document must install",
+      )
+      .await?;
+      Ok(ProjectionFixture {
+        document,
+        local,
+        concurrent,
+      })
     })
   }
 
@@ -759,7 +785,7 @@ mod tests {
         "array and inline-table keys must produce the two advertised custom semantic tokens",
       )?;
       ensure(
-        (local_symbols.len(), concurrent_symbols) == (3, local_symbols.clone()),
+        (local_symbols.len(), &concurrent_symbols) == (3, &local_symbols),
         "local and concurrent symbols must preserve the same three root declarations and nested structure",
       )?;
       ensure(

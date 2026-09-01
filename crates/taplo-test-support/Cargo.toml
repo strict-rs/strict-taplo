@@ -4,7 +4,7 @@ description  = "Private deterministic host capabilities for Taplo workspace beha
 version      = { workspace = true }
 rust-version = { workspace = true }
 authors      = { workspace = true }
-edition      = { workspace = true }
+edition = { workspace = true }
 homepage     = { workspace = true }
 license      = { workspace = true }
 repository   = { workspace = true }

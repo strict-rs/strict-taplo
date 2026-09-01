@@ -66,6 +66,7 @@ macro_rules! define_link_future_family {
     ///
     /// Returns [`RpcError`] when parameters, schema data, URL conversion, source coordinates, or
     /// snapshot freshness cannot be validated.
+    #[allow(clippy::single_call_fn, reason = "one document-link entry point per execution family, registered exactly once by its runtime family")]
     pub(super) fn $links<E: $environment>(
       world: &WorldState<E, $transport<E>>,
       params: Params<DocumentLinkParams>,
@@ -166,6 +167,7 @@ mod tests {
   use super::key_document_links;
   use super::links_concurrent;
   use super::links_local;
+  use crate::LocalTestFuture;
   use crate::handlers::test_support::SchemaFixture;
   use crate::handlers::test_support::concurrent_world;
   use crate::handlers::test_support::install_schema_document;
@@ -221,39 +223,43 @@ mod tests {
   }
 
   /// Enable standalone schema links in one local handler world.
-  async fn enable_local_links(world: &LocalWorld<TestEnvironment>) -> Result<(), TestFailure> {
-    drop(ensure_ok(
-      world.apply_configuration_values_local(Some(&link_configuration()), &[]).await,
-      "the local document-link policy must commit",
-    )?);
-    Ok(())
+  fn enable_local_links(world: &LocalWorld<TestEnvironment>) -> LocalTestFuture<'_, ()> {
+    Box::pin(async move {
+      drop(ensure_ok(
+        world.apply_configuration_values_local(Some(&link_configuration()), &[]).await,
+        "the local document-link policy must commit",
+      )?);
+      Ok(())
+    })
   }
 
   /// Execute one fully configured local link projection.
-  async fn configured_local_links(fixture: &SchemaFixture) -> Result<Vec<DocumentLink>, TestFailure> {
-    let world = local_world()?;
-    enable_local_links(&world).await?;
-    install_schema_document(
-      replace_local_document(
-        &world,
+  fn configured_local_links(fixture: &SchemaFixture) -> LocalTestFuture<'_, Vec<DocumentLink>> {
+    Box::pin(async move {
+      let world = local_world()?;
+      enable_local_links(&world).await?;
+      install_schema_document(
+        replace_local_document(
+          &world,
+          &fixture.document,
+          LINK_SOURCE,
+          "the configured local document-link source must install",
+        ),
+        world.document_snapshot(&fixture.document),
         &fixture.document,
-        LINK_SOURCE,
-        "the configured local document-link source must install",
-      ),
-      world.document_snapshot(&fixture.document),
-      &fixture.document,
-      &fixture.schema_url,
-      link_schema(),
-      "the configured local document must expose a snapshot",
-    )
-    .await?;
-    ensure_some(
-      ensure_ok(
-        links_local(&world, Params::from(Some(link_params(&fixture.document)?))).await,
-        "configured local standalone-link generation must execute",
-      )?,
-      "enabled local standalone links must return a concrete collection",
-    )
+        &fixture.schema_url,
+        link_schema(),
+        "the configured local document must expose a snapshot",
+      )
+      .await?;
+      ensure_some(
+        ensure_ok(
+          links_local(&world, Params::from(Some(link_params(&fixture.document)?))).await,
+          "configured local standalone-link generation must execute",
+        )?,
+        "enabled local standalone links must return a concrete collection",
+      )
+    })
   }
 
   /// Decode one document-link request through its public wire shape.
@@ -269,6 +275,11 @@ mod tests {
   }
 
   /// Extract the first real key from one parsed document path.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the named fixture keeps the parse, path decode, and DOM existence check together, so link ranges are asserted against a key \
+              that provably exists in the fixture tree"
+  )]
   fn key(source: &str, path: &str) -> Result<Key, TestFailure> {
     let dom = ensure_ok(parser::parse(source), "the document-link fixture tree must build")?.into_dom();
     let keys: Keys = path.parse().map_err(|error: QueryError| TestFailure::WasErr {

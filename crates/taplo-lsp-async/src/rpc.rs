@@ -519,6 +519,10 @@ pub struct RpcError {
 impl RpcError {
   /// Construct a custom error with code zero.
   #[must_use]
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the named constructor is the custom-error entry point paired with with_code and with_details"
+  )]
   pub fn new(message: impl Into<String>) -> Self {
     Self {
       code:    0,
@@ -593,6 +597,10 @@ impl RpcError {
 
   /// Construct the LSP content-modified error.
   #[must_use]
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the named content-modified constructor exposes the standard LSP code and message as a stable protocol API"
+  )]
   pub fn content_modified() -> Self {
     Self::standard(-32801, "Content modified")
   }

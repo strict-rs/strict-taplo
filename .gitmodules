@@ -2,3 +2,7 @@
 	path = .agents/plugins/rust-template-core
 	url = https://github.com/earthlings-dev/agentic-plugin-rust-template.git
 	branch = main
+[submodule ".agents/plugins/strict-adoption"]
+	path = .agents/plugins/strict-adoption
+	url = https://github.com/earthlings-dev/agentic-plugin-strict-adoption.git
+	branch = main

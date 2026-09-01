@@ -60,6 +60,10 @@ macro_rules! define_workspace_future_family {
     ///
     /// Returns [`WorkspaceChangeError`] when a URI, topology mutation, workspace initialization,
     /// or diagnostics refresh fails.
+    #[allow(
+      clippy::single_call_fn,
+      reason = "one workspace-folder transition per execution family, registered exactly once by its runtime family"
+    )]
     pub(super) fn $workspace_change<E: $environment>(
       world: &WorldState<E, $transport<E>>,
       params: DidChangeWorkspaceFoldersParams,
@@ -72,6 +76,11 @@ macro_rules! define_workspace_future_family {
     }
 
     /// Deduplicate moved documents and collect stable post-mutation effects.
+    #[allow(
+      clippy::single_call_fn,
+      reason = "the named continuation isolates moved-document deduplication and the post-mutation diagnostics sweep from the topology \
+                mutation that produced them"
+    )]
     fn $finish_change<E: $environment>(
       world: &WorldState<E, $transport<E>>,
       associations: Vec<DidChangeSchemaAssociationParams>,
@@ -223,7 +232,7 @@ mod tests {
           &concurrent_effects.diagnostics,
           "an empty concurrent workspace change must publish no client effects",
         )?;
-      }
+      };
       Ok(())
     })
   }

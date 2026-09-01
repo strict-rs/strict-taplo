@@ -10,6 +10,7 @@ use lsp_types::TextEdit;
 use lsp_types::WorkspaceEdit;
 use taplo::dom::KeyOrIndex;
 use taplo::dom::Keys;
+use taplo::dom::Node;
 use taplo::dom::rewrite::PendingPatchKind;
 use taplo::dom::rewrite::Rewrite;
 use taplo::syntax::SyntaxKind;
@@ -48,6 +49,7 @@ macro_rules! define_rename_future_family {
     ///
     /// Returns an RPC error when request parameters, source coordinates, or snapshot freshness
     /// cannot be validated.
+    #[allow(clippy::single_call_fn, reason = "one prepare-rename entry point per execution family, registered exactly once by its runtime family")]
     pub(super) fn $prepare_rename<E: $environment>(
       world: &WorldState<E, $transport<E>>,
       params: Params<TextDocumentPositionParams>,
@@ -69,6 +71,7 @@ macro_rules! define_rename_future_family {
     ///
     /// Returns an RPC error when request parameters, source coordinates, rewrite construction, or
     /// snapshot freshness cannot be validated.
+    #[allow(clippy::single_call_fn, reason = "one rename entry point per execution family, registered exactly once by its runtime family")]
     pub(super) fn $rename<E: $environment>(
       world: &WorldState<E, $transport<E>>,
       params: Params<RenameParams>,
@@ -102,7 +105,7 @@ struct RenameTarget {
   /// Identifier selected at the cursor.
   syntax:     SyntaxToken,
   /// Narrowest semantic node that owns the identifier.
-  dom_node:   Option<(Keys, taplo::dom::Node)>,
+  dom_node:   Option<(Keys, Node)>,
   /// Table-header key containing the identifier, when present.
   header_key: Option<SyntaxNode>,
 }
@@ -192,6 +195,11 @@ fn rename_document(
 }
 
 /// Whether tolerant syntax exposes a header key without a complete enclosing header.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the name states the tolerant-parse rule that a header key outside a complete `[table]` or `[[array]]` header is not a rename \
+            target, which the three-predicate expression alone does not convey"
+)]
 fn header_is_incomplete(query: &Query) -> bool {
   query.header_key().is_some() && !query.in_table_header() && !query.in_table_array_header()
 }

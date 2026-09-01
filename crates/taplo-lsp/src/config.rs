@@ -175,6 +175,11 @@ impl SchemaConfig {
   /// # Errors
   ///
   /// Returns [`LspConfigError`] if a compiled-in catalog URL is invalid.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the named fallible constructor separates built-in catalog parsing from `without_catalogs`, so `Default` stays infallible \
+              while `LspConfig::new` composes the typed catalog failure"
+  )]
   fn new() -> Result<Self, LspConfigError> {
     let mut config = Self::without_catalogs();
     for catalog in DEFAULT_CATALOGS {

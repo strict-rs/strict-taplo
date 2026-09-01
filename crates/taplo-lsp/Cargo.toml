@@ -6,7 +6,7 @@ rust-version = { workspace = true }
 categories   = ["development-tools", "text-editors"]
 keywords     = ["toml", "language-server", "lsp", "formatter", "linter"]
 authors      = { workspace = true }
-edition      = { workspace = true }
+edition = { workspace = true }
 homepage     = { workspace = true }
 license      = { workspace = true }
 repository   = { workspace = true }

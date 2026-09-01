@@ -37,6 +37,7 @@ macro_rules! define_document_symbol_future_family {
     ///
     /// Returns a JSON-RPC error when parameters are missing, source coordinates cannot be mapped,
     /// or the captured document generation becomes stale.
+    #[allow(clippy::single_call_fn, reason = "one document-symbol entry point per execution family, registered exactly once by its runtime family")]
     pub(super) fn $document_symbols<E: $environment>(
       world: &WorldState<E, $transport<E>>,
       params: Params<DocumentSymbolParams>,
@@ -97,6 +98,11 @@ struct SymbolCollector<'document> {
 
 impl<'document> SymbolCollector<'document> {
   /// Create a collector from its root-level visit tasks.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the named constructor is the only way to establish the collector's start invariant — an empty output paired with the \
+              caller's root visit tasks — so no caller can seed a traversal with partially completed symbols"
+  )]
   const fn new(document: &'document DocumentState, pending: Vec<SymbolTask>) -> Self {
     Self {
       document,

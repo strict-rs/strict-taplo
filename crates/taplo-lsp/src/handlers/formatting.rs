@@ -32,6 +32,7 @@ macro_rules! define_formatting_future_family {
     ///
     /// Returns [`RpcError`] when parameters, paths, coordinates, formatting, or snapshot freshness
     /// cannot be validated.
+    #[allow(clippy::single_call_fn, reason = "one document-formatting entry point per execution family, registered exactly once by its runtime family")]
     pub(super) fn $format<E: $environment>(
       world: &WorldState<E, $transport<E>>,
       params: Params<DocumentFormattingParams>,

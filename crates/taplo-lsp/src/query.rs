@@ -421,6 +421,11 @@ fn reaches_line_boundary(syntax: &SyntaxToken, direction: Direction) -> bool {
 }
 
 /// Join a semantic node's key and value ranges into its complete source range.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the name states that a semantic node's cursor extent spans its owning key as well as its value, a rule the narrowest-node \
+            filter would otherwise bury in a chained range join"
+)]
 fn full_range(keys: &Keys, node: &Node) -> Option<TextRange> {
   let Some(last_key) = keys.iter().filter_map(KeyOrIndex::as_key).next_back().map(Key::text_ranges) else {
     return try_join_ranges(node.text_ranges(true));
@@ -458,6 +463,11 @@ mod tests {
   }
 
   /// Resolve one cursor offset relative to a unique source fragment.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the named resolver keeps cursor fixtures anchored to readable source fragments instead of hardcoded byte offsets, and \
+              confines the checked conversions into Rowan coordinates to one place"
+  )]
   fn source_offset(source: &str, fragment: &str, relative: usize) -> Result<TextSize, TestFailure> {
     let fragment_start = ensure_some(source.find(fragment), "the query fixture fragment must exist")?;
     let offset = ensure_some(

@@ -83,6 +83,7 @@ macro_rules! define_semantic_token_future_family {
     ///
     /// Returns an RPC error when request parameters are absent, source coordinates cannot be
     /// represented by LSP, or the document changes while tokens are being built.
+    #[allow(clippy::single_call_fn, reason = "one semantic-token entry point per execution family, registered exactly once by its runtime family")]
     pub(super) fn $semantic_tokens<E: $environment>(
       world: &WorldState<E, $transport<E>>,
       params: Params<SemanticTokensParams>,
@@ -220,6 +221,11 @@ struct SemanticTokensBuilder<'b> {
 
 impl<'b> SemanticTokensBuilder<'b> {
   /// Create an empty builder using `mapper` for source-coordinate projection.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the named constructor keeps the relative-encoding origin private to the builder, so no caller can start a token stream from \
+              an already-advanced `last_start` reference position"
+  )]
   const fn new(mapper: &'b Mapper) -> Self {
     Self {
       tokens: Vec::new(),
@@ -284,10 +290,7 @@ mod tests {
   fn fixture_tokens(source: &str) -> Result<Vec<SemanticToken>, TestFailure> {
     let syntax = ensure_ok(parser::parse(source), "the semantic-token fixture must parse")?.into_syntax();
     let mapper = ensure_ok(Mapper::new_utf16(source), "the semantic-token mapper must build")?;
-    Ok(ensure_ok(
-      create_tokens(&syntax, &mapper),
-      "semantic-token construction must succeed",
-    )?)
+    ensure_ok(create_tokens(&syntax, &mapper), "semantic-token construction must succeed")
   }
 
   #[test]

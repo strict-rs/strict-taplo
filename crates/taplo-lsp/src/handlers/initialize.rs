@@ -82,6 +82,10 @@ macro_rules! define_initialization_future_family {
     ///
     /// Returns [`InitializationError`] when options, workspace URIs, or workspace initialization
     /// are invalid.
+    #[allow(
+      clippy::single_call_fn,
+      reason = "one initialization transition per execution family, registered exactly once by its runtime family"
+    )]
     pub(super) fn $initialize<E: $environment>(
       world: &WorldState<E, $transport<E>>,
       params: InitializeParams,
@@ -194,6 +198,8 @@ fn initialization_result() -> InitializeResult {
 
 #[cfg(test)]
 mod tests {
+  use std::path::Path;
+
   use lsp_types::InitializeParams;
   use lsp_types::SemanticTokensServerCapabilities;
   use lsp_types::TextDocumentSyncCapability;
@@ -235,7 +241,7 @@ mod tests {
         prepared.init_config.cache_path.as_deref(),
         prepared.init_config.configuration_section.as_str(),
         workspace_roots,
-      ) == (Some(std::path::Path::new("/workspace/cache")), "taplo", vec![
+      ) == (Some(Path::new("/workspace/cache")), "taplo", vec![
         "file:///workspace/first", "file:///workspace/second",
       ]),
       "initialization preparation must preserve host options and client workspace order",
@@ -301,8 +307,8 @@ mod tests {
       result.capabilities.text_document_sync == Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
       "initialization must advertise full document synchronization",
     )?;
-    let semantic_token_facts = match result.capabilities.semantic_tokens_provider.as_ref() {
-      Some(SemanticTokensServerCapabilities::SemanticTokensOptions(options)) => Some((
+    let semantic_token_facts = match result.capabilities.semantic_tokens_provider {
+      Some(SemanticTokensServerCapabilities::SemanticTokensOptions(ref options)) => Some((
         options.legend.token_modifiers.len(),
         options.legend.token_types.len(),
         options.range,

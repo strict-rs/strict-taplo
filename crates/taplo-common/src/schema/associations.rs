@@ -911,13 +911,16 @@ mod tests {
   use std::sync::Arc;
   use std::time::Duration;
 
+  use futures::FutureExt as _;
   use futures::executor::block_on;
+  use futures::future::LocalBoxFuture;
   use serde_json::json;
   use strict_test_support::TestFailure;
   use strict_test_support::ensure;
   use strict_test_support::ensure_eq;
   use strict_test_support::ensure_ok;
   use strict_test_support::ensure_some;
+  use taplo::dom::Node;
   use taplo::parser::parse;
   use taplo_test_support::ensure_result;
   use time::OffsetDateTime;
@@ -987,6 +990,11 @@ mod tests {
 
   /// Construct one native concurrent association service with the real HTTP-capable transport.
   #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the concurrent fixture names the HTTP client, transport, and cache construction that make the native operation family real \
+              rather than simulated"
+  )]
   fn concurrent_associations(environment: TestEnvironment) -> Result<ConcurrentTestAssociations, TestFailure> {
     let http = ensure_result(
       concurrent_http_client(&environment, Duration::from_secs(2)),
@@ -1001,7 +1009,7 @@ mod tests {
   }
 
   /// Parse one source-backed DOM root for document-association behavior.
-  fn document(source_text: &str) -> Result<taplo::dom::Node, TestFailure> {
+  fn document(source_text: &str) -> Result<Node, TestFailure> {
     let parsed = ensure_ok(parse(source_text), "the document-association fixture tree must build")?;
     ensure(
       parsed.diagnostics().is_empty(),
@@ -1010,6 +1018,10 @@ mod tests {
     Ok(parsed.into_dom())
   }
 
+  #[allow(
+    clippy::single_call_fn,
+    reason = "source counting names the metadata-ownership projection that every source-scoped replacement assertion compares against"
+  )]
   fn source_count<T: SchemaTransport>(associations: &SchemaAssociations<T>, expected_source: &str) -> usize {
     associations
       .read()
@@ -1057,31 +1069,31 @@ mod tests {
     expected: [&Url; N],
     context: &'static str,
   ) -> Result<(), TestFailure> {
-    let expected_sources = expected
-      .into_iter()
-      .map(|catalog_url| catalog_url.to_string())
-      .collect::<Vec<_>>();
+    let expected_sources = expected.into_iter().map(ToString::to_string).collect::<Vec<_>>();
     ensure(catalog_sources(associations) == expected_sources, context)
   }
 
   /// Require one catalog operation family to replace and then clear ownership.
-  async fn ensure_catalog_replacement_and_clear<T, Replacement, Clearing>(
-    associations: &SchemaAssociations<T>,
-    expected: &Url,
+  fn ensure_catalog_replacement_and_clear<'operations, T, Replacement, Clearing>(
+    associations: &'operations SchemaAssociations<T>,
+    expected: &'operations Url,
     replacement: Replacement,
     clearing: Clearing,
-    contexts: [&'static str; 4],
-  ) -> Result<(), TestFailure>
+    contexts: &[&'static str; 4],
+  ) -> LocalBoxFuture<'operations, Result<(), TestFailure>>
   where
     T: SchemaTransport,
-    Replacement: Future<Output = Result<(), AssociationError>>,
-    Clearing: Future<Output = Result<(), AssociationError>>,
+    Replacement: Future<Output = Result<(), AssociationError>> + 'operations,
+    Clearing: Future<Output = Result<(), AssociationError>> + 'operations,
   {
-    let [replacement_context, expected_context, clearing_context, empty_context] = contexts;
-    ensure_result(replacement.await, replacement_context)?;
-    ensure_catalog_sources(associations, [expected], expected_context)?;
-    ensure_result(clearing.await, clearing_context)?;
-    ensure_catalog_sources(associations, [], empty_context)
+    let [replacement_context, expected_context, clearing_context, empty_context] = *contexts;
+    async move {
+      ensure_result(replacement.await, replacement_context)?;
+      ensure_catalog_sources(associations, [expected], expected_context)?;
+      ensure_result(clearing.await, clearing_context)?;
+      ensure_catalog_sources(associations, [], empty_context)
+    }
+    .boxed_local()
   }
 
   /// Construct one Taplo catalog containing a single pattern association.
@@ -1609,7 +1621,7 @@ mod tests {
         &second_catalog,
         associations.replace_catalogs(from_ref(&second_catalog)),
         associations.replace_catalogs(&[]),
-        [
+        &[
           "the valid second catalog must replace the first",
           "a successful replacement must remove stale catalog ownership",
           "an empty catalog configuration must clear catalog ownership",
@@ -1696,7 +1708,7 @@ mod tests {
         &second_catalog,
         concurrent.replace_catalogs_concurrent(from_ref(&second_catalog)),
         concurrent.replace_catalogs_concurrent(&[]),
-        [
+        &[
           "the concurrent complete-catalog operation must replace all catalog ownership",
           "concurrent complete-catalog replacement must remove stale catalog ownership",
           "the concurrent empty catalog set must clear catalog ownership",

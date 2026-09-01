@@ -85,6 +85,10 @@ macro_rules! define_document_future_family {
     ///
     /// Returns [`DocumentNotificationError`] when parameters, URI conversion, parsing, state
     /// mutation, or diagnostic collection fails.
+    #[allow(
+      clippy::single_call_fn,
+      reason = "one document-open transition per execution family, registered exactly once on its runtime family's ordered mutation lane"
+    )]
     pub(super) fn $document_open<E: $environment>(
       world: &WorldState<E, $transport<E>>,
       params: Params<DidOpenTextDocumentParams>,
@@ -103,6 +107,11 @@ macro_rules! define_document_future_family {
     ///
     /// Returns [`DocumentNotificationError`] when parameters, replacement text, URI conversion,
     /// parsing, state mutation, or diagnostic collection fails.
+    #[allow(
+      clippy::single_call_fn,
+      reason = "one full-sync document-change transition per execution family, registered exactly once on its runtime family's ordered \
+                mutation lane"
+    )]
     pub(super) fn $document_change<E: $environment>(
       world: &WorldState<E, $transport<E>>,
       params: Params<DidChangeTextDocumentParams>,
@@ -125,6 +134,10 @@ macro_rules! define_document_future_family {
     ///
     /// Returns [`DocumentNotificationError`] when parameters, URI conversion, state mutation, or
     /// diagnostic construction fails.
+    #[allow(
+      clippy::single_call_fn,
+      reason = "one document-close transition per execution family, registered exactly once on its runtime family's ordered mutation lane"
+    )]
     pub(super) fn $document_close<E: $environment>(
       world: &WorldState<E, $transport<E>>,
       params: Params<DidCloseTextDocumentParams>,
@@ -219,6 +232,7 @@ mod tests {
   use super::document_open_local;
   use super::document_url;
   use crate::handlers::test_support::local_world;
+  use crate::world::DocumentDisposition;
 
   /// Parse one wire document URI.
   fn uri(value: &str) -> Result<Uri, TestFailure> {
@@ -330,7 +344,7 @@ mod tests {
       ensure(
         dispositions
           .first()
-          .is_some_and(|(_, disposition)| *disposition == crate::world::DocumentDisposition::Excluded),
+          .is_some_and(|disposition_entry| disposition_entry.1 == DocumentDisposition::Excluded),
         "the retained excluded document must expose its exclusion disposition",
       )
     })

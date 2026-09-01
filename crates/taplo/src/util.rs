@@ -59,6 +59,10 @@ const fn is_multiline_whitespace(character: char) -> bool {
 }
 
 /// Return whether one character is permitted in a multiline basic string.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the named rule states the multiline basic-string policy as multiline whitespace plus the basic-string set"
+)]
 fn permits_multiline_basic_string(character: char) -> bool {
   is_multiline_whitespace(character) || permits_basic_string(character)
 }

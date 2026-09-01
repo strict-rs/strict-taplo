@@ -4,7 +4,7 @@ version      = { workspace = true }
 publish      = false
 rust-version = { workspace = true }
 authors      = { workspace = true }
-edition      = { workspace = true }
+edition = { workspace = true }
 homepage     = { workspace = true }
 license      = { workspace = true }
 repository   = { workspace = true }

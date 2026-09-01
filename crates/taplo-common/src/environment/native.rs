@@ -273,7 +273,12 @@ mod tests {
   use std::fs;
   use std::io::ErrorKind;
   use std::io::IsTerminal as _;
+  use std::io::stderr;
+  #[cfg(unix)]
+  use std::os::unix::fs::symlink;
   use std::path::Path;
+  use std::path::PathBuf;
+  use std::process::id;
   use std::sync::Arc;
   use std::sync::atomic::AtomicBool;
   use std::sync::atomic::Ordering;
@@ -284,7 +289,9 @@ mod tests {
   use strict_test_support::ensure_eq;
   use strict_test_support::ensure_ok;
   use strict_test_support::ensure_some;
+  use tokio::runtime::Builder;
   use tokio::runtime::Runtime;
+  use tokio::task::yield_now;
   use url::Url;
 
   use super::NativeEnvironment;
@@ -297,9 +304,23 @@ mod tests {
   /// Construct the current-thread executor required by native host operations.
   fn test_runtime() -> Result<Runtime, TestFailure> {
     ensure_ok(
-      tokio::runtime::Builder::new_current_thread().enable_all().build(),
+      Builder::new_current_thread().enable_all().build(),
       "the native-environment test runtime must initialize",
     )
+  }
+
+  /// Project one typed I/O failure into its comparable operation, path, and kind facts.
+  fn io_failure_facts(failure: EnvironmentError) -> Option<(&'static str, PathBuf, ErrorKind)> {
+    if let EnvironmentError::Io {
+      operation,
+      path,
+      source,
+    } = failure
+    {
+      Some((operation, path, source.kind()))
+    } else {
+      None
+    }
   }
 
   #[test]
@@ -332,10 +353,10 @@ mod tests {
     ensure(
       variables
         .iter()
-        .any(|(name, contents)| (name.as_str(), contents.as_str()) == ("PATH", path.as_str())),
+        .any(|variable| (variable.0.as_str(), variable.1.as_str()) == ("PATH", path.as_str())),
       "bulk environment enumeration must retain the individually observed PATH entry",
     )?;
-    let absent_name = format!("TAPLO_TEST_ABSENT_{}", std::process::id());
+    let absent_name = format!("TAPLO_TEST_ABSENT_{}", id());
     ensure(
       ensure_ok(
         environment.env_var(&absent_name),
@@ -346,7 +367,7 @@ mod tests {
     )?;
     ensure_eq(
       &ensure_ok(environment.atty_stderr(), "native terminal detection must succeed")?,
-      &std::io::stderr().is_terminal(),
+      &stderr().is_terminal(),
       "native terminal detection must reflect the actual standard-error handle",
     )?;
 
@@ -359,7 +380,7 @@ mod tests {
     environment.spawn(async move {
       task_observation.store(true, Ordering::Release);
     });
-    runtime.block_on(tokio::task::yield_now());
+    runtime.block_on(yield_now());
     ensure(
       task_completed.load(Ordering::Acquire),
       "the captured native runtime handle must execute spawned concurrent tasks",
@@ -443,7 +464,7 @@ mod tests {
   }
 
   #[test]
-  fn native_file_operations_replace_atomically_and_preserve_typed_failures() -> Result<(), TestFailure> {
+  fn native_file_operations_replace_atomically_across_execution_models() -> Result<(), TestFailure> {
     let fixture = TempDir::new("taplo-native-io")?;
     let runtime = test_runtime()?;
     let environment = NativeEnvironment::from_handle(runtime.handle().clone());
@@ -474,41 +495,38 @@ mod tests {
     ensure(
       ensure_ok(fs::read(&document), "the atomically replaced host file must remain readable")? == b"value = 2\n",
       "atomic replacement must commit the exact requested bytes",
-    )?;
+    )
+  }
 
+  #[test]
+  fn missing_native_reads_preserve_operation_path_and_kind_in_both_execution_models() -> Result<(), TestFailure> {
+    let fixture = TempDir::new("taplo-native-missing")?;
+    let runtime = test_runtime()?;
+    let environment = NativeEnvironment::from_handle(runtime.handle().clone());
     let missing = fixture.child("missing.toml");
+
     let local_failure = ensure_some(
       runtime.block_on(environment.read_file(&missing)).err(),
       "a missing local file must return a typed failure",
     )?;
-    let local_failure_observation = match local_failure {
-      EnvironmentError::Io {
-        operation,
-        path,
-        source,
-      } => Some((operation, path, source.kind())),
-      _ => None,
-    };
     ensure(
-      local_failure_observation == Some(("read_file", missing.clone(), ErrorKind::NotFound)),
+      io_failure_facts(local_failure) == Some(("read_file", missing.clone(), ErrorKind::NotFound)),
       "a missing local file must retain its operation, path, and typed I/O source",
     )?;
     let concurrent_failure = ensure_some(
       runtime.block_on(environment.read_file_concurrent(missing.clone())).err(),
       "a missing concurrent file must return a typed failure",
     )?;
-    let concurrent_failure_observation = match concurrent_failure {
-      EnvironmentError::Io {
-        operation,
-        path,
-        source,
-      } => Some((operation, path, source.kind())),
-      _ => None,
-    };
     ensure(
-      concurrent_failure_observation == Some(("read_file", missing.clone(), ErrorKind::NotFound)),
+      io_failure_facts(concurrent_failure) == Some(("read_file", missing, ErrorKind::NotFound)),
       "a missing concurrent file must retain its operation, path, and typed I/O source",
-    )?;
+    )
+  }
+
+  #[test]
+  fn atomic_writes_reject_invalid_targets_and_remove_temporary_files() -> Result<(), TestFailure> {
+    let fixture = TempDir::new("taplo-native-atomic-write")?;
+    let runtime = test_runtime()?;
 
     ensure(
       matches!(
@@ -535,7 +553,7 @@ mod tests {
 
     let directory_target = fixture.child("directory.toml");
     ensure_ok(
-      fs::create_dir(&directory_target),
+      fs::create_dir_all(&directory_target),
       "the atomic-replacement directory target must be created",
     )?;
     ensure(
@@ -550,12 +568,12 @@ mod tests {
       "a directory replacement target must retain the typed rename boundary",
     )?;
     let fixture_entries = ensure_ok(
-      fs::read_dir(fixture.path()).and_then(|entries| entries.collect::<Result<Vec<_>, _>>()),
+      fs::read_dir(fixture.path()).and_then(Iterator::collect::<Result<Vec<_>, _>>),
       "the atomic-write fixture directory must remain enumerable",
     )?;
     ensure_eq(
       &fixture_entries.len(),
-      &2_usize,
+      &1_usize,
       "failed atomic replacement must remove its temporary file",
     )
   }
@@ -570,7 +588,7 @@ mod tests {
       "the nested configuration search fixture must be created",
     )?;
     ensure_ok(
-      fs::create_dir(project.join("taplo.toml")),
+      fs::create_dir_all(project.join("taplo.toml")),
       "a directory-shaped candidate must be created",
     )?;
     let root_config = fixture.child(".taplo.toml");
@@ -610,7 +628,7 @@ mod tests {
     {
       let looping_candidate = nested.join(".taplo.toml");
       ensure_ok(
-        std::os::unix::fs::symlink(&looping_candidate, &looping_candidate),
+        symlink(&looping_candidate, &looping_candidate),
         "the metadata-failure symlink fixture must be created",
       )?;
       ensure(
@@ -628,7 +646,7 @@ mod tests {
         fs::remove_file(looping_candidate),
         "the metadata-failure symlink fixture must be removable",
       )?;
-    }
+    };
 
     let matched = fixture.child("matched.toml");
     let ignored = fixture.child("ignored.txt");
@@ -647,9 +665,9 @@ mod tests {
       matches!(
         environment.glob_files("["),
         Err(EnvironmentError::GlobPattern {
-          pattern,
+          pattern: rejected,
           ..
-        }) if pattern == "["
+        }) if rejected == "["
       ),
       "an invalid native glob must retain its rejected expression and typed parser source",
     )

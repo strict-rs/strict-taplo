@@ -65,6 +65,10 @@ pub(super) fn render(node: &Node, formatter: &mut impl Write, inline: bool, pref
 }
 
 /// Reject malformed nodes and ambiguous semantic state before emitting bytes.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the named preflight keeps the reject-before-emit contract separate from the rendering program"
+)]
 fn ensure_renderable(root: &Node) -> Result<(), RenderError> {
   let mut diagnostic_count = 0_usize;
   let mut pending = vec![root.clone()];
@@ -145,6 +149,10 @@ enum RenderTask {
 }
 
 /// Execute a depth-independent TOML rendering program.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the named driver owns the depth-independent task loop distinct from the renderability preflight"
+)]
 fn render_tasks(formatter: &mut impl Write, root: Node, inline: bool, prefer_single_quote: bool) -> Result<(), RenderError> {
   let root_mode = if inline {
     RenderMode::INLINE
@@ -171,6 +179,10 @@ fn render_tasks(formatter: &mut impl Write, root: Node, inline: bool, prefer_sin
 }
 
 /// Render a scalar immediately or queue one composite node's children in reverse output order.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the named dispatcher is the single node-variant routing point of the rendering program"
+)]
 fn queue_or_render_node(
   formatter: &mut impl Write,
   node: Node,
@@ -195,6 +207,10 @@ fn queue_or_render_node(
 }
 
 /// Render one Boolean from retained syntax or its semantic value.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the named renderer keeps Boolean source-spelling preservation beside its sibling scalar renderers"
+)]
 fn render_bool(formatter: &mut impl Write, boolean: &Bool, keys: &Keys) -> Result<(), RenderError> {
   write_assignment(formatter, keys)?;
   render_source_or_value(formatter, boolean.syntax(), boolean.value())?;
@@ -202,6 +218,10 @@ fn render_bool(formatter: &mut impl Write, boolean: &Bool, keys: &Keys) -> Resul
 }
 
 /// Render one integer with source-spelling and representation preservation.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the named renderer keeps integer representation and signedness policy beside its sibling renderers"
+)]
 fn render_integer(formatter: &mut impl Write, integer: &Integer, keys: &Keys) -> Result<(), RenderError> {
   write_assignment(formatter, keys)?;
   if let Some(syntax) = integer.syntax() {
@@ -228,6 +248,10 @@ fn render_integer(formatter: &mut impl Write, integer: &Integer, keys: &Keys) ->
 }
 
 /// Render one float from retained syntax or its semantic value.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the named renderer keeps float source-spelling preservation beside its sibling scalar renderers"
+)]
 fn render_float(formatter: &mut impl Write, float: &Float, keys: &Keys) -> Result<(), RenderError> {
   write_assignment(formatter, keys)?;
   if let Some(syntax) = float.syntax() {
@@ -239,6 +263,10 @@ fn render_float(formatter: &mut impl Write, float: &Float, keys: &Keys) -> Resul
 }
 
 /// Render one date/time from retained syntax or its semantic value.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the named renderer keeps date/time source-spelling preservation beside its sibling scalar renderers"
+)]
 fn render_date(formatter: &mut impl Write, date_time: &DateTime, keys: &Keys) -> Result<(), RenderError> {
   write_assignment(formatter, keys)?;
   render_source_or_value(formatter, date_time.syntax(), date_time.value())?;
@@ -254,6 +282,10 @@ fn render_source_or_value(formatter: &mut impl Write, syntax: Option<&SyntaxElem
 }
 
 /// Reject an invalid semantic node without fabricating TOML.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the named renderer keeps malformed-node rejection on the same dispatch table as every emitting renderer"
+)]
 fn render_invalid(invalid: &Invalid) -> Result<(), RenderError> {
   Err(RenderError::InvalidNode {
     reason: invalid.reason().clone(),
@@ -284,6 +316,10 @@ fn queue_inline_children(pending: &mut Vec<RenderTask>, children: impl DoubleEnd
 }
 
 /// Queue one inline or header-based table.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the named queuer owns inline-versus-header table layout and scalar/composite entry ordering"
+)]
 fn queue_table(
   formatter: &mut impl Write,
   table: &Table,
@@ -339,6 +375,10 @@ fn queue_table(
 }
 
 /// Queue one inline array or array-of-tables.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the named queuer owns inline-versus-array-of-tables layout and per-element header emission"
+)]
 fn queue_array(
   formatter: &mut impl Write,
   array: &Array,

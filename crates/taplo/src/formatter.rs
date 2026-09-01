@@ -22,6 +22,7 @@ use serde::Deserialize;
 #[cfg(feature = "serde")]
 use serde::Serialize;
 
+use self::macros::parse_option_value;
 use crate::dom;
 use crate::dom::Keys;
 use crate::dom::Node;
@@ -282,6 +283,10 @@ impl Context {
 }
 
 /// Formats a parsed TOML green tree.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the public green-tree entry point preserves the infallible formatting contract for unrooted green nodes"
+)]
 #[must_use]
 pub fn format_green(green: GreenNode, options: &Options) -> String {
   format_syntax(&SyntaxNode::new_root(green), options)
@@ -559,6 +564,10 @@ struct RootFormatter<'options> {
 
 impl<'options> RootFormatter<'options> {
   /// Construct the state owner for one document.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the named constructor establishes the document formatter's deferred-group and scoped-option state"
+  )]
   fn new(options: &'options Options, context: &Context) -> Self {
     Self {
       options,
@@ -1019,6 +1028,10 @@ fn can_collapse_array(node: &SyntaxNode) -> bool {
 }
 
 /// Flush deferred array values using the active single-line or multiline layout.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the named helper owns reordering, comma attachment, and row layout apart from array traversal state"
+)]
 fn flush_array_values(
   value_group: &mut Vec<(String, Option<String>)>,
   comma_group: &mut Vec<bool>,
@@ -1116,6 +1129,10 @@ struct ArrayFormatter<'format> {
 
 impl<'format> ArrayFormatter<'format> {
   /// Construct formatting state and decide the array's final layout mode.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the named constructor owns the collapse-versus-expand layout decision before any element is consumed"
+  )]
   fn new(node: &SyntaxNode, options: &'format Options, context: &'format Context) -> Self {
     let source_multiline = is_array_multiline(node) || context.force_multiline;
     let multiline = if can_collapse_array(node) && options.array_auto_collapse && !context.force_multiline {

@@ -284,6 +284,10 @@ enum BuildLeafValue {
 
 impl BuildNode {
   /// Borrow this record as a table.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the named projection completes BuildNode's symmetric borrow API and drives arena table lookup"
+  )]
   const fn as_table(&self) -> Option<&BuildTable> {
     match *self {
       Self::Table(ref table) => Some(table),
@@ -292,6 +296,10 @@ impl BuildNode {
   }
 
   /// Mutably borrow this record as a table.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the named projection completes BuildNode's symmetric borrow API and drives mutable arena table lookup"
+  )]
   const fn as_table_mut(&mut self) -> Option<&mut BuildTable> {
     match *self {
       Self::Table(ref mut table) => Some(table),
@@ -308,6 +316,10 @@ impl BuildNode {
   }
 
   /// Mutably borrow this record as an array.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the named projection completes BuildNode's symmetric borrow API and drives mutable arena array lookup"
+  )]
   const fn as_array_mut(&mut self) -> Option<&mut BuildArray> {
     match *self {
       Self::Array(ref mut array) => Some(array),
@@ -973,6 +985,10 @@ impl DomBuilder {
 }
 
 /// Freeze one table into an immutable arena record.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the named freezer keeps the table's immutable record shape beside its sibling array and leaf freezers"
+)]
 fn freeze_table(table: BuildTable) -> NodeSeed {
   NodeSeed::Table {
     inner:   Arc::new(TableInner::new(table.diagnostics.into(), table.syntax, table.kind)),
@@ -981,6 +997,10 @@ fn freeze_table(table: BuildTable) -> NodeSeed {
 }
 
 /// Freeze one array into an immutable arena record.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the named freezer keeps the array's immutable record shape beside its sibling table and leaf freezers"
+)]
 fn freeze_array(array: BuildArray) -> NodeSeed {
   NodeSeed::Array {
     inner: Arc::new(ArrayInner::new(array.diagnostics.into(), array.syntax, array.kind)),
@@ -989,6 +1009,10 @@ fn freeze_array(array: BuildArray) -> NodeSeed {
 }
 
 /// Convert one syntax element into a fully frozen DOM.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the module entry point owns the sole two-phase construction boundary exposed to the parent dom module"
+)]
 pub(super) fn node_from_syntax(syntax: SyntaxElement) -> Node {
   let syntax_guards = syntax_green_guards(&syntax);
   let mut builder = DomBuilder {
@@ -1001,6 +1025,10 @@ pub(super) fn node_from_syntax(syntax: SyntaxElement) -> Node {
 }
 
 /// Retain every syntax node's shallow green reference in parent-before-child order.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the named helper isolates green-node lifetime retention from mutable DOM construction and freezing"
+)]
 fn syntax_green_guards(syntax: &SyntaxElement) -> VecDeque<GreenNode> {
   let Some(root) = syntax.ancestors().last() else {
     return VecDeque::new();
@@ -1045,6 +1073,10 @@ fn entry_parts(syntax: &SyntaxElement) -> (Vec<BuildKey>, Option<SyntaxElement>)
 }
 
 /// Collect header keys from the first `KEY` child.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the named helper distinguishes header key decoding from the entry key-and-value split of entry_parts"
+)]
 fn header_keys(syntax: &SyntaxElement) -> Vec<BuildKey> {
   syntax
     .as_node()
@@ -1109,6 +1141,10 @@ fn invalid_key(syntax: SyntaxElement) -> BuildKey {
 }
 
 /// Freeze one leaf into an immutable arena record.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the named freezer keeps every leaf value's immutable record shape beside its sibling container freezers"
+)]
 fn freeze_leaf(leaf: BuildLeaf) -> NodeSeed {
   let diagnostics: Arc<[Diagnostic]> = leaf.diagnostics.into();
   match leaf.value {

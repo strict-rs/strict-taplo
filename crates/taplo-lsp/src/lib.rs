@@ -131,6 +131,10 @@ pub(crate) type LocalFuture<'operation, Output> = Pin<Box<dyn Future<Output = Ou
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) type ConcurrentFuture<'operation, Output> = Pin<Box<dyn Future<Output = Output> + Send + 'operation>>;
 
+/// A current-thread test operation resolving to the panic-free test outcome.
+#[cfg(test)]
+pub(crate) type LocalTestFuture<'operation, Output> = LocalFuture<'operation, Result<Output, strict_test_support::TestFailure>>;
+
 /// Construct a local world using an explicitly configured browser-compatible HTTP client.
 ///
 /// # Errors

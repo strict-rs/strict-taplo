@@ -1782,6 +1782,10 @@ mod tests {
       $debug_name:literal,
     ) => {
       /// Exercise context state, world access, notifications, and deferred work.
+      #[allow(
+        clippy::single_call_fn,
+        reason = "the generated context probe names one runtime family's complete handler-context contract"
+      )]
       fn $context_probe(mut context: $context<$world>, _params: Params<()>) -> $future<'static, Result<u64, rpc::RpcError>> {
         async move {
           let initialized = context.is_initialized().await;
@@ -1814,6 +1818,10 @@ mod tests {
       }
 
       /// Mirror one typed outbound scalar response through the inbound request.
+      #[allow(
+        clippy::single_call_fn,
+        reason = "the generated value probe names one runtime family's typed outbound response-routing contract"
+      )]
       fn $value_probe(mut context: $context<$world>, _params: Params<()>) -> $future<'static, Result<u64, rpc::RpcError>> {
         async move {
           let response = context
@@ -1831,6 +1839,10 @@ mod tests {
       }
 
       /// Issue one outbound request, observe it pending, then send cancellation.
+      #[allow(
+        clippy::single_call_fn,
+        reason = "the generated cancel probe names one runtime family's outbound cancellation-target contract"
+      )]
       fn $cancel_probe(mut context: $context<$world>, _params: Params<()>) -> $future<'static, Result<(), rpc::RpcError>> {
         async move {
           let mut outbound = Box::pin(context.write_request::<OutboundValueRequest>(None));

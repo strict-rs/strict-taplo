@@ -2317,6 +2317,10 @@ fn path_from_entry(entry: &SyntaxNode) -> Result<ExactPath, RewriteError> {
 }
 
 /// Extract a literal path from one table header.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the named wrapper binds header key extraction to its FragmentKind diagnostic beside path_from_entry"
+)]
 fn path_from_header(header: &SyntaxNode) -> Result<ExactPath, RewriteError> {
   path_from_key_owner(header, FragmentKind::TableBlock)
 }
@@ -2580,6 +2584,10 @@ mod tests {
   }
 
   /// Project every real DOM diagnostic from one tolerant parse into rewrite-owned data.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the fixture keeps tolerant-parse validation and diagnostic projection out of the per-family assertions"
+  )]
   fn semantic_diagnostics(source: &str) -> Result<Vec<SemanticDiagnostic>, TestFailure> {
     let parsed = ensure_ok(parse(source), "the semantic-diagnostic fixture tree must construct")?;
     let root = parsed.into_dom();

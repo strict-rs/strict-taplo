@@ -154,6 +154,10 @@ fn path_is_absolute(environment: &impl Environment, path: &Path) -> Result<bool,
 }
 
 /// Decode transport bytes as JSON while preserving the owning URL.
+#[allow(
+  clippy::single_call_fn,
+  reason = "JSON decoding is the one boundary that binds a decoder failure to the URL whose bytes produced it, for every capability"
+)]
 fn decode_json(url: Url, bytes: &[u8]) -> Result<Value, TransportError> {
   serde_json::from_slice(bytes).map_err(|source| TransportError::Json {
     url,
@@ -166,6 +170,11 @@ fn decode_json(url: Url, bytes: &[u8]) -> Result<Value, TransportError> {
 macro_rules! define_http_reader {
   ($name:ident, $future:ident, $boxed:ident, $description:literal) => {
     #[doc = $description]
+    #[allow(
+      clippy::single_call_fn,
+      reason = "each generated reader is the sole remote-fetch boundary of one execution model and owns its status and body failure \
+                mapping"
+    )]
     fn $name(client: &reqwest::Client, url: Url) -> $future<'_, Result<Vec<u8>, TransportError>> {
       async move {
         let response = client
@@ -208,6 +217,11 @@ define_http_reader!(
 );
 
 /// Classify one schema URL without choosing a transport capability or asynchronous execution model.
+#[allow(
+  clippy::single_call_fn,
+  reason = "URL classification keeps supported-scheme policy and host path mapping independent of the injected file and remote \
+            capabilities"
+)]
 fn classify_schema_location(environment: &impl Environment, url: &Url) -> Result<SchemaLocation, TransportError> {
   match url.scheme() {
     "file" => environment
@@ -224,13 +238,17 @@ fn classify_schema_location(environment: &impl Environment, url: &Url) -> Result
   }
 }
 
-/// Read and decode one schema URL through injected file and remote capabilities.
-async fn read_json_with<E, ReadFile, ReadFileFuture, ReadRemote, ReadRemoteFuture>(
+/// Classify one schema URL, then read and decode it through injected file and remote capabilities.
+///
+/// Classification consults the synchronous environment before the future is constructed, so the
+/// returned future owns only the classified location, the URL, and the injected capabilities and
+/// stays `Send` exactly when the caller's injected capabilities are.
+fn read_json_with<E, ReadFile, ReadFileFuture, ReadRemote, ReadRemoteFuture>(
   environment: &E,
   url: Url,
   read_file: ReadFile,
   read_remote: ReadRemote,
-) -> Result<Value, TransportError>
+) -> impl Future<Output = Result<Value, TransportError>>
 where
   E: Environment,
   ReadFile: FnOnce(PathBuf) -> ReadFileFuture,
@@ -238,11 +256,14 @@ where
   ReadRemote: FnOnce(Url) -> ReadRemoteFuture,
   ReadRemoteFuture: Future<Output = Result<Vec<u8>, TransportError>>,
 {
-  let bytes = match classify_schema_location(environment, &url)? {
-    SchemaLocation::File(path) => read_file(path).await?,
-    SchemaLocation::Remote => read_remote(url.clone()).await?,
-  };
-  decode_json(url, &bytes)
+  let location = classify_schema_location(environment, &url);
+  async move {
+    let bytes = match location? {
+      SchemaLocation::File(path) => read_file(path).await?,
+      SchemaLocation::Remote => read_remote(url.clone()).await?,
+    };
+    decode_json(url, &bytes)
+  }
 }
 
 /// Adapt one environment byte read into the schema transport error model.
@@ -435,6 +456,10 @@ macro_rules! define_online_transport {
     impl<E: $environment> $name<E> {
       /// Construct an online schema transport.
       #[must_use]
+      #[allow(
+        clippy::single_call_fn,
+        reason = "each generated constructor is the public seam that pairs one execution model's environment with a compatible HTTP client"
+      )]
       pub const fn new(environment: E, http: reqwest::Client) -> Self {
         Self {
           environment,
@@ -631,8 +656,20 @@ impl<E: LocalEnvironment> LocalTransportState for OfflineSchemaTransport<E> {
 #[cfg(test)]
 mod tests {
   #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
+  use std::io::Error as IoError;
+  #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
+  use std::io::ErrorKind;
+  #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
+  use std::io::Read as _;
+  #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
+  use std::io::Write as _;
+  #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
+  use std::net::TcpListener;
+  #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
   use std::path::Path;
   use std::path::PathBuf;
+  #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
+  use std::thread;
   #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
   use std::time::Duration;
 
@@ -646,6 +683,10 @@ mod tests {
   use strict_test_support::ensure_ok;
   use strict_test_support::ensure_some;
   use taplo_test_support::ensure_result;
+  #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
+  use tokio::runtime::Builder;
+  #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
+  use tokio::runtime::Runtime;
   use url::Url;
 
   #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
@@ -711,7 +752,7 @@ mod tests {
 
   #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
   /// Loopback server thread used by one HTTP transport fixture.
-  type LoopbackServer = std::thread::JoinHandle<Result<(), std::io::Error>>;
+  type LoopbackServer = thread::JoinHandle<Result<(), IoError>>;
 
   #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
   /// Endpoint and server thread for one loopback HTTP response.
@@ -719,19 +760,21 @@ mod tests {
 
   #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
   /// Start one loopback server that writes the supplied complete HTTP response.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the loopback fixture owns port binding, request draining, and endpoint construction so transport assertions stay free of \
+              server setup"
+  )]
   fn serve_once(response: &'static [u8]) -> Result<LoopbackFixture, TestFailure> {
-    let listener = ensure_ok(
-      std::net::TcpListener::bind(("127.0.0.1", 0)),
-      "the loopback schema listener must bind",
-    )?;
+    let listener = ensure_ok(TcpListener::bind(("127.0.0.1", 0)), "the loopback schema listener must bind")?;
     let address = ensure_ok(listener.local_addr(), "the loopback schema listener must expose its address")?;
-    let server = std::thread::spawn(move || {
+    let server = thread::spawn(move || {
       let (mut stream, _) = listener.accept()?;
       let mut request = [0_u8; 1024];
-      if std::io::Read::read(&mut stream, &mut request)? == 0 {
-        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+      if stream.read(&mut request)? == 0 {
+        return Err(IoError::from(ErrorKind::UnexpectedEof));
       }
-      std::io::Write::write_all(&mut stream, response)
+      stream.write_all(response)
     });
     let endpoint = ensure_ok(
       Url::parse(&format!("http://{address}/schema.json")),
@@ -742,6 +785,11 @@ mod tests {
 
   #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
   /// Join one loopback server and preserve its typed I/O result.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "server teardown names the panic-free join and typed I/O adjudication that must outlive every read outcome, including a \
+              failing one"
+  )]
   fn finish_server(server: LoopbackServer) -> Result<(), TestFailure> {
     let joined = server.join();
     ensure(joined.is_ok(), "the panic-free loopback schema server must terminate normally")?;
@@ -754,7 +802,7 @@ mod tests {
   #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
   /// Read one loopback response through a real schema transport.
   fn read_http_once<T: SchemaTransport>(
-    runtime: &tokio::runtime::Runtime,
+    runtime: &Runtime,
     transport: &T,
     response: &'static [u8],
   ) -> Result<Result<serde_json::Value, TransportError>, TestFailure> {
@@ -767,7 +815,7 @@ mod tests {
   #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
   /// Read one failing response through both online transport capabilities.
   fn http_error_pair<L: SchemaTransport, C: SchemaTransport>(
-    runtime: &tokio::runtime::Runtime,
+    runtime: &Runtime,
     local: &L,
     concurrent: &C,
     response: &'static [u8],
@@ -785,7 +833,7 @@ mod tests {
 
   #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
   /// Require both online transport families to preserve the typed HTTP failure boundary.
-  fn ensure_http_failure_pair(errors: (TransportError, TransportError), context: &'static str) -> Result<(), TestFailure> {
+  fn ensure_http_failure_pair(errors: &(TransportError, TransportError), context: &'static str) -> Result<(), TestFailure> {
     ensure(
       [
         matches!(errors.0, TransportError::Http { .. }),
@@ -861,7 +909,7 @@ mod tests {
     block_on(file_transport_contract(&concurrent))?;
 
     let runtime = ensure_ok(
-      tokio::runtime::Builder::new_current_thread().enable_all().build(),
+      Builder::new_current_thread().enable_all().build(),
       "the loopback schema runtime must construct",
     )?;
     let success = b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\n{\"title\":\"loop\"}";
@@ -886,13 +934,13 @@ mod tests {
 
     let status = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     ensure_http_failure_pair(
-      http_error_pair(&runtime, &local, &concurrent, status)?,
+      &http_error_pair(&runtime, &local, &concurrent, status)?,
       "local and concurrent status failures must retain the same typed HTTP family",
     )?;
 
     let truncated = b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\nConnection: close\r\n\r\n{\"title\":";
     ensure_http_failure_pair(
-      http_error_pair(&runtime, &local, &concurrent, truncated)?,
+      &http_error_pair(&runtime, &local, &concurrent, truncated)?,
       "local and concurrent body-read failures must retain the same typed HTTP family",
     )
   }

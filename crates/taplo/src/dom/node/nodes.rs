@@ -119,6 +119,10 @@ pub(in crate::dom) enum NodeSeed {
 
 impl NodeSeed {
   /// Return a stable diagnostic name for this record kind.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the named projection supplies NodeId's Debug output with a stable arena-record kind label"
+  )]
   const fn kind_name(&self) -> &'static str {
     match *self {
       Self::Table {
@@ -324,6 +328,10 @@ impl DomArena {
   }
 
   /// Construct an empty detached arena for a view without child records.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the named constructor owns the record-free arena shared by default detached container views"
+  )]
   pub(in crate::dom) fn empty() -> Arc<Self> {
     Arc::new(Self {
       comments:      Arc::default(),
@@ -1151,6 +1159,10 @@ pub struct MalformedScalar {
 
 impl MalformedScalar {
   /// Construct one malformed-scalar value during DOM publication.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the named constructor is the sole publication point pairing scalar kind, decode failure, and source anchor"
+  )]
   pub(in crate::dom) const fn new(kind: ScalarKind, failure: DecodeFailure, syntax: SyntaxElement) -> Self {
     Self {
       kind,

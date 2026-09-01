@@ -414,11 +414,6 @@ impl Mapper {
         source_length: u32::from(self.source_length),
       });
     };
-    if offset > line.content_end && offset < line.terminator_end {
-      return Err(MappingError::OffsetNotBoundary {
-        offset: u32::from(offset)
-      });
-    }
     if offset > line.content_end {
       return Err(MappingError::OffsetNotBoundary {
         offset: u32::from(offset)

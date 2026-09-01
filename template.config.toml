@@ -1,4 +1,4 @@
-schema-version = "0.1.0"
+schema-version = "0.3.2"
 
 [template]
 id = "rust-template"
@@ -9,41 +9,10 @@ url = "https://github.com/takumi-earth/rust-template.git"
 branch = "main"
 
 [ecosystems]
-order = ["cargo"]
 
 [ecosystems.cargo.layout]
 kind = "members-dir"
 members-dir = "crates"
-
-[ecosystems.cargo.update]
-lockfile-refresh = "when-managed-dependencies-change"
-
-[ecosystems.cargo.update.workspace]
-dependencies = [
-  "anstyle",
-  "bpaf",
-  "cargo_metadata",
-  "globset",
-  "ignore",
-  "parking_lot",
-  "proc-macro2",
-  "proptest",
-  "serde_json",
-  "snapbox",
-  "strict-test-support",
-  "syn",
-  "template-core",
-  "template-stask",
-  "thiserror",
-  "toml",
-  "toml_edit",
-  "trybuild",
-]
-
-[[ecosystems.cargo.update.manifests]]
-path = "stask/Cargo.toml"
-dependencies = ["bpaf", "template-core", "template-stask", "thiserror"]
-dev-dependencies = ["strict-test-support"]
 
 [update.opt-outs]
 files = [".github/workflows/ci.yml"]
@@ -147,3 +116,7 @@ source = { kind = "git", url = "https://github.com/earthlings-dev/agentic-plugin
 file = "justfile"
 name = "x"
 reason = "strict-taplo retains a repository-specific extension seam while standard workflows use the installed template binary"
+
+[repository]
+stage = "strict"
+dependency-resolution = "registry"

@@ -145,3 +145,14 @@ disallowed-types = [
   { path = "std::sync::RwLock", reason = "prefer parking_lot in sync code; use async-aware primitives or redesign shared state in async code" },
   { path = "std::sync::Condvar", reason = "prefer parking_lot in sync code; use async-aware signalling in async code" },
 ]
+allowed-duplicate-crates = [
+    "bitflags",
+    "fluent-uri",
+    "getrandom",
+    "r-efi",
+    "syn",
+    "windows-link",
+    "windows-sys",
+    "tracing",
+    "tracing-core",
+]

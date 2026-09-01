@@ -119,6 +119,11 @@ macro_rules! define_configuration_future_family {
     /// # Errors
     ///
     /// Returns [`ConfigurationError`] when a root URL cannot be represented on the LSP wire.
+    #[allow(
+      clippy::single_call_fn,
+      reason = "one configuration-request builder per execution family, driven exactly once by its runtime family's client-configuration \
+                exchange"
+    )]
     pub(super) fn $configuration_request<E: $environment>(
       world: &WorldState<E, $transport<E>>,
     ) -> $future<'_, Result<ConfigurationRequest, ConfigurationError>> {
@@ -153,6 +158,10 @@ macro_rules! define_configuration_future_family {
     /// # Errors
     ///
     /// Returns [`ConfigurationError`] when validation or workspace reinitialization fails.
+    #[allow(
+      clippy::single_call_fn,
+      reason = "one push-style configuration transition per execution family, registered exactly once by its runtime family"
+    )]
     pub(super) fn $configuration_change<E: $environment>(
       world: &WorldState<E, $transport<E>>,
       params: DidChangeConfigurationParams,
@@ -172,6 +181,11 @@ macro_rules! define_configuration_future_family {
     ///
     /// Returns [`ConfigurationError`] when the response shape, validation, or workspace
     /// reinitialization fails.
+    #[allow(
+      clippy::single_call_fn,
+      reason = "the named pull-response step keeps captured-root pairing beside the request that captured it, and each execution family \
+                expands it for exactly one caller"
+    )]
     pub(super) fn $apply_configuration_response<'operation, E: $environment>(
       world: &'operation WorldState<E, $transport<E>>,
       request: &'operation ConfigurationRequest,
@@ -257,6 +271,11 @@ mod tests {
   }
 
   /// Construct one captured configuration request without wire items.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the named fixture isolates the captured-root identities that response pairing actually depends on, so the pairing contract \
+              can be tested without constructing wire items that play no part in it"
+  )]
   fn captured_request(roots: Vec<Url>) -> ConfigurationRequest {
     ConfigurationRequest {
       params:         ConfigurationParams {
@@ -294,7 +313,7 @@ mod tests {
     ensure(
       (global, scoped)
         == (json!({"global": true}), vec![
-          (first.clone(), json!({"root": "first"})),
+          (first, json!({"root": "first"})),
           (second.clone(), json!({"root": "second"})),
         ]),
       "configuration response pairing must preserve global value and captured root order",
@@ -396,7 +415,7 @@ mod tests {
           &concurrent_push.diagnostics,
           "configuration without open documents or associations must emit no pushed concurrent effects",
         )?;
-      }
+      };
       Ok(())
     })
   }

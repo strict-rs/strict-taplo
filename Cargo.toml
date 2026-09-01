@@ -1,16 +1,15 @@
 [workspace]
 members = ["crates/*", "stask"]
-
 resolver = "3"
 
 [workspace.package]
 authors      = ["tamasfe", "Takumi"]
-edition      = "2024"
+edition = "2024"
 version = "0.16.0"
 publish = false
 license      = "MIT"
 license-file = "LICENSE"
-rust-version = "1.97"
+rust-version = "1.98"
 homepage     = "https://github.com/strict-rs/strict-taplo"
 repository   = "https://github.com/strict-rs/strict-taplo"
 
@@ -54,8 +53,8 @@ async-ctrlc   = { version = "1.2.0", features = ["stream"] }
 clap_complete = { version = "4.6.9" }
 prettydiff    = { version = "0.9.0", default-features = false }               # `prettydiff` is also a CLI that pulls in `clap` by default
 json_value_merge   = { version = "2.0.1" }
-jsonschema         = { version = "0.49.9", default-features = false }
-lru                = { version = "0.18.2" }
+jsonschema         = { version = "0.52.1", default-features = false }
+lru                = { version = "0.18.3" }
 percent-encoding   = { version = "2.3.2" }
 rustls             = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 semver             = { version = "1.0.28", features = ["serde"] }
@@ -71,10 +70,10 @@ wasm-bindgen-futures = { version = "0.4.77" }
 criterion        = { version = "0.8" }   # criterion -> clap
 pprof = { version = "0.16",  features = ["flamegraph", "criterion"], git = "https://github.com/strict-rs/strict-pprof-rs.git", branch = "strict"} # pprof -> criterion -> clap
 
-bpaf = {  version = "0.10", default-features = false, git = "https://github.com/strict-rs/strict-bpaf.git", branch = "sync"}
+bpaf = { version = "0.10", default-features = false, git = "https://github.com/strict-rs/strict-bpaf.git", branch = "sync"}
 template-core = { version = "0.3.0", git = "https://github.com/earthlings-dev/template-rs.git", branch = "main"}
 template-stask = { version = "0.3.0", git = "https://github.com/earthlings-dev/template-rs.git", branch = "main"}
-trybuild = {  version = "1", git = "https://github.com/strict-rs/strict-trybuild.git", branch = "strict"}
+trybuild = { version = "1", git = "https://github.com/strict-rs/strict-trybuild.git", branch = "strict"}
 strict-test-support = { version = "0.1.0", git = "https://github.com/earthlings-dev/strict-test-support-rs.git", branch = "main"}
 
 syn         = { version = "3", features = ["full", "visit"] }
@@ -84,7 +83,7 @@ ignore = "0.4"
 toml_edit = "0.25"
 anstyle = "1"
 snapbox = { version = "1.2", features = ["diff"], default-features = false }
-proptest = {  version = "2", features = ["std", "strict-test"], default-features = false, git = "https://github.com/strict-rs/strict-proptest.git", branch = "strict"}
+proptest = { version = "2", features = ["std", "strict-test"], default-features = false, git = "https://github.com/strict-rs/strict-proptest.git", branch = "strict"}
 
 [patch.crates-io]
 pprof = { git = "https://github.com/strict-rs/strict-pprof-rs.git", branch = "strict"}
@@ -97,6 +96,15 @@ tracing-log = { git = "https://github.com/strict-rs/strict-tracing.git", branch 
 tracing-subscriber = { git = "https://github.com/strict-rs/strict-tracing.git", branch = "strict" }
 rowan = { git = "https://github.com/strict-rs/strict-rowan.git", branch = "strict" }
 thiserror = { git = "https://github.com/strict-rs/strict-thiserror.git", branch = "upgrade" }
+
+[patch."https://github.com/strict-rs/strict-taplo.git"]
+taplo = { path = "crates/taplo" }
+taplo-cli = { path = "crates/taplo-cli" }
+taplo-common = { path = "crates/taplo-common" }
+taplo-lsp = { path = "crates/taplo-lsp" }
+taplo-lsp-async = { path = "crates/taplo-lsp-async" }
+taplo-test-support = { path = "crates/taplo-test-support" }
+taplo-wasm = { path = "crates/taplo-wasm" }
 
 # Original Taplo Release Profile
 # [profile.release]

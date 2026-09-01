@@ -18,6 +18,7 @@ use serde_json::Value;
 use taplo::dom::Keys;
 use taplo::dom::Node;
 use taplo::dom::RenderError;
+use taplo::dom::node::IntegerValue;
 use taplo::dom::node::TableKind;
 use taplo::rowan::TextRange;
 use taplo_common::schema::ValueExt as _;
@@ -158,7 +159,7 @@ fn completion_instance(root: &Node) -> Value {
             .entries()
             .iter()
             .filter(|entry| entry.0.errors().is_empty())
-            .map(|(key, value)| (key.value().to_owned(), value))
+            .map(|(key, child)| (key.value().to_owned(), child))
             .collect::<Vec<_>>();
           let keys = entries.iter().map(|entry| entry.0.clone()).collect();
           tasks.push(CompletionInstanceTask::FinishTable(keys));
@@ -172,8 +173,8 @@ fn completion_instance(root: &Node) -> Value {
         Node::Bool(boolean) => values.push(Some(Value::Bool(boolean.value()))),
         Node::Str(string) => values.push(Some(Value::String(string.value().to_owned()))),
         Node::Integer(integer) => values.push(Some(Value::Number(match integer.value() {
-          taplo::dom::node::IntegerValue::Negative(value) => value.into(),
-          taplo::dom::node::IntegerValue::Positive(value) => value.into(),
+          IntegerValue::Negative(negative) => negative.into(),
+          IntegerValue::Positive(positive) => positive.into(),
         }))),
         Node::Float(float) => values.push(serde_json::Number::from_f64(float.value()).map(Value::Number)),
         Node::Date(date_time) => values.push(Some(Value::String(date_time.value().to_string()))),
@@ -184,12 +185,11 @@ fn completion_instance(root: &Node) -> Value {
         for key in keys.into_iter().rev() {
           projected.push((key, values.pop().flatten()));
         }
-        let mut table = serde_json::Map::new();
-        for (key, value) in projected.into_iter().rev() {
-          if let Some(value) = value {
-            drop(table.insert(key, value));
-          }
-        }
+        let table = projected
+          .into_iter()
+          .rev()
+          .filter_map(|(key, projected_value)| Some((key, projected_value?)))
+          .collect::<serde_json::Map<_, _>>();
         values.push(Some(Value::Object(table)));
       }
       CompletionInstanceTask::FinishArray(item_count) => {
@@ -324,6 +324,7 @@ macro_rules! define_completion_future_family {
     ///
     /// Returns an RPC error when request parameters, source coordinates, schema traversal,
     /// completion rendering, or snapshot freshness cannot be validated.
+    #[allow(clippy::single_call_fn, reason = "one completion entry point per execution family, registered exactly once by its runtime family")]
     pub(super) fn $completion<E: $environment>(
       world: &WorldState<E, $transport<E>>,
       params: Params<CompletionParams>,
@@ -359,6 +360,7 @@ macro_rules! define_completion_future_family {
     }
 
     /// Build completions for one already-classified semantic target.
+    #[allow(clippy::single_call_fn, reason = "the named step keeps the exhaustive `CompletionTarget` dispatch separate from the snapshot, association, and cursor classification that precedes it")]
     fn $complete_target<'operation, E: $environment>(
       snapshot: &'operation DocumentSnapshot<$transport<E>>,
       schema_url: &'operation Url,
@@ -450,6 +452,11 @@ define_response_document_handler_execution_families!(
 );
 
 /// Return whether a schema branch permits an object.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the name carries the domain rule that an absent, null, scalar, or union `type` can still admit a table header, which the \
+            filter closure would otherwise state as three unexplained JSON probes"
+)]
 fn accepts_object(schema: &Value) -> bool {
   let schema_type = schema.get("type");
   schema_type.is_none_or(Value::is_null)
@@ -460,6 +467,11 @@ fn accepts_object(schema: &Value) -> bool {
 }
 
 /// Return whether a schema branch permits an array whose items are objects.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the name carries the domain rule that `[[array of tables]]` requires an array whose item schema is absent, null, or an \
+            object, keeping that TOML-specific contract out of the filter closure"
+)]
 fn accepts_array_of_objects(schema: &Value) -> bool {
   schema.get("type").is_some_and(|schema_type| schema_type == "array")
     && schema
@@ -476,13 +488,11 @@ fn missing_or_pseudo(root: &Node, path: &Keys) -> bool {
     .is_none_or(|node| node.as_table().is_some_and(|table| table.kind() == TableKind::Pseudo))
 }
 
-/// Build one optional replacement edit from an owned insertion.
-fn replacement_text_edit(replacement: Option<&Range>, new_text: String) -> Option<CompletionTextEdit> {
-  replacement.map(|replacement_range| {
-    CompletionTextEdit::Edit(TextEdit {
-      range: *replacement_range,
-      new_text,
-    })
+/// Build one replacement edit covering an existing source range.
+const fn replacement_text_edit(replacement_range: Range, new_text: String) -> CompletionTextEdit {
+  CompletionTextEdit::Edit(TextEdit {
+    range: replacement_range,
+    new_text,
   })
 }
 
@@ -494,7 +504,7 @@ fn header_completion(path: &Keys, schema: &Value, replacement: Option<&Range>) -
     kind: Some(CompletionItemKind::STRUCT),
     documentation: documentation(schema)?,
     insert_text: Some(text.clone()),
-    text_edit: replacement_text_edit(replacement, text),
+    text_edit: replacement.map(|replacement_range| replacement_text_edit(*replacement_range, text)),
     ..Default::default()
   })
 }
@@ -573,7 +583,7 @@ fn entry_key_completions(
         label: relative_path.to_string(),
         kind: Some(CompletionItemKind::VARIABLE),
         documentation: documentation(&schema)?,
-        text_edit: replacement_text_edit(replacement, text.clone()),
+        text_edit: replacement.map(|replacement_range| replacement_text_edit(*replacement_range, text.clone())),
         insert_text: Some(text),
         insert_text_format: if has_equals {
           None
@@ -617,7 +627,7 @@ fn standalone_key_completions(
         documentation: documentation(&schema)?,
         insert_text_format: Some(InsertTextFormat::SNIPPET),
         insert_text: Some(text.clone()),
-        text_edit: replacement_text_edit(replacement, text),
+        text_edit: replacement.map(|replacement_range| replacement_text_edit(*replacement_range, text)),
         ..Default::default()
       })
     })
@@ -698,7 +708,7 @@ fn value_completion(
       .filter(|content| !content.is_empty())
       .map(markdown_documentation),
     insert_text: Some(text.clone()),
-    text_edit: replacement_text_edit(replacement, text),
+    text_edit: replacement.map(|replacement_range| replacement_text_edit(*replacement_range, text)),
     ..Default::default()
   }
 }
@@ -713,16 +723,21 @@ fn snippet_completion(label: &str, text: &str, documentation_text: Option<String
       .map(markdown_documentation),
     insert_text: Some(text.into()),
     insert_text_format: Some(InsertTextFormat::SNIPPET),
-    text_edit: replacement_text_edit(replacement, text.into()),
+    text_edit: replacement.map(|replacement_range| replacement_text_edit(*replacement_range, text.into())),
     ..Default::default()
   }
 }
 
 /// Select the first losslessly representable explicit schema value in precedence order.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the named selector owns the const-before-default precedence and its skip-on-unrepresentable fallthrough, so the caller's enum \
+            and type-derived branches stay one readable step each"
+)]
 fn explicit_value_completion(
   schema: &Value,
   candidates: [(&str, Option<String>); 2],
-  schema_docs: &Option<String>,
+  schema_docs: Option<&str>,
   replacement: Option<&Range>,
   single_quote: bool,
 ) -> Result<Option<CompletionItem>, CompletionError> {
@@ -733,7 +748,7 @@ fn explicit_value_completion(
       return Ok(Some(value_completion(
         text,
         kind,
-        candidate_docs.or_else(|| schema_docs.clone()),
+        candidate_docs.or_else(|| schema_docs.map(str::to_owned)),
         replacement,
       )));
     }
@@ -747,6 +762,11 @@ fn explicit_value_completion(
 ///
 /// Returns a typed completion error when schema extensions or candidate TOML values cannot be
 /// decoded losslessly.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the named builder owns the complete enum-then-const-or-default-then-type precedence for one schema branch, leaving its caller \
+            to iterate branches without repeating that ordering"
+)]
 fn add_value_completions(
   schema: &Value,
   replacement: Option<&Range>,
@@ -784,7 +804,7 @@ fn add_value_completions(
       ("const", ext_docs.const_value.clone()),
       ("default", ext_docs.default_value.clone()),
     ],
-    &schema_docs,
+    schema_docs.as_deref(),
     replacement,
     single_quote,
   )? {
@@ -922,6 +942,11 @@ fn default_value_snippet(schema: &Value, cursor_count: usize, single_quote: bool
 }
 
 /// Render a type-directed empty snippet when no explicit value is available.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the name marks the terminating case of `default_value_snippet`'s recursion: the point where no explicit or nested value \
+            remains and only the schema type may shape the placeholder"
+)]
 fn empty_value_snippet(schema: &Value, cursor_count: usize) -> String {
   if schema.is_schema_ref() {
     return format!("${cursor_count}");
@@ -1001,10 +1026,14 @@ mod tests {
   use super::schema_value_to_toml;
   use super::standalone_key_completions;
   use super::table_header_completions;
+  use crate::LocalTestFuture;
   use crate::query::Query;
   use crate::world::LocalWorld;
   use crate::world::ManualAssociationRule;
   use crate::world::TestEnvironment;
+
+  /// One schema candidate in traversal shape: full path, relative path, and schema body.
+  type SchemaCandidate = (Keys, Keys, Arc<Value>);
 
   /// Classify one real parsed cursor fixture through the production completion decision model.
   fn classify(source: &str, offset: u32) -> Result<Option<CompletionTarget>, TestFailure> {
@@ -1016,7 +1045,7 @@ mod tests {
   }
 
   /// Construct one schema candidate through the same exact-path representation used by traversal.
-  fn completion_schema(full: &str, relative: &str, schema: Value) -> Result<(Keys, Keys, Arc<Value>), TestFailure> {
+  fn completion_schema(full: &str, relative: &str, schema: Value) -> Result<SchemaCandidate, TestFailure> {
     let full_path = ensure_ok(full.parse::<Keys>(), "the full completion path must parse")?;
     let relative_path = ensure_ok(relative.parse::<Keys>(), "the relative completion path must parse")?;
     Ok((full_path, relative_path, Arc::new(schema)))
@@ -1029,43 +1058,62 @@ mod tests {
 
   /// Project a simple completion replacement into exact observable fields.
   fn simple_text_edit(item: &CompletionItem) -> Option<(&Range, &str)> {
-    match item.text_edit.as_ref()? {
-      CompletionTextEdit::Edit(edit) => Some((&edit.range, edit.new_text.as_str())),
+    match *item.text_edit.as_ref()? {
+      CompletionTextEdit::Edit(ref edit) => Some((&edit.range, edit.new_text.as_str())),
       CompletionTextEdit::InsertAndReplace(_) => None,
     }
   }
 
   /// Decode one complete completion request through its public wire shape.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the named fixture fixes completion's request type at the shared positional decoder, so every scenario exercises the real \
+              `CompletionParams` wire shape rather than a hand-built value"
+  )]
   fn completion_params(document: &Url, line: u32, character: u32) -> Result<CompletionParams, TestFailure> {
     position_params(document, line, character, "the completion request fixture must decode")
   }
 
   /// Execute one local completion request against the current document revision.
-  async fn completion_at(
-    world: &LocalWorld<TestEnvironment>,
-    document: &Url,
+  fn completion_at<'operation>(
+    world: &'operation LocalWorld<TestEnvironment>,
+    document: &'operation Url,
     character: u32,
     context: &'static str,
-  ) -> Result<Option<CompletionResponse>, TestFailure> {
-    ensure_ok(
-      completion_local(world, Params::from(Some(completion_params(document, 0, character)?))).await,
-      context,
-    )
+  ) -> LocalTestFuture<'operation, Option<CompletionResponse>> {
+    Box::pin(async move {
+      ensure_ok(
+        completion_local(world, Params::from(Some(completion_params(document, 0, character)?))).await,
+        context,
+      )
+    })
   }
 
   /// Install one source revision and execute completion through the local public handler family.
-  async fn complete_source(
-    world: &LocalWorld<TestEnvironment>,
-    document: &Url,
-    source_text: &str,
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the named helper binds source installation to the completion request that must observe it, so a scenario cannot query a \
+              revision it never committed"
+  )]
+  fn complete_source<'operation>(
+    world: &'operation LocalWorld<TestEnvironment>,
+    document: &'operation Url,
+    source_text: &'operation str,
     character: u32,
     context: &'static str,
-  ) -> Result<Option<CompletionResponse>, TestFailure> {
-    replace_local_document(world, document, source_text, "the completion document revision must install").await?;
-    completion_at(world, document, character, context).await
+  ) -> LocalTestFuture<'operation, Option<CompletionResponse>> {
+    Box::pin(async move {
+      replace_local_document(world, document, source_text, "the completion document revision must install").await?;
+      completion_at(world, document, character, context).await
+    })
   }
 
   /// Return owned labels from either supported LSP completion response representation.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the named projection keeps the exhaustive `CompletionResponse` match in one place, so assertions observe labels without \
+              depending on which wire representation the handler returns"
+  )]
   fn response_labels(response: CompletionResponse) -> Vec<String> {
     match response {
       CompletionResponse::Array(items) => items.into_iter().map(|item| item.label).collect(),
@@ -1074,89 +1122,95 @@ mod tests {
   }
 
   /// Execute one schema-backed completion request and require a present response.
-  async fn completion_labels(
-    world: &LocalWorld<TestEnvironment>,
-    document: &Url,
-    source_text: &str,
+  fn completion_labels<'operation>(
+    world: &'operation LocalWorld<TestEnvironment>,
+    document: &'operation Url,
+    source_text: &'operation str,
     character: u32,
     execution_context: &'static str,
     presence_context: &'static str,
-  ) -> Result<Vec<String>, TestFailure> {
-    let response = ensure_some(
-      complete_source(world, document, source_text, character, execution_context).await?,
-      presence_context,
-    )?;
-    Ok(response_labels(response))
+  ) -> LocalTestFuture<'operation, Vec<String>> {
+    Box::pin(async move {
+      let response = ensure_some(
+        complete_source(world, document, source_text, character, execution_context).await?,
+        presence_context,
+      )?;
+      Ok(response_labels(response))
+    })
   }
 
   /// Execute one completion request whose observable label contract is order-independent.
-  async fn sorted_completion_labels(
-    world: &LocalWorld<TestEnvironment>,
-    document: &Url,
-    source_text: &str,
+  fn sorted_completion_labels<'operation>(
+    world: &'operation LocalWorld<TestEnvironment>,
+    document: &'operation Url,
+    source_text: &'operation str,
     character: u32,
     execution_context: &'static str,
     presence_context: &'static str,
-  ) -> Result<String, TestFailure> {
-    let mut labels = completion_labels(world, document, source_text, character, execution_context, presence_context).await?;
-    labels.sort();
-    Ok(labels.join(","))
+  ) -> LocalTestFuture<'operation, String> {
+    Box::pin(async move {
+      let mut labels = completion_labels(world, document, source_text, character, execution_context, presence_context).await?;
+      labels.sort();
+      Ok(labels.join(","))
+    })
   }
 
   /// Construct one document with an exact association and a complete in-memory schema.
-  async fn schema_backed_completion_world() -> Result<(LocalWorld<TestEnvironment>, Url), TestFailure> {
-    let world = local_world()?;
-    let document = fixture_url("file:///workspace/completion.toml", "the completion document URL must parse")?;
-    replace_local_document(&world, &document, "", "the initial completion document must install").await?;
-    let schema_url = fixture_url("https://example.com/completion-schema.json", "the completion schema URL must parse")?;
-    drop(ensure_ok(
-      world
-        .associate_schema(ManualAssociationRule::Url(document.clone()), SchemaAssociation {
-          meta:     json!({ "source": source::MANUAL }),
-          url:      schema_url.clone(),
-          priority: priority::MAX,
-        })
-        .await,
-      "the exact completion schema association must commit",
-    )?);
-    let snapshot = ensure_some(
-      world.document_snapshot(&document).await,
-      "the associated completion document must expose a snapshot",
-    )?;
-    snapshot.schemas.add_schema(
-      &schema_url,
-      Arc::new(json!({
-        "type": "object",
-        "properties": {
-          "flag": {
-            "type": "boolean"
-          },
-          "name": {
-            "type": "string"
-          },
-          "table": {
-            "type": "object",
-            "properties": {
-              "nested": {
-                "const": 1
-              }
-            }
-          },
-          "items": {
-            "type": "array",
-            "items": {
+  fn schema_backed_completion_world() -> LocalTestFuture<'static, (LocalWorld<TestEnvironment>, Url)> {
+    Box::pin(async {
+      let world = local_world()?;
+      let document = fixture_url("file:///workspace/completion.toml", "the completion document URL must parse")?;
+      replace_local_document(&world, &document, "", "the initial completion document must install").await?;
+      let schema_url = fixture_url("https://example.com/completion-schema.json", "the completion schema URL must parse")?;
+      drop(ensure_ok(
+        world
+          .associate_schema(ManualAssociationRule::Url(document.clone()), SchemaAssociation {
+            meta:     json!({ "source": source::MANUAL }),
+            url:      schema_url.clone(),
+            priority: priority::MAX,
+          })
+          .await,
+        "the exact completion schema association must commit",
+      )?);
+      let snapshot = ensure_some(
+        world.document_snapshot(&document).await,
+        "the associated completion document must expose a snapshot",
+      )?;
+      snapshot.schemas.add_schema(
+        &schema_url,
+        Arc::new(json!({
+          "type": "object",
+          "properties": {
+            "flag": {
+              "type": "boolean"
+            },
+            "name": {
+              "type": "string"
+            },
+            "table": {
               "type": "object",
               "properties": {
-                "id": {
-                  "type": "integer"
+                "nested": {
+                  "const": 1
+                }
+              }
+            },
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "integer"
+                  }
                 }
               }
             }
           }
-        }
-      })),
-    );
-    Ok((world, document))
+        })),
+      );
+      Ok((world, document))
+    })
   }
 
   /// Extract rendered Markdown from one completion documentation value.
@@ -1167,6 +1221,11 @@ mod tests {
       })
       | Documentation::String(ref value) => Some(value),
     }
+  }
+
+  /// Render one expected LSP snippet placeholder with an editable default, such as `${0:true}`.
+  fn snippet_placeholder(tab_stop: u8, default_text: &str) -> String {
+    format!("${{{tab_stop}:{default_text}}}")
   }
 
   #[test]
@@ -1271,15 +1330,15 @@ mod tests {
       "a cursor on a scalar value must select value replacement with basic-string preference",
     )?;
     let Some(CompletionTarget::EntryValue {
-      replacement,
-      lookup_path,
+      replacement: value_replacement,
+      lookup_path: value_lookup_path,
       ..
     }) = classify("values = [1]\n", 10)?
     else {
       return ensure(false, "a cursor on an array element must select entry-value completion");
     };
     ensure(
-      (replacement.is_none(), lookup_path.is_empty()) == (true, false),
+      (value_replacement.is_none(), value_lookup_path.is_empty()) == (true, false),
       "an array element must retain its semantic inline lookup path without replacing the complete array value",
     )?;
     ensure(
@@ -1329,9 +1388,9 @@ mod tests {
     )
   }
 
-  /// Exercise every classified completion target through schema lookup and rendering.
+  /// Exercise the empty-line and header completion targets through schema lookup and rendering.
   #[test]
-  fn schema_backed_handler_completes_every_cursor_surface() -> Result<(), TestFailure> {
+  fn schema_backed_handler_completes_header_surfaces() -> Result<(), TestFailure> {
     block_on(async {
       let (world, document) = schema_backed_completion_world().await?;
 
@@ -1380,7 +1439,15 @@ mod tests {
         &array_table_labels.as_str(),
         &"items",
         "array-table completion must retain only compatible arrays of objects",
-      )?;
+      )
+    })
+  }
+
+  /// Exercise the standalone and assigned entry-key completion targets through schema lookup.
+  #[test]
+  fn schema_backed_handler_completes_key_surfaces() -> Result<(), TestFailure> {
+    block_on(async {
+      let (world, document) = schema_backed_completion_world().await?;
 
       let entry_key_label_set = sorted_completion_labels(
         &world,
@@ -1411,7 +1478,15 @@ mod tests {
         &",flag,items,name,table,table.nested",
         "assigned entry-key completion must expose the current path and every compatible schema path while retaining the existing equals \
          sign",
-      )?;
+      )
+    })
+  }
+
+  /// Exercise the value, inline-table, and incomplete-value completion targets through rendering.
+  #[test]
+  fn schema_backed_handler_completes_value_surfaces() -> Result<(), TestFailure> {
+    block_on(async {
+      let (world, document) = schema_backed_completion_world().await?;
 
       let entry_value_labels = completion_labels(
         &world,
@@ -1826,7 +1901,7 @@ mod tests {
   }
 
   #[test]
-  fn entry_builders_preserve_presence_equals_and_replacement_contracts() -> Result<(), TestFailure> {
+  fn entry_builders_preserve_presence_and_replacement_contracts() -> Result<(), TestFailure> {
     let document = parse_document("existing = 1\n[pseudo.child]\n", "the entry-completion DOM fixture must parse")?;
     let schemas = vec![
       completion_schema("existing", "existing", json!({ "default": 2 }))?,
@@ -1870,8 +1945,12 @@ mod tests {
           .collect::<Vec<_>>(),
       ) == (vec!["missing", "pseudo"], vec![true, true]),
       "standalone-key completion must replace only missing or pseudo paths",
-    )?;
+    )
+  }
 
+  #[test]
+  fn entry_builders_preserve_equals_and_value_contracts() -> Result<(), TestFailure> {
+    let replacement = Range::default();
     let key_schema = vec![completion_schema("feature", "feature", json!({ "default": true }))?];
     let assigned = ensure_ok(
       entry_key_completions(key_schema.clone(), Some(&replacement), true),
@@ -1891,12 +1970,14 @@ mod tests {
       "unassigned entry-key completions must build",
     )?;
     let unassigned_item = ensure_some(unassigned.first(), "the unassigned key completion must exist")?;
+    let feature_snippet = snippet_placeholder(0, "true");
+    let expected_entry_insert = format!("feature = {feature_snippet}");
     ensure(
       (
         unassigned_item.insert_text.as_deref(),
         unassigned_item.insert_text_format,
         unassigned_item.text_edit.is_some(),
-      ) == (Some("feature = ${0:true}"), Some(InsertTextFormat::SNIPPET), false),
+      ) == (Some(expected_entry_insert.as_str()), Some(InsertTextFormat::SNIPPET), false),
       "an unassigned key completion must insert a complete schema-directed entry snippet",
     )?;
 
@@ -1925,6 +2006,7 @@ mod tests {
 
   #[test]
   fn empty_value_snippets_cover_every_schema_type_polarity() -> Result<(), TestFailure> {
+    let boolean_placeholder = snippet_placeholder(3, "false");
     for (schema, expected) in [
       (json!({ "$ref": "#/$defs/value" }), "$3"),
       (json!({}), "{ $3 }"),
@@ -1933,7 +2015,7 @@ mod tests {
       (json!({ "type": "object" }), "{ $3 }"),
       (json!({ "type": "array" }), "[$3]"),
       (json!({ "type": "string" }), "\"$3\""),
-      (json!({ "type": "boolean" }), "${3:false}"),
+      (json!({ "type": "boolean" }), boolean_placeholder.as_str()),
       (json!({ "type": "integer" }), "$3"),
     ] {
       let snippet = empty_value_snippet(&schema, 3);
@@ -2005,7 +2087,7 @@ mod tests {
         "a valid default must produce a snippet",
       )?
       .as_ref(),
-      &concat!("$", "{", "0:true", "}"),
+      &snippet_placeholder(0, "true").as_str(),
       "null const must fall through to a valid default",
     )?;
     ensure_eq(

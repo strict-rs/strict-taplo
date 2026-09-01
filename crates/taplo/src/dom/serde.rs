@@ -234,6 +234,10 @@ impl<'de> Deserialize<'de> for DetachedNode {
 }
 
 /// Allocate detached records iteratively so publication never follows the host call stack.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the named phase owns identity allocation and keeps detached deserialization off the host call stack"
+)]
 fn detached_records(root: DetachedNode) -> Result<DetachedPublication, &'static str> {
   let root_id = ArenaNodeId::pending(0);
   let mut next_index = 1_usize;
@@ -287,6 +291,10 @@ fn detached_records(root: DetachedNode) -> Result<DetachedPublication, &'static 
 }
 
 /// Convert one detached record into its immutable arena representation.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the named converter keeps every detached record's immutable arena shape in one place"
+)]
 fn publish_detached_record(detached_record: DetachedRecord) -> NodeSeed {
   match detached_record {
     DetachedRecord::Bool(boolean) => NodeSeed::Bool {
@@ -358,6 +366,10 @@ fn publish_detached_record(detached_record: DetachedRecord) -> NodeSeed {
 }
 
 /// Publish detached records directly into one immutable arena.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the named publication phase pairs with detached_records to complete two-phase detached construction"
+)]
 fn publish_detached(publication: DetachedPublication) -> Node {
   for (id, record) in publication.records {
     id.initialize(publish_detached_record(record));

@@ -111,6 +111,7 @@ macro_rules! define_diagnostic_future_family {
     }
 
     /// Validate a clean snapshot against its active schema association.
+    #[allow(clippy::single_call_fn, reason = "naming the schema phase keeps association lookup and validation projection out of the syntax-then-DOM-then-schema precedence ladder that selects it")]
     fn $collect_schema_errors<'operation, E: $environment>(
       snapshot: &'operation DocumentSnapshot<$transport<E>>,
       document_url: &'operation Url,
@@ -356,6 +357,7 @@ fn single_dom_error(document: &DocumentState, source_range: TextRange, message: 
 #[cfg(test)]
 mod tests {
   use lsp_types::DiagnosticSeverity;
+  use lsp_types::Uri;
   use strict_test_support::TestFailure;
   use strict_test_support::ensure;
   use strict_test_support::ensure_ok;
@@ -373,6 +375,14 @@ mod tests {
     ensure_ok(
       Url::parse("file:///workspace/diagnostics.toml"),
       "the diagnostic document URL must parse",
+    )
+  }
+
+  /// Convert the diagnostic fixture URL into its LSP wire URI.
+  fn document_wire_uri() -> Result<Uri, TestFailure> {
+    ensure_some(
+      super::super::uri::to_uri(&document_url()?),
+      "the diagnostic document URL must convert to an LSP URI",
     )
   }
 
@@ -403,47 +413,73 @@ mod tests {
   }
 
   #[test]
-  fn semantic_diagnostics_cover_paired_and_single_source_contracts() -> Result<(), TestFailure> {
-    let url = document_url()?;
-    let uri = ensure_some(
-      super::super::uri::to_uri(&url),
-      "the diagnostic document URL must convert to an LSP URI",
-    )?;
-    for (source, expected_message, expected_count, context) in [
+  fn semantic_diagnostics_cover_paired_source_contracts() -> Result<(), TestFailure> {
+    let uri = document_wire_uri()?;
+    for (source, expected_message, context) in [
       (
         "a = 1\na = 2\n",
         "conflicting keys",
-        2_usize,
         "conflicting keys must retain paired diagnostics",
       ),
       (
         "a = 1\n[a.b]\n",
         "expected table",
-        2_usize,
         "table requirements must retain paired diagnostics",
       ),
       (
         "a = 1\n[[a]]\n",
         "expected array of tables",
-        2_usize,
         "array-of-table requirements must retain paired diagnostics",
       ),
+    ] {
+      let document = parse_document(source, "the semantic-diagnostic document must construct")?;
+      let diagnostics = ensure_ok(
+        collect_dom_errors(&document, &uri),
+        "semantic diagnostics must map to complete LSP values",
+      )?;
+      let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message == expected_message)
+        .collect::<Vec<_>>();
+      ensure(matching.len() == 2, context)?;
+      let primary = ensure_some(
+        matching.first().copied(),
+        "a paired semantic diagnostic must retain its primary side",
+      )?;
+      let related = ensure_some(
+        matching.get(1).copied(),
+        "a paired semantic diagnostic must retain its contextual side",
+      )?;
+      ensure(
+        (
+          primary.severity,
+          related.severity,
+          primary.related_information.as_ref().map(Vec::len),
+          related.related_information.as_ref().map(Vec::len),
+        ) == (Some(DiagnosticSeverity::ERROR), Some(DiagnosticSeverity::HINT), Some(1), Some(1)),
+        "paired semantic diagnostics must retain error/hint polarity and reciprocal source context",
+      )?;
+    }
+    Ok(())
+  }
+
+  #[test]
+  fn semantic_diagnostics_cover_single_source_and_clean_contracts() -> Result<(), TestFailure> {
+    let uri = document_wire_uri()?;
+    for (source, expected_prefix, context) in [
       (
         "\"\\q\" = 1\n",
         "the string contains invalid escape sequence(s)",
-        1_usize,
         "invalid key escapes must retain one source diagnostic",
       ),
       (
         "value = 999999999999999999999999999999\n",
         "the integer scalar could not be decoded:",
-        1_usize,
         "malformed integers must retain one typed decode diagnostic",
       ),
       (
         "missing =\nnext = 1\n",
         "the syntax was not expected here:",
-        1_usize,
         "missing values must retain one unexpected-source diagnostic",
       ),
     ] {
@@ -454,41 +490,15 @@ mod tests {
       )?;
       let matching = diagnostics
         .iter()
-        .filter(|diagnostic| {
-          if expected_count == 2 {
-            diagnostic.message == expected_message
-          } else {
-            diagnostic.message.starts_with(expected_message)
-          }
-        })
+        .filter(|diagnostic| diagnostic.message.starts_with(expected_prefix))
         .collect::<Vec<_>>();
-      ensure(matching.len() == expected_count, context)?;
-      if expected_count == 2 {
-        let primary = ensure_some(
-          matching.first().copied(),
-          "a paired semantic diagnostic must retain its primary side",
-        )?;
-        let related = ensure_some(
-          matching.get(1).copied(),
-          "a paired semantic diagnostic must retain its contextual side",
-        )?;
-        ensure(
-          (
-            primary.severity,
-            related.severity,
-            primary.related_information.as_ref().map(Vec::len),
-            related.related_information.as_ref().map(Vec::len),
-          ) == (Some(DiagnosticSeverity::ERROR), Some(DiagnosticSeverity::HINT), Some(1), Some(1)),
-          "paired semantic diagnostics must retain error/hint polarity and reciprocal source context",
-        )?;
-      } else {
-        ensure(
-          matching
-            .first()
-            .is_some_and(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR)),
-          "single-source semantic diagnostics must retain error severity",
-        )?;
-      }
+      ensure(matching.len() == 1, context)?;
+      ensure(
+        matching
+          .first()
+          .is_some_and(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR)),
+        "single-source semantic diagnostics must retain error severity",
+      )?;
     }
 
     let clean = parse_document("value = 1\n", "the clean semantic-diagnostic document must construct")?;

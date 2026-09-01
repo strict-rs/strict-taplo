@@ -59,6 +59,11 @@ pub fn json_to_toml(json: &str, inline: bool) -> Result<String, ConvertError> {
 /// [`ConvertError::SyntaxDiagnostics`] or
 /// [`ConvertError::SemanticDiagnostics`] when the source is not valid TOML,
 /// or [`ConvertError::Json`] when the resulting DOM cannot be serialized.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the explicit-presentation conversion entry point owns JSON policy selection for every caller, including the pretty-printing \
+            default"
+)]
 pub fn toml_to_json_with_format(toml: &str, formatting: JsonFormatting) -> Result<String, ConvertError> {
   let root = validated_toml(toml)?;
   match formatting {
@@ -73,11 +78,19 @@ pub fn toml_to_json_with_format(toml: &str, formatting: JsonFormatting) -> Resul
 ///
 /// Returns the typed conversion failures documented by
 /// [`toml_to_json_with_format`].
+#[allow(
+  clippy::single_call_fn,
+  reason = "the established conversion entry point pins pretty JSON as the default presentation independently of the policy-selecting form"
+)]
 pub fn toml_to_json(toml: &str) -> Result<String, ConvertError> {
   toml_to_json_with_format(toml, JsonFormatting::Pretty)
 }
 
 /// Parse and validate one TOML document for either JSON presentation.
+#[allow(
+  clippy::single_call_fn,
+  reason = "document validation isolates syntax- and semantic-diagnostic rejection from JSON presentation"
+)]
 fn validated_toml(toml: &str) -> Result<Node, ConvertError> {
   let parsed = parse(toml)?;
   if !parsed.diagnostics().is_empty() {

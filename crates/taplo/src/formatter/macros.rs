@@ -1,7 +1,13 @@
 //! Generation of complete and partial formatter option structures.
 //!
-//! The expansion owns field-by-field updates and type-directed textual parsing so callers cannot
-//! create a parallel option vocabulary or erase the concrete parse failure.
+//! The expansion owns field-by-field updates and option-name dispatch, while [`parse_option_value`]
+//! owns type-directed textual parsing at one generic boundary so callers cannot create a parallel
+//! option vocabulary or erase the concrete parse failure.
+
+use std::fmt::Display;
+use std::str::FromStr;
+
+use super::OptionParseError;
 
 /// Generate complete formatter options plus snake-case and camel-case partial update forms.
 macro_rules! create_options {
@@ -52,20 +58,10 @@ macro_rules! create_options {
                 &mut self,
                 values: I,
             ) -> Result<(), OptionParseError> {
-                for (key, val) in values {
-
+                for (key, input) in values {
                     $(
                         if key.as_ref() == stringify!($name) {
-                            self.$name =
-                                val.as_ref()
-                                    .parse::<$ty>()
-                                    .map_err(|error| OptionParseError::InvalidValue {
-                                        key: key.as_ref().into(),
-                                        input: val.as_ref().into(),
-                                        expected: stringify!($ty),
-                                        reason: error.to_string(),
-                                    })?;
-
+                            self.$name = parse_option_value(key.as_ref(), input.as_ref(), stringify!($ty))?;
                             continue;
                         }
                     )+
@@ -126,4 +122,23 @@ macro_rules! create_options {
             }
         }
     };
+}
+
+/// Parse one textual option value into the option's declared field type.
+///
+/// Every generated option arm shares this single generic construction of
+/// [`OptionParseError::InvalidValue`]. Keeping the parse behind the generic boundary keeps the
+/// error path reachable as written for every declared option type, including types such as
+/// [`String`] whose [`FromStr`] error is uninhabited.
+pub(super) fn parse_option_value<T>(key: &str, input: &str, expected: &'static str) -> Result<T, OptionParseError>
+where
+  T: FromStr,
+  T::Err: Display,
+{
+  input.parse::<T>().map_err(|error| OptionParseError::InvalidValue {
+    key: key.into(),
+    input: input.into(),
+    expected,
+    reason: error.to_string(),
+  })
 }

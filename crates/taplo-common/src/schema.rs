@@ -89,6 +89,10 @@ type ResolvedSchema = (Keys, Arc<Value>, Url);
 /// One descendant schema with absolute path, relative path, value, and reference base.
 type ResolvedChildSchema = (Keys, Keys, Arc<Value>, Url);
 
+/// One completion-facing descendant schema: the absolute document path, the path relative to the
+/// queried path, and the schema.
+type PossibleSchema = (Keys, Keys, Arc<Value>);
+
 /// A typed failure while interpreting, resolving, or validating JSON Schema.
 #[derive(Debug, Error)]
 pub enum SchemaError {
@@ -228,6 +232,11 @@ impl SchemaTraversalState {
   }
 
   /// Replace traversal state after composition has resolved additional references.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the merged constructor is the only successor that adopts cycle state an intersection branch resolved outside the frame it \
+              continues"
+  )]
   const fn merged(schema: Arc<Value>, base_url: Url, visited: HashSet<Url>) -> Self {
     Self {
       schema,
@@ -1048,7 +1057,7 @@ macro_rules! schema_operations {
       instance: &'schemas Value,
       path: &'schemas Keys,
       max_depth: usize,
-    ) -> $future<'schemas, Result<Vec<(Keys, Keys, Arc<Value>)>, SchemaError>>
+    ) -> $future<'schemas, Result<Vec<PossibleSchema>, SchemaError>>
     $($bounds)*
     {
       let span = tracing::info_span!(stringify!($possible_schemas_from), %schema_url, %path);
@@ -1211,6 +1220,10 @@ impl<E: LocalEnvironment> Schemas<LocalSchemaTransport<E>> {
   /// # Errors
   ///
   /// Returns [`SchemaError`] when cache or built-in initialization fails.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the current-thread constructor is the public seam that selects the local execution model's transport for an embedding host"
+  )]
   pub fn new_local(environment: E, http: reqwest::Client) -> Result<Self, SchemaError> {
     Self::with_transport(LocalSchemaTransport::new(environment, http))
   }
@@ -1223,6 +1236,10 @@ impl<E: ConcurrentEnvironment> Schemas<ConcurrentSchemaTransport<E>> {
   /// # Errors
   ///
   /// Returns [`SchemaError`] when cache or built-in initialization fails.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the multi-thread constructor is the public seam that selects the native execution model's transport for an embedding host"
+  )]
   pub fn new_concurrent(environment: E, http: reqwest::Client) -> Result<Self, SchemaError> {
     Self::with_transport(ConcurrentSchemaTransport::new(environment, http))
   }
@@ -1353,107 +1370,13 @@ impl SchemaValidationError {
     reason = "validation conversion decouples owned diagnostics from jsonschema's borrowed error representation"
   )]
   fn from_jsonschema(error: &ValidationError<'_>) -> Self {
-    let additional_properties = match *error.kind() {
-      ValidationErrorKind::AdditionalProperties {
-        ref unexpected,
-      } => Some(unexpected.clone()),
-      ValidationErrorKind::AdditionalItems {
-        ..
-      }
-      | ValidationErrorKind::AnyOf {
-        ..
-      }
-      | ValidationErrorKind::BacktrackLimitExceeded {
-        ..
-      }
-      | ValidationErrorKind::RegexEngineFailure {
-        ..
-      }
-      | ValidationErrorKind::Constant {
-        ..
-      }
-      | ValidationErrorKind::Contains
-      | ValidationErrorKind::ContentEncoding {
-        ..
-      }
-      | ValidationErrorKind::ContentMediaType {
-        ..
-      }
-      | ValidationErrorKind::Custom {
-        ..
-      }
-      | ValidationErrorKind::Enum {
-        ..
-      }
-      | ValidationErrorKind::ExclusiveMaximum {
-        ..
-      }
-      | ValidationErrorKind::ExclusiveMinimum {
-        ..
-      }
-      | ValidationErrorKind::FalseSchema
-      | ValidationErrorKind::Format {
-        ..
-      }
-      | ValidationErrorKind::FromUtf8 {
-        ..
-      }
-      | ValidationErrorKind::MaxItems {
-        ..
-      }
-      | ValidationErrorKind::Maximum {
-        ..
-      }
-      | ValidationErrorKind::MaxLength {
-        ..
-      }
-      | ValidationErrorKind::MaxProperties {
-        ..
-      }
-      | ValidationErrorKind::MinItems {
-        ..
-      }
-      | ValidationErrorKind::Minimum {
-        ..
-      }
-      | ValidationErrorKind::MinLength {
-        ..
-      }
-      | ValidationErrorKind::MinProperties {
-        ..
-      }
-      | ValidationErrorKind::MultipleOf {
-        ..
-      }
-      | ValidationErrorKind::Not {
-        ..
-      }
-      | ValidationErrorKind::OneOfMultipleValid {
-        ..
-      }
-      | ValidationErrorKind::OneOfNotValid {
-        ..
-      }
-      | ValidationErrorKind::Pattern {
-        ..
-      }
-      | ValidationErrorKind::PropertyNames {
-        ..
-      }
-      | ValidationErrorKind::Required {
-        ..
-      }
-      | ValidationErrorKind::Type {
-        ..
-      }
-      | ValidationErrorKind::UnevaluatedItems {
-        ..
-      }
-      | ValidationErrorKind::UnevaluatedProperties {
-        ..
-      }
-      | ValidationErrorKind::UniqueItems
-      | ValidationErrorKind::Referencing(_) => None,
+    let additional_properties = if let ValidationErrorKind::AdditionalProperties {
+      ref unexpected,
+    } = *error.kind()
+    {
+      Some(unexpected.clone())
+    } else {
+      None
     };
 
     let instance_path = error
@@ -1610,6 +1533,7 @@ mod tests {
   use super::CacheRetriever;
   use super::NodeValidationError;
   use super::PathSegment;
+  use super::PossibleSchema;
   use super::SchemaError;
   use super::SchemaValidationError;
   use super::Schemas;
@@ -1661,6 +1585,10 @@ mod tests {
 
   /// Construct current-thread HTTP-capable schema services.
   #[cfg(feature = "reqwest")]
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the local fixture names HTTP client construction and service initialization for the current-thread family under test"
+  )]
   fn local_schemas(environment: TestEnvironment) -> Result<LocalTestSchemas, TestFailure> {
     let http = ensure_result(local_http_client(), "the local schema HTTP client must initialize")?;
     ensure_result(Schemas::new_local(environment, http), "local schema services must initialize")
@@ -1668,6 +1596,11 @@ mod tests {
 
   /// Construct native concurrent schema services.
   #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the concurrent fixture names the timeout-bearing HTTP client and service initialization that distinguish the native Send \
+              family"
+  )]
   fn concurrent_schemas(environment: TestEnvironment) -> Result<ConcurrentTestSchemas, TestFailure> {
     let http = ensure_result(
       concurrent_http_client(&environment, Duration::from_secs(2)),
@@ -1691,10 +1624,23 @@ mod tests {
   fn seeded_object_property_schemas(
     schema_url: &str,
     property: &str,
-    property_schema: Value,
-    additional_properties: Value,
+    property_schema: &Value,
+    additional_properties: &Value,
   ) -> Result<(TestSchemas, Url), TestFailure> {
     seeded_schemas(schema_url, object_property_schema(property, property_schema, additional_properties))
+  }
+
+  /// Seed the array-of-integers object schema shared by the validation-behavior tests.
+  fn validation_schemas() -> Result<(TestSchemas, Url), TestFailure> {
+    seeded_object_property_schemas(
+      "https://example.com/validation.json",
+      "values",
+      &json!({
+        "type": "array",
+        "items": { "type": "integer" }
+      }),
+      &Value::Bool(false),
+    )
   }
 
   /// Read one textual property from a schema fixture.
@@ -1703,7 +1649,7 @@ mod tests {
   }
 
   /// Project descendant paths and one textual metadata field for exact assertions.
-  fn child_text_facts(children: &[(Keys, Keys, Arc<Value>)], name: &str) -> Vec<(String, Option<String>)> {
+  fn child_text_facts(children: &[PossibleSchema], name: &str) -> Vec<(String, Option<String>)> {
     children
       .iter()
       .map(|child| (child.1.dotted().to_owned(), schema_text(&child.2, name).map(str::to_owned)))
@@ -1711,15 +1657,24 @@ mod tests {
   }
 
   /// Project a single-property validation path into its stable property name.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the projection names the exhaustive instance-path shape that keeps custom-format rejections attributable to one property"
+  )]
   fn single_property_path(path: &[PathSegment]) -> Option<&str> {
-    match path {
-      [PathSegment::Property(property)] => Some(property),
+    match *path {
+      [PathSegment::Property(ref property)] => Some(property),
       [PathSegment::Index(_)] | [] | [_, _, ..] => None,
     }
   }
 
   /// Build one object schema with a named property and explicit fallback policy.
-  fn object_property_schema(property: &str, property_schema: Value, additional_properties: Value) -> Value {
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the fixture builder keeps declared-property and additionalProperties shape construction separate from seeding a schema \
+              service"
+  )]
+  fn object_property_schema(property: &str, property_schema: &Value, additional_properties: &Value) -> Value {
     json!({
       "type": "object",
       "additionalProperties": additional_properties,
@@ -1730,7 +1685,7 @@ mod tests {
   }
 
   /// Build one schema branch that contributes a single named property.
-  fn property_branch(property: &str, property_schema: Value) -> Value {
+  fn property_branch(property: &str, property_schema: &Value) -> Value {
     json!({
       "properties": {
         (property): property_schema
@@ -1739,11 +1694,16 @@ mod tests {
   }
 
   /// Build a two-branch composition fixture from named property contracts.
-  fn paired_composition(kind: &str, first: (&str, &str), second: (&str, &str)) -> Value {
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the builder names the two-branch composition-only wrapper shape independently of the keyword chosen and the URL it is \
+              seeded under"
+  )]
+  fn paired_composition(kind: &str, first: &(&str, &str), second: &(&str, &str)) -> Value {
     json!({
       (kind): [
-        property_branch(first.0, json!({ "title": first.1 })),
-        property_branch(second.0, json!({ "title": second.1 }))
+        property_branch(first.0, &json!({ "title": first.1 })),
+        property_branch(second.0, &json!({ "title": second.1 }))
       ]
     })
   }
@@ -1753,8 +1713,8 @@ mod tests {
     schemas: &TestSchemas,
     schema_url: &str,
     kind: &str,
-    first: (&str, &str),
-    second: (&str, &str),
+    first: &(&str, &str),
+    second: &(&str, &str),
   ) -> Result<Url, TestFailure> {
     let parsed_url = url(schema_url)?;
     seed(schemas, &parsed_url, paired_composition(kind, first, second));
@@ -1832,12 +1792,12 @@ mod tests {
     )?;
 
     let missing_url = url("https://example.com/missing-schema.json")?;
-    let missing_uri = ensure_some(
+    let requested_uri = ensure_some(
       Uri::<String>::parse(missing_url.to_string()).ok(),
       "an absolute schema URI must parse for validator retrieval",
     )?;
     let missing_error = ensure_some(
-      retriever.retrieve(&missing_uri).err(),
+      retriever.retrieve(&requested_uri).err(),
       "an uncached absolute schema must be reported missing",
     )?;
     ensure_contains(
@@ -1851,58 +1811,25 @@ mod tests {
     )?;
 
     seed(&schemas, &missing_url, json!({ "title": "cached" }));
-    let retrieved = ensure_result(
-      retriever.retrieve(&missing_uri),
+    let prefetched = ensure_result(
+      retriever.retrieve(&requested_uri),
       "validator retrieval must read a schema after it is prefetched",
     )?;
     ensure(
-      schema_text(&retrieved, "title") == Some("cached"),
+      schema_text(&prefetched, "title") == Some("cached"),
       "validator retrieval must preserve the cached schema value",
     )
   }
 
   #[test]
-  fn validation_caches_compilers_and_projects_object_and_array_failures() -> Result<(), TestFailure> {
+  fn validation_caches_compiled_validators_and_clears_them_on_expiration() -> Result<(), TestFailure> {
     block_on(async {
-      let (schemas, schema_url) = seeded_object_property_schemas(
-        "https://example.com/validation.json",
-        "values",
-        json!({
-          "type": "array",
-          "items": { "type": "integer" }
-        }),
-        Value::Bool(false),
-      )?;
+      let (schemas, schema_url) = validation_schemas()?;
       let valid = ensure_result(
         schemas.validate(&schema_url, &json!({ "values": [1, 2] })).await,
         "a valid JSON instance must complete validation",
       )?;
       ensure(valid.is_empty(), "a valid JSON instance must produce no errors")?;
-
-      let invalid = ensure_result(
-        schemas
-          .validate(&schema_url, &json!({ "values": [1, "wrong"], "unexpected": true }))
-          .await,
-        "an invalid JSON instance must return owned validation errors",
-      )?;
-      ensure(
-        invalid.iter().any(|error| {
-          matches!(
-            error.instance_path.as_slice(),
-            [PathSegment::Property(property), PathSegment::Index(1)] if property == "values"
-          )
-        }),
-        "an array-item failure must retain its object property and array index",
-      )?;
-      ensure(
-        invalid.iter().any(|error| {
-          error
-            .additional_properties
-            .as_ref()
-            .is_some_and(|properties| properties == &["unexpected"])
-        }),
-        "an unexpected property failure must retain the rejected property",
-      )?;
 
       let first_validator = ensure_some(
         ensure_result(
@@ -1926,6 +1853,46 @@ mod tests {
       ensure(
         Arc::ptr_eq(&first_validator, &second_validator),
         "repeated validation must reuse the same compiled validator",
+      )?;
+
+      ensure_result(
+        schemas.cache().set_expiration_times(Duration::ZERO, Duration::from_secs(60)),
+        "the validator expiration policy must install",
+      )?;
+      ensure(
+        ensure_result(schemas.get_validator(&schema_url), "expired validator state must be evaluated")?.is_none(),
+        "an expired schema generation must clear compiled validators",
+      )
+    })
+  }
+
+  #[test]
+  fn validation_projects_object_and_array_failures_onto_json_and_dom() -> Result<(), TestFailure> {
+    block_on(async {
+      let (schemas, schema_url) = validation_schemas()?;
+      let invalid = ensure_result(
+        schemas
+          .validate(&schema_url, &json!({ "values": [1, "wrong"], "unexpected": true }))
+          .await,
+        "an invalid JSON instance must return owned validation errors",
+      )?;
+      ensure(
+        invalid.iter().any(|error| {
+          matches!(
+            error.instance_path.as_slice(),
+            [PathSegment::Property(property), PathSegment::Index(1)] if property == "values"
+          )
+        }),
+        "an array-item failure must retain its object property and array index",
+      )?;
+      ensure(
+        invalid.iter().any(|error| {
+          error
+            .additional_properties
+            .as_ref()
+            .is_some_and(|properties| properties == &["unexpected"])
+        }),
+        "an unexpected property failure must retain the rejected property",
       )?;
 
       let root = parse_valid_dom(
@@ -1965,32 +1932,23 @@ mod tests {
           Err(SchemaError::DomSerialization { .. })
         ),
         "a semantic DOM that cannot become JSON must fail with the typed serialization error",
-      )?;
-
-      ensure_result(
-        schemas.cache().set_expiration_times(Duration::ZERO, Duration::from_secs(60)),
-        "the validator expiration policy must install",
-      )?;
-      ensure(
-        ensure_result(schemas.get_validator(&schema_url), "expired validator state must be evaluated")?.is_none(),
-        "an expired schema generation must clear compiled validators",
       )
     })
   }
 
   #[test]
-  fn schema_paths_distinguish_tuple_indices_fallbacks_and_composition_branches() -> Result<(), TestFailure> {
+  fn schema_paths_distinguish_tuple_indices_and_additional_property_fallbacks() -> Result<(), TestFailure> {
     block_on(async {
       let (schemas, indexed_url) = seeded_object_property_schemas(
         "https://example.com/indexed.json",
         "values",
-        json!({
+        &json!({
           "items": [
             { "title": "first" },
             { "title": "second" }
           ]
         }),
-        json!({ "title": "fallback" }),
+        &json!({ "title": "fallback" }),
       )?;
       let instance = json!({ "values": [true, 7], "other": "text" });
       let second = ensure_result(
@@ -2028,14 +1986,20 @@ mod tests {
           .iter()
           .any(|resolved| schema_text(&resolved.1, "title") == Some("fallback")),
         "an undeclared object property must retain the fallback schema",
-      )?;
+      )
+    })
+  }
 
+  #[test]
+  fn composition_only_wrappers_expose_alternative_branches_and_descendants() -> Result<(), TestFailure> {
+    block_on(async {
+      let schemas = offline_schemas()?;
       let composition_url = seed_composition(
         &schemas,
         "https://example.com/composition.json",
         "oneOf",
-        ("choice", "one-of text"),
-        ("choice", "one-of number"),
+        &("choice", "one-of text"),
+        &("choice", "one-of number"),
       )?;
       let choices = ensure_result(
         schemas
@@ -2056,8 +2020,8 @@ mod tests {
         &schemas,
         "https://example.com/alternatives.json",
         "anyOf",
-        ("left", "left alternative"),
-        ("right", "right alternative"),
+        &("left", "left alternative"),
+        &("right", "right alternative"),
       )?;
       let descendants = ensure_result(
         schemas
@@ -2077,7 +2041,7 @@ mod tests {
   }
 
   #[test]
-  fn external_references_invalid_schemas_and_stale_cache_have_typed_outcomes() -> Result<(), TestFailure> {
+  fn external_references_prefetch_and_fail_with_typed_load_outcomes() -> Result<(), TestFailure> {
     block_on(async {
       let environment = TestEnvironment::default();
       environment.insert_file(
@@ -2085,7 +2049,7 @@ mod tests {
         serde_json::to_vec(&json!({ "type": "string", "minLength": 2 })).unwrap_or_default(),
       );
       let schemas = ensure_result(
-        Schemas::new_offline(environment.clone()),
+        Schemas::new_offline(environment),
         "the reference-loading schema service must initialize",
       )?;
       let root_url = url("https://example.com/reference-root.json")?;
@@ -2127,8 +2091,18 @@ mod tests {
       ensure(
         matches!(invalid_schema, SchemaError::InvalidSchema { .. }),
         "schema compilation failures must retain the typed invalid-schema variant",
-      )?;
+      )
+    })
+  }
 
+  #[test]
+  fn fragment_resolution_and_stale_cache_recovery_have_typed_outcomes() -> Result<(), TestFailure> {
+    block_on(async {
+      let environment = TestEnvironment::default();
+      let schemas = ensure_result(
+        Schemas::new_offline(environment.clone()),
+        "the fragment-and-stale schema service must initialize",
+      )?;
       let fragment_url = url("https://example.com/fragments.json")?;
       seed(
         &schemas,
@@ -2530,10 +2504,9 @@ mod tests {
   }
 
   #[test]
-  fn relative_reference_origins_ids_and_cycles_are_deterministic() -> Result<(), TestFailure> {
+  fn document_local_and_invalid_references_have_exact_typed_outcomes() -> Result<(), TestFailure> {
     block_on(async {
       let schemas = offline_schemas()?;
-
       let internal_url = url("https://example.com/internal.json")?;
       seed(
         &schemas,
@@ -2574,8 +2547,14 @@ mod tests {
           } if root == &invalid_reference_url && reference == "http://["
         ),
         "invalid-reference failure must retain both its owning document and rejected reference",
-      )?;
+      )
+    })
+  }
 
+  #[test]
+  fn relative_references_resolve_against_owning_documents_and_identifiers() -> Result<(), TestFailure> {
+    block_on(async {
+      let schemas = offline_schemas()?;
       let root_url = url("https://example.com/root.json")?;
       let first_url = url("https://example.com/schemas/first.json")?;
       let second_url = url("https://example.com/schemas/second.json")?;
@@ -2648,8 +2627,14 @@ mod tests {
           .iter()
           .any(|resolved| schema_text(&resolved.1, "title") == Some("id-relative leaf")),
         "a relative reference must resolve against the nearest schema identifier",
-      )?;
+      )
+    })
+  }
 
+  #[test]
+  fn reference_cycles_terminate_without_inventing_schemas() -> Result<(), TestFailure> {
+    block_on(async {
+      let schemas = offline_schemas()?;
       let cycle_root = url("https://example.com/cycle-root.json")?;
       let cycle_a = url("https://example.com/a.json")?;
       let cycle_b = url("https://example.com/b.json")?;

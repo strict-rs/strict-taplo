@@ -102,6 +102,10 @@ impl KeyOrIndex {
   /// Returns `true` if the key or index is [`Key`].
   ///
   /// [`Key`]: KeyOrIndex::Key
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the public predicate completes KeyOrIndex's symmetric segment API alongside is_index, as_key, and as_index"
+  )]
   #[must_use]
   pub const fn is_key(&self) -> bool {
     matches!(self, Self::Key(..))
@@ -110,6 +114,10 @@ impl KeyOrIndex {
   /// Returns `true` if the key or index is [`Index`].
   ///
   /// [`Index`]: KeyOrIndex::Index
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the public predicate completes KeyOrIndex's symmetric segment API alongside is_key, as_key, and as_index"
+  )]
   #[must_use]
   pub const fn is_index(&self) -> bool {
     matches!(self, Self::Index(..))
@@ -329,6 +337,10 @@ pub struct Entries {
 
 impl Entries {
   /// Construct a view over one immutable table record.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the named constructor is the sole arena-plus-record pairing that materializes cheap table-entry handles"
+  )]
   pub(in crate::dom) const fn new(arena: Arc<DomArena>, inner: Arc<ArenaEntries>) -> Self {
     Self {
       inner,
@@ -428,6 +440,10 @@ pub struct ArrayItems {
 
 impl ArrayItems {
   /// Construct a view over one immutable array record.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the named constructor is the sole arena-plus-record pairing that materializes cheap array-item handles"
+  )]
   pub(in crate::dom) const fn new(arena: Arc<DomArena>, items: Arc<[NodeId]>) -> Self {
     Self {
       items,
@@ -616,6 +632,10 @@ impl CommentStore {
 
 impl Comment {
   /// Construct a detached ordinary comment.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the public constructor is the detached ordinary-comment entry point paired with new_directive"
+  )]
   #[must_use]
   pub fn new(comment_text: impl Into<String>) -> Self {
     Self {
@@ -625,6 +645,10 @@ impl Comment {
   }
 
   /// Construct a detached directive comment.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the public constructor is the detached directive-comment entry point paired with new"
+  )]
   #[must_use]
   pub fn new_directive(name: impl Into<String>, directive_value: impl Into<String>) -> Self {
     Self {

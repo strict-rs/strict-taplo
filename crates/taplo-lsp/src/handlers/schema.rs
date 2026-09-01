@@ -35,6 +35,10 @@ macro_rules! define_schema_handler_future_family {
     [$($value_bound:path),*]
   ) => {
     /// List every non-document association visible to a document's workspace.
+    #[allow(
+      clippy::single_call_fn,
+      reason = "one schema-listing request handler per execution family, registered exactly once by its runtime family"
+    )]
     pub(super) fn $list_schemas<E: $environment>(
       world: &WorldState<E, $transport<E>>,
       params: Params<ListSchemasParams>,
@@ -56,6 +60,11 @@ macro_rules! define_schema_handler_future_family {
     }
 
     /// Validate and commit one manual schema association.
+    #[allow(
+      clippy::single_call_fn,
+      reason = "one manual-association transition per execution family, registered exactly once on its runtime family's ordered mutation \
+                lane"
+    )]
     pub(super) fn $associate_schema<E: $environment>(
       world: &WorldState<E, $transport<E>>,
       params: Params<AssociateSchemaParams>,
@@ -87,6 +96,10 @@ macro_rules! define_schema_handler_future_family {
     }
 
     /// Return the highest-priority schema association selected for one document.
+    #[allow(
+      clippy::single_call_fn,
+      reason = "one effective-schema query handler per execution family, registered exactly once by its runtime family"
+    )]
     pub(super) fn $associated_schema<E: $environment>(
       world: &WorldState<E, $transport<E>>,
       params: Params<AssociatedSchemaParams>,

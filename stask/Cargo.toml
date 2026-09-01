@@ -22,9 +22,9 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-bpaf.workspace           = true
 template-core.workspace  = true
 template-stask.workspace = true
+bpaf.workspace           = true
 thiserror.workspace      = true
 
 [dev-dependencies]

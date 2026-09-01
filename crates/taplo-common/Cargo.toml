@@ -7,7 +7,7 @@ categories   = ["config", "development-tools"]
 keywords     = ["toml", "configuration", "schema", "formatter", "language-server"]
 readme       = "../../README.md"
 authors      = { workspace = true }
-edition      = { workspace = true }
+edition = { workspace = true }
 homepage     = { workspace = true }
 license      = { workspace = true }
 repository   = { workspace = true }

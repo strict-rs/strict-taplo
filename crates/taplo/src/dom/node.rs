@@ -700,6 +700,10 @@ fn queue_container_range(syntax: Option<&SyntaxElement>, ranges: &mut Vec<TextRa
 }
 
 /// Schedule one table anchor and, when requested, its key and entry descendants.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the named scheduler keeps table key-range and entry ordering out of the iterative range-collection loop"
+)]
 fn queue_table_ranges(table: &Table, include_children: bool, ranges: &mut Vec<TextRange>, pending: &mut Vec<RangeTask>) {
   queue_container_range(table.syntax(), ranges, pending);
   if !include_children {
@@ -718,6 +722,10 @@ fn queue_table_ranges(table: &Table, include_children: bool, ranges: &mut Vec<Te
 }
 
 /// Schedule one array anchor and, when requested, its semantic element descendants.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the named scheduler keeps array element ordering out of the iterative range-collection loop"
+)]
 fn queue_array_ranges(array: &Array, include_children: bool, ranges: &mut Vec<TextRange>, pending: &mut Vec<RangeTask>) {
   queue_container_range(array.syntax(), ranges, pending);
   if include_children {
@@ -804,6 +812,10 @@ mod tests {
   }
 
   /// Return the public borrowed-projection results in declaration order.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the paired fixture names the borrowed-projection order compared against the variant-predicate order"
+  )]
   fn projection_flags(node: &Node) -> [bool; 8] {
     [
       node.as_table().is_some(),

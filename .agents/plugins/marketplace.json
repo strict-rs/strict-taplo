@@ -1,0 +1,19 @@
+{
+  "name": "rust-template",
+  "plugins": [
+    {
+      "name": "rust-template-core",
+      "source": {
+        "source": "local",
+        "path": ".agents/plugins/rust-template-core"
+      }
+    },
+    {
+      "name": "strict-adoption",
+      "source": {
+        "source": "local",
+        "path": ".agents/plugins/strict-adoption"
+      }
+    }
+  ]
+}

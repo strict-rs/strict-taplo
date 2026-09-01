@@ -14,7 +14,6 @@ pub fn run() -> ExitCode {
 }
 
 #[cfg(test)]
-/// Contract tests for the consumer-owned extension façade.
 mod tests {
   use strict_test_support::TestFailure;
   use strict_test_support::ensure;
@@ -23,16 +22,15 @@ mod tests {
 
   use super::extensions;
 
-  /// Keep the compiled local runner limited to the guarded `x` command group.
   #[test]
   fn extension_registry_exposes_only_the_local_x_router() -> Result<(), TestFailure> {
     let command_set = ensure_ok(extensions::commands(), "the local extension registry must build")?;
     let descriptors = command_set.descriptors();
     ensure(
-      (
-        descriptors.len(),
-        descriptors.first().map(|descriptor| (descriptor.name(), descriptor.surface())),
-      ) == (1, Some(("x", CommandSurface::StaskExtension))),
+      descriptors.len() == 1
+        && descriptors
+          .first()
+          .is_some_and(|descriptor| descriptor.name() == "x" && descriptor.surface() == CommandSurface::StaskExtension),
       "the consumer runner must expose only the local x extension surface",
     )
   }

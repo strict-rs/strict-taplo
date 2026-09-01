@@ -418,6 +418,11 @@ pub(crate) struct Workspaces<T: SchemaTransport> {
 
 impl<T: SchemaTransport> Workspaces<T> {
   /// Construct topology around the permanent detached workspace.
+  #[allow(
+    clippy::single_call_fn,
+    reason = "the named constructor establishes the topology invariant that the detached workspace is always present and real roots start \
+              empty, which every ownership lookup here depends on"
+  )]
   fn new(detached: WorkspaceHandle<T>) -> Self {
     Self {
       detached,
@@ -1586,6 +1591,11 @@ macro_rules! define_configuration_candidates_future_family {
     $configuration_candidates:ident; $future:ident, $environment:path, $transport:ident, $schema_execution:path; [$($value_bound:path),*]
   ) => {
     /// Validate global and root-scoped configuration values before any live update.
+    #[allow(
+      clippy::single_call_fn,
+      reason = "the named validation step is what keeps the complete shape, ownership, and merge checks ahead of the transaction that \
+                publishes them, once per execution family"
+    )]
     fn $configuration_candidates<'operation, E: $environment>(
       workspaces: &'operation AsyncRwLock<Workspaces<$transport<E>>>,
       global: Option<&'operation Value>,
@@ -1985,6 +1995,11 @@ macro_rules! define_config_loader {
     $discover:expr,
   ) => {
     /// Load and prepare one workspace configuration through this host execution family.
+    #[allow(
+      clippy::single_call_fn,
+      reason = "each host execution family expands one configuration loader, called once by that family's workspace initialization; the \
+                shared `ConfigSourcePlan` decision is what both expansions reuse"
+    )]
     fn $name<'operation, E: $environment>(
       environment: &'operation E,
       root: &'operation WorkspaceRoot,
@@ -2052,6 +2067,11 @@ define_config_loader!(
 );
 
 /// Resolve the workspace base path without asynchronous host calls.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the named resolver isolates the rooted-versus-detached base-path rule and its two typed failures, so `ConfigSourcePlan::new` \
+            stays a synchronous classification with no host I/O"
+)]
 fn workspace_base_path(environment: &impl Environment, root: &WorkspaceRoot) -> Result<PathBuf, WorldError> {
   match *root {
     WorkspaceRoot::Rooted(ref root_url) => environment
@@ -2312,6 +2332,7 @@ mod tests {
   use super::load_config_local;
   use super::merge_unique_documents;
   use crate::LocalFuture;
+  use crate::LocalTestFuture;
 
   /// Local schema transport used by world owner tests.
   type LocalTestTransport = LocalSchemaTransport<TestEnvironment>;
@@ -2344,7 +2365,7 @@ mod tests {
   }
 
   /// Construct one local world with its standard document already open.
-  fn open_document_fixture(context: &'static str) -> LocalFuture<'static, Result<(LocalTestWorld, Url), TestFailure>> {
+  fn open_document_fixture(context: &'static str) -> LocalTestFuture<'static, (LocalTestWorld, Url)> {
     Box::pin(async move {
       let world = local_world()?;
       let document = url("file:///workspace/document.toml")?;
@@ -2411,30 +2432,269 @@ mod tests {
 
   /// Generate the configured-association transaction contract for one execution family.
   macro_rules! workspace_association_contract {
-    ($name:ident, $transport:ident, $client_context:literal, $apply_configuration:ident) => {
+    (
+      $name:ident,
+      $transport:ident,
+      $client_context:literal,
+      $apply_configuration:ident,
+      rejected = $rejected:ident,
+      commit = $commit:ident,
+      rejections = $rejections:ident,
+      lifecycle = $lifecycle:ident,
+      detached = $detached:ident $(,)?
+    ) => {
+      /// Apply one configured association that is expected to fail validation.
+      fn $rejected<'operation>(
+        workspace: &'operation mut WorkspaceState<$transport<TestEnvironment>>,
+        environment: &'operation TestEnvironment,
+        pattern: &'static str,
+        schema: &'static str,
+        revision: Revision,
+        context: &'static str,
+      ) -> LocalFuture<'operation, Result<WorldError, TestFailure>> {
+        Box::pin(async move {
+          set_lsp_association(&mut workspace.config, pattern, schema);
+          ensure_some(
+            workspace
+              .$apply_configuration(environment, Config::default(), revision)
+              .await
+              .err(),
+            context,
+          )
+        })
+      }
+
+      /// Commit the first configured association and return its selected schema URL.
+      #[allow(clippy::single_call_fn, reason = "naming the commit phase separates the one successful association transaction from the failure phases that must preserve its committed revision")]
+      fn $commit<'operation>(
+        workspace: &'operation mut WorkspaceState<$transport<TestEnvironment>>,
+        environment: &'operation TestEnvironment,
+        document: &'operation Url,
+        committed_revision: Revision,
+      ) -> LocalFuture<'operation, Result<Url, TestFailure>> {
+        Box::pin(async move {
+          let notifications = ensure_ok(
+            workspace
+              .$apply_configuration(environment, Config::default(), committed_revision)
+              .await,
+            "a rooted relative LSP association must commit",
+          )?;
+          let selected = ensure_some(
+            workspace.schemas.associations().association_for(document),
+            "the rooted LSP association must select its configured document",
+          )?;
+          ensure(
+            (
+              selected.url.clone(),
+              selected.priority,
+            ) == (
+              url("file:///workspace/schema.json")?,
+              priority::LSP_CONFIG,
+            ),
+            "a rooted relative association must resolve against its workspace and retain LSP priority",
+          )?;
+          let selected_source = ensure_some(
+            selected.meta.get("source"),
+            "the selected association must retain its owning source",
+          )?;
+          ensure_eq(
+            selected_source,
+            &json!(source::LSP_CONFIG),
+            "the selected association must identify the LSP configuration owner",
+          )?;
+          let selected_notification = ensure_some(
+            notifications
+              .iter()
+              .find(|notification| notification.document_uri == *document),
+            "configuration commit must notify the open document",
+          )?;
+          ensure(
+            selected_notification.schema_uri.as_ref() == Some(&selected.url),
+            "the association notification must expose the newly selected schema",
+          )?;
+          Ok(selected.url)
+        })
+      }
+
+      /// Reject invalid patterns and URLs while preserving the committed association.
+      #[allow(clippy::single_call_fn, reason = "the named phase pairs both invalid-input rejections with proof that the previously committed association and revisions survive them")]
+      fn $rejections<'operation>(
+        workspace: &'operation mut WorkspaceState<$transport<TestEnvironment>>,
+        environment: &'operation TestEnvironment,
+        document: &'operation Url,
+        selected_schema: &'operation Url,
+        committed_revision: Revision,
+      ) -> LocalFuture<'operation, Result<(), TestFailure>> {
+        Box::pin(async move {
+          let pattern_failure = $rejected(
+            workspace,
+            environment,
+            "[",
+            "https://example.com/rejected-pattern.json",
+            Revision(2),
+            "an invalid configured regular expression must be rejected",
+          )
+          .await?;
+          ensure(
+            matches!(
+              pattern_failure,
+              WorldError::AssociationPattern {
+                ref pattern,
+                ..
+              } if pattern == "["
+            ),
+            "configured regular-expression failure must retain the rejected pattern",
+          )?;
+          ensure_committed_association(
+            workspace,
+            document,
+            selected_schema,
+            committed_revision,
+            "pattern validation failure must preserve the committed association and both revisions",
+          )?;
+
+          let url_failure = $rejected(
+            workspace,
+            environment,
+            r".*/document\.toml$",
+            "::",
+            Revision(3),
+            "an invalid configured schema URL must be rejected",
+          )
+          .await?;
+          ensure(
+            matches!(
+              url_failure,
+              WorldError::AssociationUrl {
+                ref source_value,
+                ..
+              } if source_value == "::"
+            ),
+            "configured URL failure must retain the rejected source value",
+          )?;
+          ensure_committed_association(
+            workspace,
+            document,
+            selected_schema,
+            committed_revision,
+            "URL validation failure must preserve the committed association and both revisions",
+          )
+        })
+      }
+
+      /// Disable schema support, then require configured associations to recover.
+      #[allow(clippy::single_call_fn, reason = "the named phase keeps disable-then-recover ordering explicit, so removal and replacement of LSP-owned associations are asserted against the same committed workspace")]
+      fn $lifecycle<'operation>(
+        workspace: &'operation mut WorkspaceState<$transport<TestEnvironment>>,
+        environment: &'operation TestEnvironment,
+        document: &'operation Url,
+      ) -> LocalFuture<'operation, Result<(), TestFailure>> {
+        Box::pin(async move {
+          workspace.config.schema.enabled = false;
+          set_lsp_association(
+            &mut workspace.config,
+            r".*/document\.toml$",
+            "./disabled.json",
+          );
+          let disabled_revision = Revision(4);
+          let disabled_notifications = ensure_ok(
+            workspace
+              .$apply_configuration(environment, Config::default(), disabled_revision)
+              .await,
+            "disabling schemas must atomically remove LSP-owned associations",
+          )?;
+          ensure(
+            (
+              workspace.schemas.associations().association_for(document).is_none(),
+              workspace.config_revision,
+              workspace.schema_revision,
+            ) == (true, disabled_revision, disabled_revision),
+            "disabled schema configuration must remove prior selections and commit both revisions",
+          )?;
+          let disabled_notification = ensure_some(
+            disabled_notifications
+              .iter()
+              .find(|notification| notification.document_uri == *document),
+            "schema disablement must notify the open document",
+          )?;
+          ensure(
+            disabled_notification.schema_uri.is_none(),
+            "schema disablement must explicitly notify the client that no schema remains selected",
+          )?;
+
+          workspace.config.schema.enabled = true;
+          set_lsp_association(
+            &mut workspace.config,
+            r".*/document\.toml$",
+            "./recovered.json",
+          );
+          let recovered_revision = Revision(5);
+          let recovered_schema = url("file:///workspace/recovered.json")?;
+          drop(ensure_ok(
+            workspace
+              .$apply_configuration(environment, Config::default(), recovered_revision)
+              .await,
+            "configured associations must recover after schema support is re-enabled",
+          )?);
+          let recovered_selection = workspace
+            .schemas
+            .associations()
+            .association_for(document)
+            .map(|association| association.url);
+          ensure(
+            (
+              recovered_selection,
+              workspace.config_revision,
+              workspace.schema_revision,
+            ) == (Some(recovered_schema), recovered_revision, recovered_revision),
+            "re-enabled schema configuration must select the replacement association and advance both revisions",
+          )
+        })
+      }
+
+      /// Reject a relative configured association for a fresh detached workspace.
+      #[allow(clippy::single_call_fn, reason = "the named phase isolates the detached-workspace polarity, whose fresh workspace must reject relative association paths without touching the rooted contract")]
+      fn $detached<'operation>(
+        transport: $transport<TestEnvironment>,
+        environment: &'operation TestEnvironment,
+        document: &'operation Url,
+      ) -> LocalFuture<'operation, Result<(), TestFailure>> {
+        Box::pin(async move {
+          let mut detached = ensure_ok(
+            WorkspaceState::new(WorkspaceRoot::Detached, transport),
+            "the detached configured-association workspace must construct",
+          )?;
+          detached.config.schema.catalogs.clear();
+          set_lsp_association(&mut detached.config, r".*\.toml$", "./schema.json");
+          let detached_failure = ensure_some(
+            detached
+              .$apply_configuration(environment, Config::default(), Revision(1))
+              .await
+              .err(),
+            "a detached relative LSP association must be rejected",
+          )?;
+          ensure(
+            matches!(
+              detached_failure,
+              WorldError::DetachedRelativePath {
+                ref path
+              } if path == Path::new("./schema.json")
+            ),
+            "detached association failure must retain the unresolved relative path",
+          )?;
+          ensure(
+            (
+              detached.config_revision,
+              detached.schema_revision,
+              detached.schemas.associations().association_for(document).is_none(),
+            ) == (Revision::INITIAL, Revision::INITIAL, true),
+            "detached-path rejection must preserve initial revisions and install no association",
+          )
+        })
+      }
+
       #[test]
       fn $name() -> Result<(), TestFailure> {
-        /// Apply one configured association that is expected to fail validation.
-        fn rejected_association<'operation>(
-          workspace: &'operation mut WorkspaceState<$transport<TestEnvironment>>,
-          environment: &'operation TestEnvironment,
-          pattern: &'static str,
-          schema: &'static str,
-          revision: Revision,
-          context: &'static str,
-        ) -> LocalFuture<'operation, Result<WorldError, TestFailure>> {
-          Box::pin(async move {
-            set_lsp_association(&mut workspace.config, pattern, schema);
-            ensure_some(
-              workspace
-                .$apply_configuration(environment, Config::default(), revision)
-                .await
-                .err(),
-              context,
-            )
-          })
-        }
-
         block_on(async {
           let environment = TestEnvironment::default();
           let transport = $transport::new(
@@ -2462,190 +2722,10 @@ mod tests {
           ));
 
           let committed_revision = Revision(1);
-          let notifications = ensure_ok(
-            workspace
-              .$apply_configuration(&environment, Config::default(), committed_revision)
-              .await,
-            "a rooted relative LSP association must commit",
-          )?;
-          let selected = ensure_some(
-            workspace.schemas.associations().association_for(&document),
-            "the rooted LSP association must select its configured document",
-          )?;
-          ensure(
-            (
-              selected.url.clone(),
-              selected.priority,
-            ) == (
-              url("file:///workspace/schema.json")?,
-              priority::LSP_CONFIG,
-            ),
-            "a rooted relative association must resolve against its workspace and retain LSP priority",
-          )?;
-          let selected_source = ensure_some(
-            selected.meta.get("source"),
-            "the selected association must retain its owning source",
-          )?;
-          ensure_eq(
-            selected_source,
-            &json!(source::LSP_CONFIG),
-            "the selected association must identify the LSP configuration owner",
-          )?;
-          let selected_notification = ensure_some(
-            notifications
-              .iter()
-              .find(|notification| notification.document_uri == document),
-            "configuration commit must notify the open document",
-          )?;
-          ensure(
-            selected_notification.schema_uri.as_ref() == Some(&selected.url),
-            "the association notification must expose the newly selected schema",
-          )?;
-
-          let pattern_failure = rejected_association(
-            &mut workspace,
-            &environment,
-            "[",
-            "https://example.com/rejected-pattern.json",
-            Revision(2),
-            "an invalid configured regular expression must be rejected",
-          )
-          .await?;
-          ensure(
-            matches!(
-              pattern_failure,
-              WorldError::AssociationPattern {
-                ref pattern,
-                ..
-              } if pattern == "["
-            ),
-            "configured regular-expression failure must retain the rejected pattern",
-          )?;
-          ensure_committed_association(
-            &workspace,
-            &document,
-            &selected.url,
-            committed_revision,
-            "pattern validation failure must preserve the committed association and both revisions",
-          )?;
-
-          let url_failure = rejected_association(
-            &mut workspace,
-            &environment,
-            r".*/document\.toml$",
-            "::",
-            Revision(3),
-            "an invalid configured schema URL must be rejected",
-          )
-          .await?;
-          ensure(
-            matches!(
-              url_failure,
-              WorldError::AssociationUrl {
-                ref source_value,
-                ..
-              } if source_value == "::"
-            ),
-            "configured URL failure must retain the rejected source value",
-          )?;
-          ensure_committed_association(
-            &workspace,
-            &document,
-            &selected.url,
-            committed_revision,
-            "URL validation failure must preserve the committed association and both revisions",
-          )?;
-
-          workspace.config.schema.enabled = false;
-          set_lsp_association(
-            &mut workspace.config,
-            r".*/document\.toml$",
-            "./disabled.json",
-          );
-          let disabled_revision = Revision(4);
-          let disabled_notifications = ensure_ok(
-            workspace
-              .$apply_configuration(&environment, Config::default(), disabled_revision)
-              .await,
-            "disabling schemas must atomically remove LSP-owned associations",
-          )?;
-          ensure(
-            (
-              workspace.schemas.associations().association_for(&document).is_none(),
-              workspace.config_revision,
-              workspace.schema_revision,
-            ) == (true, disabled_revision, disabled_revision),
-            "disabled schema configuration must remove prior selections and commit both revisions",
-          )?;
-          let disabled_notification = ensure_some(
-            disabled_notifications
-              .iter()
-              .find(|notification| notification.document_uri == document),
-            "schema disablement must notify the open document",
-          )?;
-          ensure(
-            disabled_notification.schema_uri.is_none(),
-            "schema disablement must explicitly notify the client that no schema remains selected",
-          )?;
-
-          workspace.config.schema.enabled = true;
-          set_lsp_association(
-            &mut workspace.config,
-            r".*/document\.toml$",
-            "./recovered.json",
-          );
-          let recovered_revision = Revision(5);
-          let recovered_schema = url("file:///workspace/recovered.json")?;
-          drop(ensure_ok(
-            workspace
-              .$apply_configuration(&environment, Config::default(), recovered_revision)
-              .await,
-            "configured associations must recover after schema support is re-enabled",
-          )?);
-          let recovered_selection = workspace
-            .schemas
-            .associations()
-            .association_for(&document)
-            .map(|association| association.url);
-          ensure(
-            (
-              recovered_selection,
-              workspace.config_revision,
-              workspace.schema_revision,
-            ) == (Some(recovered_schema), recovered_revision, recovered_revision),
-            "re-enabled schema configuration must select the replacement association and advance both revisions",
-          )?;
-
-          let mut detached = ensure_ok(
-            WorkspaceState::new(WorkspaceRoot::Detached, transport),
-            "the detached configured-association workspace must construct",
-          )?;
-          detached.config.schema.catalogs.clear();
-          set_lsp_association(&mut detached.config, r".*\.toml$", "./schema.json");
-          let detached_failure = ensure_some(
-            detached
-              .$apply_configuration(&environment, Config::default(), Revision(1))
-              .await
-              .err(),
-            "a detached relative LSP association must be rejected",
-          )?;
-          ensure(
-            matches!(
-              detached_failure,
-              WorldError::DetachedRelativePath {
-                ref path
-              } if path == Path::new("./schema.json")
-            ),
-            "detached association failure must retain the unresolved relative path",
-          )?;
-          ensure(
-            (
-              detached.config_revision,
-              detached.schema_revision,
-              detached.schemas.associations().association_for(&document).is_none(),
-            ) == (Revision::INITIAL, Revision::INITIAL, true),
-            "detached-path rejection must preserve initial revisions and install no association",
-          )
+          let selected_schema = $commit(&mut workspace, &environment, &document, committed_revision).await?;
+          $rejections(&mut workspace, &environment, &document, &selected_schema, committed_revision).await?;
+          $lifecycle(&mut workspace, &environment, &document).await?;
+          $detached(transport, &environment, &document).await
         })
       }
     };
@@ -2655,7 +2735,12 @@ mod tests {
     local_workspace_lsp_associations_validate_commit_disable_and_recover,
     LocalSchemaTransport,
     "the local association client must construct",
-    apply_configuration_local
+    apply_configuration_local,
+    rejected = rejected_local_association,
+    commit = commit_local_configured_association,
+    rejections = reject_local_invalid_associations,
+    lifecycle = disable_and_recover_local_associations,
+    detached = reject_local_detached_relative_association,
   );
 
   #[cfg(not(target_arch = "wasm32"))]
@@ -2663,7 +2748,12 @@ mod tests {
     concurrent_workspace_lsp_associations_validate_commit_disable_and_recover,
     ConcurrentSchemaTransport,
     "the concurrent association client must construct",
-    apply_configuration_concurrent
+    apply_configuration_concurrent,
+    rejected = rejected_concurrent_association,
+    commit = commit_concurrent_configured_association,
+    rejections = reject_concurrent_invalid_associations,
+    lifecycle = disable_and_recover_concurrent_associations,
+    detached = reject_concurrent_detached_relative_association,
   );
 
   /// Load one configuration through both execution families for parity assertions.
@@ -2672,7 +2762,7 @@ mod tests {
     root: &'fixture WorkspaceRoot,
     lsp_config: &'fixture LspConfig,
     default: &'fixture Config,
-  ) -> LocalFuture<'fixture, Result<(Config, Config), TestFailure>> {
+  ) -> LocalTestFuture<'fixture, (Config, Config)> {
     Box::pin(async move {
       let local = ensure_ok(
         load_config_local(environment, root, lsp_config, default).await,
@@ -2692,7 +2782,7 @@ mod tests {
     root: &'fixture WorkspaceRoot,
     default: &'fixture Config,
     configured_path: &str,
-  ) -> LocalFuture<'fixture, Result<(Config, Config), TestFailure>> {
+  ) -> LocalTestFuture<'fixture, (Config, Config)> {
     let path = PathBuf::from(configured_path);
     Box::pin(async move {
       let mut lsp_config = ensure_ok(LspConfig::new(), "the explicit-path LSP configuration must construct")?;
@@ -2922,11 +3012,11 @@ mod tests {
         [
           matches!(
             load_config_local(&environment, &root, &invalid_utf8, &default).await,
-            Err(WorldError::ConfigUtf8 { path, .. }) if path == PathBuf::from("/configs/non-utf8.toml")
+            Err(WorldError::ConfigUtf8 { path, .. }) if path == Path::new("/configs/non-utf8.toml")
           ),
           matches!(
             load_config_concurrent(&environment, &root, &invalid_utf8, &default).await,
-            Err(WorldError::ConfigUtf8 { path, .. }) if path == PathBuf::from("/configs/non-utf8.toml")
+            Err(WorldError::ConfigUtf8 { path, .. }) if path == Path::new("/configs/non-utf8.toml")
           ),
         ] == [true, true],
         "both loaders must preserve the selected path in typed UTF-8 failures",
@@ -2939,11 +3029,11 @@ mod tests {
         [
           matches!(
             load_config_local(&environment, &root, &invalid_toml, &default).await,
-            Err(WorldError::ConfigToml { path, .. }) if path == PathBuf::from("/configs/invalid.toml")
+            Err(WorldError::ConfigToml { path, .. }) if path == Path::new("/configs/invalid.toml")
           ),
           matches!(
             load_config_concurrent(&environment, &root, &invalid_toml, &default).await,
-            Err(WorldError::ConfigToml { path, .. }) if path == PathBuf::from("/configs/invalid.toml")
+            Err(WorldError::ConfigToml { path, .. }) if path == Path::new("/configs/invalid.toml")
           ),
         ] == [true, true],
         "both loaders must preserve the selected path in typed TOML failures",
@@ -3051,9 +3141,9 @@ mod tests {
     )
   }
 
-  #[test]
-  fn initialization_and_scoped_configuration_validate_before_atomic_commit() -> Result<(), TestFailure> {
-    block_on(async {
+  /// Initialize one schema-disabled world with a single committed project root.
+  fn initialized_project_world() -> LocalTestFuture<'static, (LocalTestWorld, Url)> {
+    Box::pin(async {
       let world = local_world()?;
       let root = url("file:///workspace/project")?;
       let preparation_environment = world.env.clone();
@@ -3065,6 +3155,14 @@ mod tests {
         .await,
         "one valid rooted topology must initialize transactionally",
       )?);
+      Ok((world, root))
+    })
+  }
+
+  #[test]
+  fn initialization_commits_atomically_and_rejects_reinitialization() -> Result<(), TestFailure> {
+    block_on(async {
+      let (world, root) = initialized_project_world().await?;
       ensure(
         world.rooted_workspace_urls().await == [root.clone()],
         "initialization must publish the complete rooted topology",
@@ -3107,8 +3205,15 @@ mod tests {
       ensure(
         (empty.is_empty(), world.revision.load(Ordering::SeqCst)) == (true, initialized_revision),
         "an empty configuration response must not emit effects or advance the revision",
-      )?;
+      )
+    })
+  }
 
+  #[test]
+  fn scoped_configuration_validates_before_atomic_commit() -> Result<(), TestFailure> {
+    block_on(async {
+      let (world, root) = initialized_project_world().await?;
+      let initialized_revision = world.revision.load(Ordering::SeqCst);
       let invalid_global = Value::String(String::from("invalid"));
       ensure(
         matches!(
@@ -3637,7 +3742,7 @@ mod tests {
   }
 
   #[test]
-  fn manual_association_families_compile_select_replace_and_reject_atomically() -> Result<(), TestFailure> {
+  fn manual_global_associations_select_by_priority_and_reject_invalid_patterns() -> Result<(), TestFailure> {
     block_on(async {
       let (world, document) = open_document_fixture("the manual-association document must install").await?;
 
@@ -3717,7 +3822,24 @@ mod tests {
       ensure(
         world.revision.load(Ordering::SeqCst) == revision_before_rejections,
         "failed manual-association compilation must leave the world revision unchanged",
-      )?;
+      )
+    })
+  }
+
+  #[test]
+  fn manual_exact_associations_replace_their_prior_owner_atomically() -> Result<(), TestFailure> {
+    block_on(async {
+      let (world, document) = open_document_fixture("the exact-association document must install").await?;
+      let glob_schema = url("https://example.com/glob.json")?;
+      drop(ensure_ok(
+        world
+          .associate_schema(
+            ManualAssociationRule::Glob(String::from("**/*.toml")),
+            manual_association(glob_schema.clone(), priority::LSP_CONFIG),
+          )
+          .await,
+        "the listing-context glob association must commit",
+      )?);
 
       let exact_schema = url("https://example.com/exact.json")?;
       let exact_update = ensure_ok(
@@ -3759,9 +3881,13 @@ mod tests {
             .into_iter()
             .map(|association| association.url)
             .collect::<Vec<_>>();
-          (listed_urls.contains(&exact_schema), listed_urls.contains(&replacement_schema)) == (false, false)
+          (
+            listed_urls.contains(&glob_schema),
+            listed_urls.contains(&exact_schema),
+            listed_urls.contains(&replacement_schema),
+          ) == (true, false, false)
         },
-        "non-document schema listing must exclude exact document associations",
+        "non-document schema listing must retain global rules while excluding exact document associations",
       )
     })
   }

@@ -6,7 +6,7 @@ categories   = ["development-tools", "command-line-utilities"]
 keywords     = ["toml", "linter", "formatter"]
 rust-version = { workspace = true }
 authors      = { workspace = true }
-edition      = { workspace = true }
+edition = { workspace = true }
 homepage     = { workspace = true }
 license      = { workspace = true }
 repository   = { workspace = true }

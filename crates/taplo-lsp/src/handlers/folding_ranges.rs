@@ -47,6 +47,7 @@ macro_rules! define_folding_range_future_family {
     ///
     /// Returns [`RpcError`] when parameters, coordinates, or snapshot freshness cannot be
     /// validated.
+    #[allow(clippy::single_call_fn, reason = "one folding-range entry point per execution family, registered exactly once by its runtime family")]
     pub(super) fn $folding_ranges<E: $environment>(
       world: &WorldState<E, $transport<E>>,
       params: Params<FoldingRangeParams>,
@@ -175,6 +176,11 @@ fn close_completed_table_headers(
 }
 
 /// Collect folds for multiline arrays and multiline string tokens beneath one top-level node.
+#[allow(
+  clippy::single_call_fn,
+  reason = "naming the descendant sweep separates value-owned folds from the header and comment-block bookkeeping that \
+            `create_folding_ranges` maintains across top-level elements"
+)]
 fn collect_multiline_value_ranges(node: &SyntaxNode, mapper: &Mapper, ranges: &mut Vec<FoldingRange>) -> Result<(), MappingError> {
   for descendant in node.descendants_with_tokens() {
     let Some(source_range) = multiline_value_range(&descendant) else {
@@ -188,6 +194,11 @@ fn collect_multiline_value_ranges(node: &SyntaxNode, mapper: &Mapper, ranges: &m
 }
 
 /// Return the source range of an array or string that spans multiple lines.
+#[allow(
+  clippy::single_call_fn,
+  reason = "the named classifier states the multiline-value rule once for both the node and token halves of a syntax element, so the \
+            traversal loop reads as a single foldable-or-not decision"
+)]
 fn multiline_value_range(element: &SyntaxElement) -> Option<TextRange> {
   if let Some(array) = element.as_node() {
     return (array.kind() == ARRAY && array.descendants_with_tokens().any(|descendant| descendant.kind() == NEWLINE))
