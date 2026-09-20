@@ -60,8 +60,10 @@ impl FeatureSet {
 #[cfg(test)]
 /// Command-planning tests for the supported `taplo-wasm` feature matrix.
 mod tests {
+  use std::fmt::Debug;
+
   use strict_test_support::EffectEvent;
-  use strict_test_support::PredicateFailure;
+  use strict_test_support::ensure_eq;
   use strict_test_support::ensure_that;
 
   use super::FeatureSet;
@@ -72,7 +74,7 @@ mod tests {
 
   /// Pin the complete feature-matrix command contract.
   #[test]
-  fn plans_every_wasm_feature_configuration() -> Result<(), PredicateFailure<Vec<Vec<String>>>> {
+  fn plans_every_wasm_feature_configuration() -> Result<(), impl Debug> {
     let planned = FeatureSet::ALL.into_iter().map(FeatureSet::arguments).collect::<Vec<_>>();
     let expected = [
       vec![
@@ -89,10 +91,7 @@ mod tests {
     .into_iter()
     .map(|arguments| arguments.into_iter().map(str::to_owned).collect::<Vec<_>>())
     .collect::<Vec<_>>();
-    ensure_that(planned, "the WASM matrix must retain every required feature polarity", |observed| {
-      *observed == expected
-    })
-    .map(drop)
+    ensure_eq(planned, expected, "the WASM matrix must retain every required feature polarity").map(drop)
   }
 
   #[test]

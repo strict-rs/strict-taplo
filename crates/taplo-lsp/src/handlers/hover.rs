@@ -264,6 +264,8 @@ const fn is_primitive(kind: SyntaxKind) -> bool {
 
 #[cfg(test)]
 mod tests {
+  use std::fmt::Debug;
+
   use futures::executor::block_on;
   use lsp_types::Hover;
   use lsp_types::HoverContents;
@@ -271,17 +273,15 @@ mod tests {
   use lsp_types::Position;
   use lsp_types::Range;
   use serde_json::json;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_contains;
+  use strict_test_support::ResultFailure;
   use strict_test_support::ensure_eq;
-  use strict_test_support::ensure_lacks;
-  use strict_test_support::ensure_ok;
-  use strict_test_support::ensure_some;
+  use strict_test_support::ensure_that;
   use taplo::syntax::kind::FLOAT;
   use taplo::syntax::kind::IDENT;
   use taplo::syntax::kind::STRING;
+  use taplo_common::schema::transport::LocalSchemaTransport;
   use taplo_lsp_async::Params;
+  use taplo_lsp_async::rpc::RpcError;
   use url::Url;
 
   use super::hover_concurrent;
@@ -289,8 +289,10 @@ mod tests {
   use super::is_primitive;
   use super::key_documentation;
   use super::primitive_documentation;
-  use crate::LocalTestFuture;
+  use crate::LocalFuture;
+  use crate::handlers::test_support::FixtureFailure;
   use crate::handlers::test_support::SchemaFixture;
+  use crate::handlers::test_support::SchemaInstallation;
   use crate::handlers::test_support::concurrent_world;
   use crate::handlers::test_support::install_schema_document;
   use crate::handlers::test_support::local_world;
@@ -304,26 +306,30 @@ mod tests {
   /// Source shared by every schema-backed hover integration scenario.
   const HOVER_SOURCE: &str = "name = \"taplo\"\nempty = 1\n[table]\nenabled = true\n";
 
-  /// One exact schema-backed hover expectation.
+  /// Local world owner and its complete document/schema installation evidence.
+  type PreparedHover = (
+    LocalWorld<TestEnvironment>,
+    SchemaInstallation<LocalSchemaTransport<TestEnvironment>>,
+  );
+
+  /// Native wire decoding and complete handler response for one hover request.
+  type HoverRequest = Result<Result<Option<Hover>, RpcError>, ResultFailure<serde_json::Error>>;
+
+  /// One exact schema-backed hover expectation retained beside its response.
+  #[derive(Debug)]
   struct HoverExpectation {
     /// Zero-based source line.
-    line:              u32,
+    line:      u32,
     /// Zero-based UTF-16 source character.
-    character:         u32,
-    /// Request execution failure context.
-    execution_context: &'static str,
-    /// Missing-response failure context.
-    presence_context:  &'static str,
+    character: u32,
     /// Expected Markdown content.
-    content:           &'static str,
+    content:   &'static str,
     /// Exact selected range when the contract pins one.
-    range:             Option<Range>,
-    /// Observable-content failure context.
-    assertion_context: &'static str,
+    range:     Option<Range>,
   }
 
-  /// Construct one schema-backed hover scenario without retaining transport state.
-  fn hover_fixture() -> Result<SchemaFixture, TestFailure> {
+  /// Construct complete document and schema URL identities for the hover scenario.
+  fn hover_fixture() -> Result<SchemaFixture, ResultFailure<url::ParseError>> {
     schema_fixture(
       "file:///workspace/hover.toml",
       "https://example.com/hover-schema.json",
@@ -332,98 +338,47 @@ mod tests {
     )
   }
 
-  /// Install one local hover document together with its exact manual schema association.
-  fn prepared_local_hover_world(fixture: &SchemaFixture) -> LocalTestFuture<'_, LocalWorld<TestEnvironment>> {
+  /// Install one local hover document while retaining its world, transition and schema snapshot.
+  fn prepared_local_hover_world(fixture: &SchemaFixture) -> LocalFuture<'_, Result<PreparedHover, FixtureFailure>> {
     Box::pin(async move {
       let world = local_world()?;
-      install_schema_document(
+      let installation = install_schema_document(
         replace_local_document(&world, &fixture.document, HOVER_SOURCE, "the local hover document must install"),
         world.document_snapshot(&fixture.document),
         &fixture.document,
         &fixture.schema_url,
         hover_schema(),
-        "the local hover document must expose a snapshot",
       )
-      .await?;
-      Ok(world)
+      .await;
+      Ok((world, installation))
     })
   }
 
-  /// Execute one local hover request through its complete public wire representation.
+  /// Execute one local hover request while retaining wire decoding and native protocol results.
   fn local_hover_at<'operation>(
     world: &'operation LocalWorld<TestEnvironment>,
     document: &'operation Url,
     line: u32,
     character: u32,
-    context: &'static str,
-  ) -> LocalTestFuture<'operation, Option<Hover>> {
+  ) -> LocalFuture<'operation, HoverRequest> {
     Box::pin(async move {
-      ensure_ok(
-        hover_local(
-          world,
-          Params::from(Some(position_params::<HoverParams>(
-            document,
-            line,
-            character,
-            "the hover request fixture must decode",
-          )?)),
-        )
-        .await,
-        context,
-      )
-    })
-  }
-
-  /// Execute one local hover request and require concrete content.
-  fn required_local_hover_at<'operation>(
-    world: &'operation LocalWorld<TestEnvironment>,
-    document: &'operation Url,
-    line: u32,
-    character: u32,
-    execution_context: &'static str,
-    presence_context: &'static str,
-  ) -> LocalTestFuture<'operation, Hover> {
-    Box::pin(async move {
-      ensure_some(
-        local_hover_at(world, document, line, character, execution_context).await?,
-        presence_context,
-      )
+      let parameters = position_params::<HoverParams>(document, line, character, "the hover request fixture must decode")?;
+      Ok(hover_local(world, Params::from(Some(parameters))).await)
     })
   }
 
   /// Construct the complete schema shared by both hover execution families.
   fn hover_schema() -> serde_json::Value {
-    json!({
-      "type": "object",
-      "properties": {
-        "name": {
-          "title": "Name",
-          "description": "name documentation",
-          "type": "string"
-        },
-        "empty": {
-          "type": "integer"
-        },
-        "table": {
-          "description": "table documentation",
-          "type": "object",
-          "properties": {
-            "enabled": {
-              "type": "boolean",
-              "default": true,
-              "x-taplo": {
-                "docs": {
-                  "defaultValue": "enabled-by-default documentation"
-                }
-              }
-            }
-          }
-        }
-      }
-    })
+    json!({ "type": "object", "properties": {
+      "name": { "title": "Name", "description": "name documentation", "type": "string" },
+      "empty": { "type": "integer" },
+      "table": { "description": "table documentation", "type": "object", "properties": {
+        "enabled": { "type": "boolean", "default": true, "x-taplo": { "docs": { "defaultValue": "enabled-by-default documentation" } } }
+      } }
+    } })
   }
 
-  /// Extract the complete observable Markdown and range from one hover response.
+  /// Borrow observable Markdown and range without replacing the complete hover response.
   fn hover_observation(hover: &Hover) -> Option<(&str, Option<Range>)> {
     match hover.contents {
       HoverContents::Markup(ref markup) => Some((markup.value.as_str(), hover.range)),
@@ -431,272 +386,159 @@ mod tests {
     }
   }
 
-  /// Require one hover to retain exact Markdown and an exact source range.
-  fn ensure_hover_content_and_range(
-    hover: &Hover,
-    expected_content: &str,
-    expected_range: Range,
-    context: &'static str,
-  ) -> Result<(), TestFailure> {
-    ensure(hover_observation(hover) == Some((expected_content, Some(expected_range))), context)
-  }
-
-  /// Require one hover to retain exact Markdown regardless of its selected primitive range.
-  #[allow(
-    clippy::single_call_fn,
-    reason = "the name distinguishes this assertion from `ensure_hover_content_and_range`, marking the expectations that deliberately pin \
-              documentation without pinning a primitive's selected range"
-  )]
-  fn ensure_hover_content(hover: &Hover, expected_content: &str, context: &'static str) -> Result<(), TestFailure> {
-    ensure(
-      hover_observation(hover).is_some_and(|observation| observation.0 == expected_content),
-      context,
+  #[test]
+  fn key_documentation_prefers_extensions_and_embeds_links_only_in_hover() -> Result<(), impl Debug> {
+    let schema = json!({ "title": "Setting", "description": "schema description",
+      "x-taplo": { "docs": { "main": "extension documentation" }, "links": { "key": "https://example.com/key" } } });
+    let embedded = key_documentation(&schema, true);
+    let standalone = key_documentation(&schema, false);
+    let description = json!({ "description": "fallback description" });
+    let fallback = key_documentation(&description, true);
+    let empty_schema = json!({ "description": "" });
+    let empty = key_documentation(&empty_schema, true);
+    ensure_that(
+      (schema, embedded, standalone, description, fallback, empty_schema, empty),
+      "key hover must prefer extension docs, embed links only in hover mode, fall back to description and omit empty content",
+      |observed| {
+        observed.1.as_ref().ok().and_then(Option::as_ref).is_some_and(|text| {
+          text.contains("[Setting](https://example.com/key)")
+            && text.contains("extension documentation")
+            && !text.contains("schema description")
+        }) && observed
+          .2
+          .as_ref()
+          .is_ok_and(|content| content.as_deref() == Some("extension documentation"))
+          && observed
+            .4
+            .as_ref()
+            .is_ok_and(|content| content.as_deref() == Some("fallback description"))
+          && matches!(observed.6, Ok(None))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn key_documentation_prefers_extensions_and_embeds_links_only_in_hover() -> Result<(), TestFailure> {
-    let schema = json!({
-        "title": "Setting",
-        "description": "schema description",
-        "x-taplo": {
-            "docs": { "main": "extension documentation" },
-            "links": { "key": "https://example.com/key" }
-        }
-    });
-    let embedded = ensure_some(
-      ensure_ok(
-        key_documentation(&schema, true),
-        "valid extension metadata must decode for key hover",
-      )?,
-      "key documentation with extension content must exist",
-    )?;
-    ensure_contains(
-      &embedded,
-      "[Setting](https://example.com/key)",
-      "embedded hover mode must prefix the key link",
-    )?;
-    ensure_contains(
-      &embedded,
-      "extension documentation",
-      "extension docs must override the schema description",
-    )?;
-    ensure_lacks(
-      &embedded,
-      "schema description",
-      "lower-precedence schema description must not leak into extension docs",
-    )?;
+  fn primitive_enum_documentation_obeys_link_and_embedding_precedence() -> Result<(), impl Debug> {
+    let schema = json!({ "title": "Value", "description": "description docs", "enum": [1, 2], "default": 2, "const": 2,
+      "x-taplo": { "docs": { "main": "main docs", "enumValues": ["one docs", "two docs"], "defaultValue": "default docs", "constValue": "const docs" },
+        "links": { "enumValues": [null, "https://example.com/two"] } } });
+    let embedded = primitive_documentation(&schema, &json!(2), true);
+    let standalone = primitive_documentation(&schema, &json!(2), false);
+    ensure_that(
+      (schema, embedded, standalone),
+      "matching enum docs must precede default or const docs and embed their link only in hover mode",
+      |observed| {
+        observed.1.as_ref().is_ok_and(|content| {
+          content
+            .as_ref()
+            .is_some_and(|text| text.contains("[Value](https://example.com/two)") && text.contains("two docs"))
+        }) && observed.2.as_ref().is_ok_and(|content| content.as_deref() == Some("two docs"))
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
+  }
 
-    let standalone_mode = ensure_some(
-      ensure_ok(
-        key_documentation(&schema, false),
-        "valid extension metadata must decode for standalone-link mode",
-      )?,
-      "standalone-link mode must retain key documentation",
-    )?;
+  #[test]
+  fn primitive_documentation_falls_through_default_const_and_general_sources() -> Result<(), impl Debug> {
+    let cases = [
+      (json!({ "enum": [2], "default": 2, "const": 2, "x-taplo": { "docs": { "defaultValue": "default docs", "constValue": "const docs" } } }), json!(2), Some("default docs")),
+      (json!({ "const": true, "x-taplo": { "docs": { "constValue": "const docs" } } }), json!(true), Some("const docs")),
+      (json!({ "title": "Value", "description": "description docs", "x-taplo": { "docs": { "main": "main docs" } } }), json!(99), Some("main docs")),
+      (json!({ "description": "description" }), json!(1), Some("description")),
+      (json!({ "title": "title" }), json!(1), Some("title")),
+      (json!({}), json!(1), None),
+    ].map(|(schema, instance, expected)| {
+      let actual = primitive_documentation(&schema, &instance, true);
+      (schema, instance, expected, actual)
+    });
+    ensure_that(
+      cases,
+      "primitive hover must fall through enum, default, const, main, description and title without fabricating empty docs",
+      |observed| {
+        observed
+          .iter()
+          .all(|case| case.3.as_ref().is_ok_and(|content| content.as_deref() == case.2))
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
+  }
+
+  #[test]
+  fn primitive_selection_includes_floats_but_excludes_identifiers() -> Result<(), impl Debug> {
     ensure_eq(
-      &standalone_mode.as_str(),
-      &"extension documentation",
-      "standalone-link mode must not duplicate the URL inside hover content",
-    )?;
-
-    let description_only = json!({ "description": "fallback description" });
-    ensure(
-      ensure_ok(
-        key_documentation(&description_only, true),
-        "an absent extension must retain schema documentation",
-      )? == Some("fallback description".into()),
-      "schema description must backfill absent extension docs",
-    )?;
-    ensure(
-      ensure_ok(
-        key_documentation(&json!({ "description": "" }), true),
-        "an absent extension with empty documentation must decode",
-      )?
-      .is_none(),
-      "empty key documentation must produce no hover content",
+      [is_primitive(FLOAT), is_primitive(STRING), is_primitive(IDENT)],
+      [true, true, false],
+      "float and string values must be hoverable while identifiers retain their distinct branch",
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn primitive_enum_documentation_obeys_link_and_embedding_precedence() -> Result<(), TestFailure> {
-    let schema = json!({
-        "title": "Value",
-        "description": "description docs",
-        "enum": [1, 2],
-        "default": 2,
-        "const": 2,
-        "x-taplo": {
-            "docs": {
-                "main": "main docs",
-                "enumValues": ["one docs", "two docs"],
-                "defaultValue": "default docs",
-                "constValue": "const docs"
-            },
-            "links": {
-                "enumValues": [null, "https://example.com/two"]
-            }
-        }
-    });
-    let enum_embedded = ensure_some(
-      ensure_ok(
-        primitive_documentation(&schema, &json!(2), true),
-        "valid enum extension metadata must decode",
-      )?,
-      "a matching documented enum value must produce content",
-    )?;
-    ensure_contains(
-      &enum_embedded,
-      "[Value](https://example.com/two)",
-      "embedded mode must prefix a matching enum link",
-    )?;
-    ensure_contains(&enum_embedded, "two docs", "matching enum docs")?;
-
-    ensure(
-      ensure_ok(
-        primitive_documentation(&schema, &json!(2), false),
-        "valid enum metadata must decode in standalone-link mode",
-      )? == Some("two docs".into()),
-      "standalone-link mode must retain enum docs without embedding the link",
-    )
-  }
-
-  #[test]
-  fn primitive_documentation_falls_through_default_const_and_general_sources() -> Result<(), TestFailure> {
-    let no_enum_docs = json!({
-        "enum": [2],
-        "default": 2,
-        "const": 2,
-        "x-taplo": {
-            "docs": {
-                "defaultValue": "default docs",
-                "constValue": "const docs"
-            }
-        }
-    });
-    ensure(
-      ensure_ok(
-        primitive_documentation(&no_enum_docs, &json!(2), true),
-        "valid default metadata must decode",
-      )? == Some("default docs".into()),
-      "a matching enum without enum docs must fall through to default before const",
-    )?;
-
-    let const_only = json!({
-        "const": true,
-        "x-taplo": { "docs": { "constValue": "const docs" } }
-    });
-    ensure(
-      ensure_ok(
-        primitive_documentation(&const_only, &json!(true), true),
-        "valid constant metadata must decode",
-      )? == Some("const docs".into()),
-      "matching const docs must be selected when no default docs match",
-    )?;
-
-    let general = json!({
-        "title": "Value",
-        "description": "description docs",
-        "x-taplo": { "docs": { "main": "main docs" } }
-    });
-    ensure(
-      ensure_ok(
-        primitive_documentation(&general, &json!(99), true),
-        "valid main metadata must decode",
-      )? == Some("main docs".into()),
-      "a nonmatching value must fall through to extension main docs",
-    )?;
-    ensure(
-      ensure_ok(
-        primitive_documentation(&json!({ "description": "description" }), &json!(1), true),
-        "an absent extension must retain the schema description",
-      )? == Some("description".into()),
-      "description must follow extension docs",
-    )?;
-    ensure(
-      ensure_ok(
-        primitive_documentation(&json!({ "title": "title" }), &json!(1), true),
-        "an absent extension must retain the schema title",
-      )? == Some("title".into()),
-      "title must be the final nonempty fallback",
-    )?;
-    ensure(
-      ensure_ok(
-        primitive_documentation(&json!({}), &json!(1), true),
-        "an empty schema must decode without extension metadata",
-      )?
-      .is_none(),
-      "a schema without documentation must produce no hover",
-    )
-  }
-
-  #[test]
-  fn primitive_selection_includes_floats_but_excludes_identifiers() -> Result<(), TestFailure> {
-    ensure(is_primitive(FLOAT), "floating-point values must be hoverable")?;
-    ensure(is_primitive(STRING), "string values must be hoverable")?;
-    ensure(!is_primitive(IDENT), "identifier handling must remain a distinct hover branch")
-  }
-
-  #[test]
-  fn schema_backed_hover_projects_key_value_header_and_default_documentation() -> Result<(), TestFailure> {
-    block_on(async {
+  fn schema_backed_hover_projects_key_value_header_and_default_documentation() -> Result<(), impl Debug> {
+    let observed = block_on(async {
       let fixture = hover_fixture()?;
-      let local = prepared_local_hover_world(&fixture).await?;
-
+      let prepared = prepared_local_hover_world(&fixture).await?;
+      let mut requests = Vec::new();
       for expectation in [
         HoverExpectation {
-          line:              0,
-          character:         1,
-          execution_context: "local key hover must execute",
-          presence_context:  "a documented key must produce local hover content",
-          content:           "name documentation",
-          range:             Some(Range::new(Position::new(0, 0), Position::new(0, 4))),
-          assertion_context: "key hover must preserve schema documentation and the exact identifier range",
+          line:      0,
+          character: 1,
+          content:   "name documentation",
+          range:     Some(Range::new(Position::new(0, 0), Position::new(0, 4))),
         },
         HoverExpectation {
-          line:              0,
-          character:         9,
-          execution_context: "local primitive hover must execute",
-          presence_context:  "a documented primitive must produce local hover content",
-          content:           "name documentation",
-          range:             None,
-          assertion_context: "primitive hover must resolve documentation through the same schema path as its key",
+          line:      0,
+          character: 9,
+          content:   "name documentation",
+          range:     None,
         },
         HoverExpectation {
-          line:              2,
-          character:         2,
-          execution_context: "local table-header hover must execute",
-          presence_context:  "a documented table header must produce local hover content",
-          content:           "table documentation",
-          range:             Some(Range::new(Position::new(2, 1), Position::new(2, 6))),
-          assertion_context: "table-header hover must resolve the indexed header path and exact identifier range",
+          line:      2,
+          character: 2,
+          content:   "table documentation",
+          range:     Some(Range::new(Position::new(2, 1), Position::new(2, 6))),
         },
         HoverExpectation {
-          line:              3,
-          character:         11,
-          execution_context: "local default-value hover must execute",
-          presence_context:  "a documented schema default must produce local hover content",
-          content:           "enabled-by-default documentation",
-          range:             None,
-          assertion_context: "primitive hover must honor specialized default-value documentation",
+          line:      3,
+          character: 11,
+          content:   "enabled-by-default documentation",
+          range:     None,
         },
       ] {
-        let hover = required_local_hover_at(
-          &local, &fixture.document, expectation.line, expectation.character, expectation.execution_context, expectation.presence_context,
-        )
-        .await?;
-        expectation.range.map_or_else(
-          || ensure_hover_content(&hover, expectation.content, expectation.assertion_context),
-          |expected_range| ensure_hover_content_and_range(&hover, expectation.content, expected_range, expectation.assertion_context),
-        )?;
+        let response = local_hover_at(&prepared.0, &fixture.document, expectation.line, expectation.character).await;
+        requests.push((expectation, response));
       }
-      Ok(())
-    })
+      Ok::<_, FixtureFailure>((fixture, prepared, requests))
+    });
+    let matches_expectation = |request: &(HoverExpectation, HoverRequest)| {
+      let Ok(Ok(Some(ref content))) = request.1 else {
+        return false;
+      };
+      hover_observation(content)
+        .is_some_and(|hover| hover.0 == request.0.content && request.0.range.is_none_or(|range| hover.1 == Some(range)))
+    };
+    ensure_that(
+      observed,
+      "schema hover must preserve key, primitive, table and specialized default documentation with exact selected ranges",
+      |result| {
+        let Ok(ref scenario) = *result else {
+          return false;
+        };
+        scenario.1.1.0.is_ok() && scenario.1.1.1.is_some() && scenario.2.iter().all(matches_expectation)
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn array_table_header_hover_resolves_the_schema_path_without_runtime_indices() -> Result<(), TestFailure> {
-    block_on(async {
+  fn array_table_header_hover_resolves_the_schema_path_without_runtime_indices() -> Result<(), impl Debug> {
+    let observed = block_on(async {
       let fixture = schema_fixture(
         "file:///workspace/array-hover.toml",
         "https://example.com/array-hover-schema.json",
@@ -704,7 +546,7 @@ mod tests {
         "the array-hover schema URL must parse",
       )?;
       let world = local_world()?;
-      install_schema_document(
+      let installed = install_schema_document(
         replace_local_document(
           &world,
           &fixture.document,
@@ -714,112 +556,89 @@ mod tests {
         world.document_snapshot(&fixture.document),
         &fixture.document,
         &fixture.schema_url,
-        json!({
-          "type": "object",
-          "properties": {
-            "products": {
-              "description": "product collection documentation",
-              "type": "array",
-              "items": {
-                "type": "object",
-                "properties": {
-                  "name": {
-                    "type": "string"
-                  }
-                }
-              }
-            }
-          }
-        }),
-        "the array-hover document must expose a snapshot",
+        json!({ "type": "object", "properties": { "products": { "description": "product collection documentation", "type": "array",
+          "items": { "type": "object", "properties": { "name": { "type": "string" } } } } } }),
       )
-      .await?;
-
-      let hover = required_local_hover_at(
-        &world,
-        &fixture.document,
-        0,
-        3,
-        "array-table header hover must execute",
-        "a documented array-table header must produce hover content",
-      )
-      .await?;
-      ensure_hover_content_and_range(
-        &hover,
-        "product collection documentation",
-        Range::new(Position::new(0, 2), Position::new(0, 10)),
-        "array-table header hover must remove runtime item indices before schema lookup and retain the exact identifier range",
-      )
-    })
+      .await;
+      let response = local_hover_at(&world, &fixture.document, 0, 3).await;
+      Ok::<_, FixtureFailure>((fixture, world, installed, response))
+    });
+    ensure_that(
+      observed,
+      "array-table hover must remove runtime item indices and retain documentation with the exact header identifier range",
+      |result| {
+        let Ok(ref scenario) = *result else {
+          return false;
+        };
+        scenario.2.0.is_ok()
+          && scenario.2.1.is_some()
+          && scenario
+            .3
+            .as_ref()
+            .ok()
+            .and_then(|response| response.as_ref().ok())
+            .and_then(Option::as_ref)
+            .and_then(hover_observation)
+            == Some((
+              "product collection documentation",
+              Some(Range::new(Position::new(0, 2), Position::new(0, 10))),
+            ))
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn hover_rejects_missing_parameters_and_omits_unsupported_or_unassociated_targets() -> Result<(), TestFailure> {
-    block_on(async {
+  fn hover_rejects_missing_parameters_and_omits_unsupported_or_unassociated_targets() -> Result<(), impl Debug> {
+    let observed = block_on(async {
       let fixture = hover_fixture()?;
-      let local = prepared_local_hover_world(&fixture).await?;
-
-      for (line, character, context) in [
-        (1, 1, "a schema without documentation must not fabricate hover content"),
-        (0, 5, "a nonidentifier operator position must not fabricate a hover target"),
-      ] {
-        ensure(
-          local_hover_at(&local, &fixture.document, line, character, context)
-            .await?
-            .is_none(),
-          context,
-        )?;
-      }
-
       let unassociated = local_world()?;
-      replace_local_document(
+      let prepared = prepared_local_hover_world(&fixture).await?;
+      let mut absent = Vec::new();
+      for position in [(1, 1), (0, 5)] {
+        let response = local_hover_at(&prepared.0, &fixture.document, position.0, position.1).await;
+        absent.push((position, response));
+      }
+      let installed = replace_local_document(
         &unassociated,
         &fixture.document,
         HOVER_SOURCE,
         "the unassociated hover document must install",
       )
-      .await?;
-      ensure(
-        local_hover_at(
-          &unassociated,
-          &fixture.document,
-          0,
-          1,
-          "unassociated hover must remain an absent success",
-        )
-        .await?
-        .is_none(),
-        "a document without a schema association must not fabricate hover content",
-      )?;
-      let missing_params = ensure_some(
-        hover_local(&local, Params::<HoverParams>::from(None)).await.err(),
-        "hover without parameters must return a typed invalid-params error",
-      )?;
-      ensure_eq(
-        &missing_params.code,
-        &-32602,
-        "hover without parameters must retain the standard invalid-params code",
-      )
-    })
+      .await;
+      let unassociated_response = local_hover_at(&unassociated, &fixture.document, 0, 1).await;
+      let rejected = hover_local(&prepared.0, Params::<HoverParams>::from(None)).await;
+      Ok::<_, FixtureFailure>((fixture, prepared, absent, unassociated, installed, unassociated_response, rejected))
+    });
+    ensure_that(
+      observed,
+      "unsupported, undocumented and unassociated hover targets must remain absent while missing parameters retain their typed error",
+      |result| {
+        let Ok(ref scenario) = *result else {
+          return false;
+        };
+        scenario.1.1.0.is_ok()
+          && scenario.1.1.1.is_some()
+          && scenario.2.iter().all(|request| matches!(request.1, Ok(Ok(None))))
+          && scenario.4.is_ok()
+          && matches!(scenario.5, Ok(Ok(None)))
+          && scenario.6.as_ref().is_err_and(|error| error.code == -32602)
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn hover_execution_families_preserve_observable_output() -> Result<(), TestFailure> {
-    block_on(async {
+  fn hover_execution_families_preserve_observable_output() -> Result<(), impl Debug> {
+    let observed = block_on(async {
       let fixture = hover_fixture()?;
-      let local = prepared_local_hover_world(&fixture).await?;
-      let local_hover = required_local_hover_at(
-        &local,
-        &fixture.document,
-        0,
-        1,
-        "local parity hover must execute",
-        "a documented key must produce local parity hover content",
-      )
-      .await?;
-
       let concurrent = concurrent_world()?;
-      install_schema_document(
+      let concurrent_params = position_params::<HoverParams>(&fixture.document, 0, 1, "the concurrent hover request fixture must decode")?;
+      let prepared = prepared_local_hover_world(&fixture).await?;
+      let local = local_hover_at(&prepared.0, &fixture.document, 0, 1).await;
+      let installed = install_schema_document(
         replace_concurrent_document(
           &concurrent,
           &fixture.document,
@@ -830,29 +649,34 @@ mod tests {
         &fixture.document,
         &fixture.schema_url,
         hover_schema(),
-        "the concurrent hover document must expose a snapshot",
       )
-      .await?;
-      let concurrent_hover = ensure_some(
-        ensure_ok(
-          hover_concurrent(
-            &concurrent,
-            Params::from(Some(position_params::<HoverParams>(
-              &fixture.document,
-              0,
-              1,
-              "the concurrent hover request fixture must decode",
-            )?)),
-          )
-          .await,
-          "concurrent key hover must execute",
-        )?,
-        "a documented key must produce concurrent hover content",
-      )?;
-      ensure(
-        hover_observation(&concurrent_hover) == hover_observation(&local_hover),
-        "local and concurrent hover families must preserve the same observable content and range",
-      )
-    })
+      .await;
+      let response = hover_concurrent(&concurrent, Params::from(Some(concurrent_params))).await;
+      Ok::<_, FixtureFailure>((fixture, prepared, local, concurrent, installed, response))
+    });
+    ensure_that(
+      observed,
+      "both hover execution families must retain identical complete content and range",
+      |result| {
+        let Ok(ref scenario) = *result else {
+          return false;
+        };
+        let Ok(Ok(Some(ref local))) = scenario.2 else {
+          return false;
+        };
+        let Ok(Some(ref concurrent)) = scenario.5 else {
+          return false;
+        };
+        scenario.1.1.0.is_ok()
+          && scenario.1.1.1.is_some()
+          && scenario.4.0.is_ok()
+          && scenario.4.1.is_some()
+          && hover_observation(local)
+            .zip(hover_observation(concurrent))
+            .is_some_and(|(left, right)| left == right)
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

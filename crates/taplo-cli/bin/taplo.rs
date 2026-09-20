@@ -57,12 +57,15 @@ mod tests {
   use std::io;
   use std::io::Write;
 
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
+  use strict_test_support::PredicateFailure;
+  use strict_test_support::ensure_that;
   use taplo_cli::CliError;
   use taplo_cli::CliFailure;
 
   use super::write_cli_error;
+
+  /// Complete typed error, write result, and bytes observed at the binary boundary.
+  type ErrorRendering = (CliError, io::Result<()>, Vec<u8>);
 
   /// Writer that rejects every byte sequence.
   struct RejectingWriter;
@@ -78,25 +81,40 @@ mod tests {
   }
 
   #[test]
-  fn typed_cli_errors_render_with_a_stable_boundary_prefix() -> Result<(), TestFailure> {
+  fn typed_cli_errors_render_with_a_stable_boundary_prefix() -> Result<(), Box<PredicateFailure<ErrorRendering>>> {
     let mut output = Vec::new();
     let error = CliError::from(CliFailure::NoQueryMatches);
-    write_cli_error(&mut output, &error).map_err(|source| TestFailure::WasErr {
-      context: "the in-memory CLI writer must accept the rendered error",
-      cause:   source.to_string(),
-    })?;
-    ensure(
-      output == b"error: the query matched no values\n",
-      "the binary boundary must preserve the typed error and stable prefix",
+    let written = write_cli_error(&mut output, &error);
+    ensure_that(
+      (error, written, output),
+      "the in-memory CLI writer must accept the rendered error",
+      |&(_, ref written, _)| written.is_ok(),
     )
+    .and_then(|observed| {
+      ensure_that(
+        observed,
+        "the binary boundary must preserve the typed error and stable prefix",
+        |&(_, _, ref output)| output == b"error: the query matched no values\n",
+      )
+    })
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn cli_error_rendering_propagates_writer_failure() -> Result<(), TestFailure> {
+  fn cli_error_rendering_propagates_writer_failure() -> Result<(), Box<PredicateFailure<(CliError, io::Result<()>)>>> {
     let error = CliError::from(CliFailure::NoQueryMatches);
-    ensure(
-      write_cli_error(&mut RejectingWriter, &error).is_err(),
+    let written = write_cli_error(&mut RejectingWriter, &error);
+    ensure_that(
+      (error, written),
       "the binary boundary must not hide an output failure",
+      |&(_, ref written)| {
+        written
+          .as_ref()
+          .is_err_and(|failure| failure.kind() == io::ErrorKind::BrokenPipe)
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

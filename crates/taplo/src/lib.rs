@@ -26,35 +26,36 @@
 //! parts of it might be missing.
 //!
 //! ```
-//! use strict_test_support::TestFailure;
-//! use strict_test_support::ensure;
-//! use strict_test_support::ensure_ok;
+//! use strict_test_support::ensure_that;
 //! use taplo::parser::parse;
 //!
-//! # fn main() -> Result<(), TestFailure> {
+//! # fn main() -> Result<(), impl core::fmt::Debug> {
 //! const SOURCE: &str = "value = 1
 //! value = 2
 //!
 //! [table]
 //! string = 'some string'";
 //!
-//! let parse_result = ensure_ok(parse(SOURCE), "the syntax tree must build")?;
+//! let observed = parse(SOURCE).map(|parsed| {
+//!   let root = parsed.clone().into_dom();
+//!   let validation = root.validate();
+//!   (parsed, root, validation)
+//! });
 //!
 //! // Check for syntax errors.
 //! // These are not carried over to DOM errors.
-//! ensure(
-//!   parse_result.diagnostics().is_empty(),
-//!   "the source must not produce syntax diagnostics",
-//! )?;
-//!
-//! let root_node = parse_result.into_dom();
-//!
-//! // Check for semantic errors.
-//! // In this example "value" is a duplicate key.
-//! ensure(
-//!   root_node.validate().is_err(),
-//!   "the duplicate key must produce a semantic diagnostic",
+//! // In this example "value" is a duplicate key, so semantic validation fails.
+//! ensure_that(
+//!   observed,
+//!   "the source must parse cleanly and report the duplicate key",
+//!   |result| {
+//!     result
+//!       .as_ref()
+//!       .is_ok_and(|value| value.0.diagnostics().is_empty() && value.2.is_err())
+//!   },
 //! )
+//! .map(drop)
+//! .map_err(Box::new)
 //! # }
 //! ```
 

@@ -787,14 +787,17 @@ impl From<Invalid> for Node {
 #[cfg(test)]
 /// Unified node-variant API contracts.
 mod tests {
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_some;
+  use core::array::from_fn;
+  use core::fmt::Debug;
+
+  use strict_test_support::ResultFailure;
+  use strict_test_support::ensure_that;
 
   use super::Node;
   use crate::dom::Key;
   use crate::dom::KeyOrIndex;
   use crate::dom::Keys;
+  use crate::parser::ParseFailure;
   use crate::test_support::parse_dom;
 
   /// Return the public variant-predicate results in declaration order.
@@ -829,204 +832,155 @@ mod tests {
     ]
   }
 
-  /// Extract one named root entry from a parsed document.
-  fn entry(root: &Node, name: &str) -> Result<Node, TestFailure> {
-    ensure_some(root.get_key(name), "the named node-variant fixture must exist")
-  }
-
-  /// Parse one source-backed instance of every public node variant.
-  fn variant_fixture() -> Result<[Node; 8], TestFailure> {
-    let root = parse_dom(
+  /// Parse one source-backed instance of every public node variant without discarding missing
+  /// entries.
+  fn variant_fixture() -> Result<[Option<Node>; 8], ResultFailure<ParseFailure>> {
+    parse_dom(
       "array = [true]\nboolean = true\nstring = \"text\"\ninteger = 7\nfloat = 1.5\ndate = 1979-05-27\ninvalid = \
        999999999999999999999999999999\n",
       "the node-variant fixture must parse",
-    )?;
-    Ok([
-      root.clone(),
-      entry(&root, "array")?,
-      entry(&root, "boolean")?,
-      entry(&root, "string")?,
-      entry(&root, "integer")?,
-      entry(&root, "float")?,
-      entry(&root, "date")?,
-      entry(&root, "invalid")?,
-    ])
+    )
+    .map(|root| {
+      [
+        Some(root.clone()),
+        root.get_key("array"),
+        root.get_key("boolean"),
+        root.get_key("string"),
+        root.get_key("integer"),
+        root.get_key("float"),
+        root.get_key("date"),
+        root.get_key("invalid"),
+      ]
+    })
   }
 
-  /// Exercise one positive and negative owned node conversion.
+  /// Retain original nodes and both native owned-conversion outcomes.
   macro_rules! conversion_contract {
-    ($positive:expr, $negative:expr, $method:ident, $expected:expr, $positive_context:literal, $negative_context:literal) => {{
-      let Ok(converted) = $positive.clone().$method() else {
-        return ensure(false, $positive_context);
-      };
-      let reconstructed = Node::from(converted);
-      ensure(variant_flags(&reconstructed) == $expected, $positive_context)?;
-      let rejected = $negative.clone();
-      let rejected_flags = variant_flags(&rejected);
-      let Err(original) = rejected.$method() else {
-        return ensure(false, $negative_context);
-      };
-      ensure(variant_flags(&original) == rejected_flags, $negative_context)?;
+    ($positive:expr, $negative:expr, $method:ident) => {{
+      let positive = $positive.clone();
+      let negative = $negative.clone();
+      let accepted = positive.clone().$method().map(Node::from);
+      let rejected = negative.clone().$method().map(Node::from);
+      (positive, negative, accepted, rejected)
     }};
   }
 
   #[test]
-  fn variant_predicates_and_borrowed_projections_are_symmetric() -> Result<(), TestFailure> {
-    let [table, array, boolean, string, integer, float, date, invalid] = variant_fixture()?;
-    let variants = [
-      (&table, [true, false, false, false, false, false, false, false]),
-      (&array, [false, true, false, false, false, false, false, false]),
-      (&boolean, [false, false, true, false, false, false, false, false]),
-      (&string, [false, false, false, true, false, false, false, false]),
-      (&integer, [false, false, false, false, true, false, false, false]),
-      (&float, [false, false, false, false, false, true, false, false]),
-      (&date, [false, false, false, false, false, false, true, false]),
-      (&invalid, [false, false, false, false, false, false, false, true]),
-    ];
-    for (node, expected) in variants {
-      ensure(
-        (variant_flags(node), projection_flags(node)) == (expected, expected),
-        "every node predicate and borrowed projection must select exactly its declared variant",
-      )?;
-      ensure(
-        node.syntax().is_some(),
-        "every source-backed node variant must retain its immutable syntax anchor",
-      )?;
-    }
-    ensure(
-      [
-        table.is_valid_node(),
-        array.is_valid_node(),
-        boolean.is_valid_node(),
-        string.is_valid_node(),
-        integer.is_valid_node(),
-        float.is_valid_node(),
-        date.is_valid_node(),
-        invalid.is_valid_node(),
-        invalid.errors().len() == 1,
-      ] == [true, true, true, true, true, true, true, false, true],
-      "valid scalar and container variants must stay diagnostic-free while malformed source retains its direct diagnostic",
+  fn variant_predicates_and_borrowed_projections_are_symmetric() -> Result<(), impl Debug> {
+    ensure_that(
+      variant_fixture(),
+      "every variant must preserve symmetric predicates, projections, source anchors, and direct diagnostics",
+      |fixture| {
+        let Ok(ref nodes) = *fixture else {
+          return false;
+        };
+
+        nodes.iter().enumerate().all(|(index, pending)| {
+          let expected = from_fn(|candidate| candidate == index);
+          matches!(*pending, Some(ref node) if variant_flags(node) == expected && projection_flags(node) == expected
+            && node.syntax().is_some() && node.is_valid_node() == (index != 7) && (index != 7 || node.errors().len() == 1))
+        })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn owned_variant_conversions_reconstruct_or_preserve_the_original() -> Result<(), TestFailure> {
-    let [table, array, boolean, string, integer, float, date, invalid] = variant_fixture()?;
-    conversion_contract!(
-      table,
-      array,
-      try_into_table,
-      [true, false, false, false, false, false, false, false],
-      "owned table conversion must reconstruct the table variant",
-      "owned table conversion must reject and preserve an array"
-    );
-    conversion_contract!(
-      array,
-      table,
-      try_into_array,
-      [false, true, false, false, false, false, false, false],
-      "owned array conversion must reconstruct the array variant",
-      "owned array conversion must reject and preserve a table"
-    );
-    conversion_contract!(
-      boolean,
-      table,
-      try_into_bool,
-      [false, false, true, false, false, false, false, false],
-      "owned Boolean conversion must reconstruct the Boolean variant",
-      "owned Boolean conversion must reject and preserve a table"
-    );
-    conversion_contract!(
-      string,
-      table,
-      try_into_str,
-      [false, false, false, true, false, false, false, false],
-      "owned string conversion must reconstruct the string variant",
-      "owned string conversion must reject and preserve a table"
-    );
-    conversion_contract!(
-      integer,
-      table,
-      try_into_integer,
-      [false, false, false, false, true, false, false, false],
-      "owned integer conversion must reconstruct the integer variant",
-      "owned integer conversion must reject and preserve a table"
-    );
-    conversion_contract!(
-      float,
-      table,
-      try_into_float,
-      [false, false, false, false, false, true, false, false],
-      "owned float conversion must reconstruct the float variant",
-      "owned float conversion must reject and preserve a table"
-    );
-    conversion_contract!(
-      date,
-      table,
-      try_into_date,
-      [false, false, false, false, false, false, true, false],
-      "owned date conversion must reconstruct the date variant",
-      "owned date conversion must reject and preserve a table"
-    );
-    conversion_contract!(
-      invalid,
-      table,
-      try_into_invalid,
-      [false, false, false, false, false, false, false, true],
-      "owned invalid conversion must reconstruct the invalid variant",
-      "owned invalid conversion must reject and preserve a table"
-    );
-    Ok(())
-  }
-
-  #[test]
-  fn typed_lookup_routes_table_keys_and_array_indices_without_scalar_fallbacks() -> Result<(), TestFailure> {
-    let root = parse_dom(
-      "items = [{ name = \"first\" }, { name = \"second\" }]\n",
-      "the typed node-lookup fixture must parse",
-    )?;
-    let items = entry(&root, "items")?;
-    let second_path = Keys::new(
-      [
-        KeyOrIndex::from(Key::new("items")),
-        KeyOrIndex::from(1_usize),
-        KeyOrIndex::from(Key::new("name")),
-      ]
-      .into_iter(),
-    );
-    ensure(
-      root
-        .path(&second_path)
-        .and_then(|node| node.as_str().map(|string| string.value().to_owned()))
-        .as_deref()
-        == Some("second"),
-      "typed path lookup must route key and index segments through nested containers",
-    )?;
-    ensure(
-      [
-        items.get(&KeyOrIndex::from(0_usize)).is_some(),
-        items.get_index(9).is_none(),
-        items.get_key("0").is_none(),
-        root.get_index(0).is_none(),
-        items.get_key("missing").is_none(),
-        items.get_index(0).and_then(|node| node.get_key("name")).is_some(),
-      ] == [true, true, true, true, true, true],
-      "container lookup must preserve key/index kind, bounds, and absence without scalar coercion",
-    )?;
-    let scalar = ensure_some(
-      root.path(&Keys::new(
+  fn owned_variant_conversions_reconstruct_or_preserve_the_original() -> Result<(), impl Debug> {
+    let observed = variant_fixture().map(|nodes| {
+      let conversions = match nodes {
         [
-          KeyOrIndex::from(Key::new("items")),
-          KeyOrIndex::from(0_usize),
-          KeyOrIndex::from(Key::new("name")),
-        ]
-        .into_iter(),
-      )),
-      "the scalar node-lookup fixture must exist",
-    )?;
-    ensure(
-      [scalar.get_key("child").is_none(), scalar.get_index(0).is_none()] == [true, true],
-      "scalar nodes must not fabricate table or array children",
+          Some(ref table),
+          Some(ref array),
+          Some(ref boolean),
+          Some(ref string),
+          Some(ref integer),
+          Some(ref float),
+          Some(ref date),
+          Some(ref invalid),
+        ] => Some([
+          conversion_contract!(table, array, try_into_table),
+          conversion_contract!(array, table, try_into_array),
+          conversion_contract!(boolean, table, try_into_bool),
+          conversion_contract!(string, table, try_into_str),
+          conversion_contract!(integer, table, try_into_integer),
+          conversion_contract!(float, table, try_into_float),
+          conversion_contract!(date, table, try_into_date),
+          conversion_contract!(invalid, table, try_into_invalid),
+        ]),
+        _ => None,
+      };
+      (nodes, conversions)
+    });
+    ensure_that(
+      observed,
+      "owned conversions must reconstruct their variant or return the unchanged rejected node",
+      |fixture| {
+        let Ok(ref value) = *fixture else {
+          return false;
+        };
+
+        let Some(ref conversions) = value.1 else {
+          return false;
+        };
+        conversions.iter().all(|conversion| {
+          conversion
+            .2
+            .as_ref()
+            .is_ok_and(|node| variant_flags(node) == variant_flags(&conversion.0) && node.syntax() == conversion.0.syntax())
+            && conversion
+              .3
+              .as_ref()
+              .is_err_and(|node| variant_flags(node) == variant_flags(&conversion.1) && node.syntax() == conversion.1.syntax())
+        })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
+  }
+
+  #[test]
+  fn typed_lookup_routes_table_keys_and_array_indices_without_scalar_fallbacks() -> Result<(), impl Debug> {
+    let observed = parse_dom(
+      "items = [{ name = \"first\" }, { name = \"second\" }]\n",
+      "the node-lookup fixture must parse",
+    );
+    ensure_that(
+      observed,
+      "typed lookup must retain key/index boundaries, nested values, absence, and scalar rejection",
+      |fixture| {
+        let Ok(ref root) = *fixture else {
+          return false;
+        };
+        let second_path = Keys::new(
+          [
+            KeyOrIndex::from(Key::new("items")),
+            KeyOrIndex::from(1_usize),
+            KeyOrIndex::from(Key::new("name")),
+          ]
+          .into_iter(),
+        );
+        let Some(second) = root.path(&second_path) else {
+          return false;
+        };
+        let Some(items) = root.get_key("items") else {
+          return false;
+        };
+        let Some(scalar) = items.get_index(0).and_then(|node| node.get_key("name")) else {
+          return false;
+        };
+        second.as_str().is_some_and(|value| value.value() == "second")
+          && root.get_index(0).is_none()
+          && items.get(&KeyOrIndex::from(0_usize)).is_some()
+          && items.get_index(9).is_none()
+          && items.get_key("0").is_none()
+          && items.get_key("missing").is_none()
+          && scalar.get_key("child").is_none()
+          && scalar.get_index(0).is_none()
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

@@ -122,6 +122,7 @@ macro_rules! implement_message_writer_readiness {
 }
 
 /// Result of invoking an erased request handler before its JSON-RPC response is written.
+#[derive(Debug)]
 enum RequestOutcome {
   /// Typed handler success serialized to JSON.
   Success(serde_json::Value),
@@ -636,6 +637,7 @@ struct MutationBarrierState<R: WakerRegistration> {
 }
 
 /// Issued mutation whose drop marks completion even if its handler future is cancelled.
+#[derive(Debug)]
 struct MutationTicket<S: MutationBarrierStorage> {
   /// Shared ordering barrier.
   barrier:  MutationBarrier<S>,
@@ -710,6 +712,7 @@ impl<S: MutationBarrierStorage> Drop for MutationBarrierWait<S> {
 }
 
 /// Ordering work captured synchronously when a message enters a server.
+#[derive(Debug)]
 enum MessageSchedule<S: MutationBarrierStorage> {
   /// Await every mutation issued before this request.
   Request {
@@ -1055,6 +1058,7 @@ fn lifecycle_error<C: CancellationState>(state: &SessionState<C>, kind: RequestK
 }
 
 /// A classified inbound JSON-RPC message.
+#[derive(Debug)]
 enum Inbound {
   /// A client request with a concrete ID.
   Request(InboundRequest),
@@ -1069,6 +1073,7 @@ enum Inbound {
 }
 
 /// Concrete request data established at wire classification.
+#[derive(Debug)]
 struct InboundRequest {
   /// JSON-RPC version.
   jsonrpc: String,
@@ -1081,6 +1086,7 @@ struct InboundRequest {
 }
 
 /// Concrete notification data established at wire classification.
+#[derive(Debug)]
 struct InboundNotification {
   /// JSON-RPC version.
   jsonrpc: String,
@@ -1264,18 +1270,16 @@ mod tests {
   use futures::future::pending;
   use futures::future::poll_fn;
   use futures::future::ready;
-  use futures::future::try_join;
   use futures::task::noop_waker;
   use lsp_types::NumberOrString;
   use lsp_types::notification;
   use lsp_types::notification::Notification;
   use lsp_types::request;
   use lsp_types::request::Request;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
+  use strict_test_support::ComparisonFailure;
+  use strict_test_support::PredicateFailure;
   use strict_test_support::ensure_eq;
-  use strict_test_support::ensure_ok;
-  use strict_test_support::ensure_some;
+  use strict_test_support::ensure_that;
 
   use super::CancellationState;
   use super::CancellationWaiter;
@@ -1312,7 +1316,7 @@ mod tests {
   use super::serialize_optional;
 
   /// Count wakeups delivered to one independently registered cancellation waiter.
-  #[derive(Default)]
+  #[derive(Debug, Default)]
   struct WakeCounter {
     /// Number of wakeups observed by this waiter.
     count: AtomicU64,
@@ -1342,6 +1346,7 @@ mod tests {
   }
 
   /// Two independently observable task wakers used by waiter lifecycle tests.
+  #[derive(Debug)]
   struct WakeObservers {
     /// Wake count retained for the first task.
     first_counter:  Arc<WakeCounter>,
@@ -1370,7 +1375,7 @@ mod tests {
   }
 
   /// Thread-safe in-memory message sink shared by local and concurrent runtime tests.
-  #[derive(Clone, Default)]
+  #[derive(Clone, Debug, Default)]
   struct TestWriter {
     /// Messages accepted by the sink.
     messages: Arc<parking_lot::Mutex<Vec<rpc::Message>>>,
@@ -1633,32 +1638,51 @@ mod tests {
     codes
   }
 
-  /// Drive one inbound request and its client response to completion together.
+  /// Native completion and context for one public server operation.
+  type DispatchObservation = (&'static str, Result<(), ServerError>);
+
+  /// Drive both halves of one exchange and retain both native completions.
   fn complete_exchange<InboundFuture, ResponseFuture>(
     inbound: InboundFuture,
     response: ResponseFuture,
     inbound_context: &'static str,
     response_context: &'static str,
-  ) -> Result<(), TestFailure>
+  ) -> [DispatchObservation; 2]
   where
     InboundFuture: Future<Output = Result<(), ServerError>>,
     ResponseFuture: Future<Output = Result<(), ServerError>>,
   {
     let (inbound_result, response_result) = block_on(join(inbound, response));
-    ensure_ok(inbound_result, inbound_context)?;
-    ensure_ok(response_result, response_context)
+    [(inbound_context, inbound_result), (response_context, response_result)]
   }
+
+  /// Complete runtime fixture and every observed operation or state checkpoint.
+  #[derive(Debug)]
+  struct RuntimeObservations<W, S> {
+    /// World owner retained through assertion completion.
+    world:    W,
+    /// Writer retaining every emitted message and its transport state.
+    writer:   TestWriter,
+    /// Runtime owner retaining protocol state and registries.
+    server:   S,
+    /// Native results in dispatch order with their scenario contexts.
+    dispatch: Vec<DispatchObservation>,
+    /// World values observed before later mutations.
+    values:   Vec<u64>,
+    /// Message snapshots observed before later dispatch.
+    messages: Vec<Vec<rpc::Message>>,
+    /// Registry descriptions captured before and after handler replacement.
+    registry: Vec<String>,
+  }
+
+  /// Native terminal assertion over a retained runtime fixture.
+  type RuntimeAssertion<W, S> = Result<(), Box<PredicateFailure<RuntimeObservations<W, S>>>>;
 
   /// Current-thread state used by local runtime behavior tests.
   type LocalValue = Rc<Cell<u64>>;
 
-  /// Construct fresh current-thread state for one local runtime contract.
-  fn local_runtime_value() -> LocalValue {
-    Rc::new(Cell::new(0))
-  }
-
-  /// Successful local initialize handler.
-  fn initialize_local(_context: LocalContext<LocalValue>, _params: Params<()>) -> Ready<Result<(), rpc::RpcError>> {
+  /// Complete initialization identically for either honest runtime context family.
+  fn initialize_runtime_context<C>(_context: C, _params: Params<()>) -> Ready<Result<(), rpc::RpcError>> {
     ready(Ok(()))
   }
 
@@ -1725,13 +1749,8 @@ mod tests {
   }
 
   /// Concurrent state used by ordering tests.
-  #[derive(Clone, Default)]
+  #[derive(Clone, Debug, Default)]
   struct ConcurrentValue(Arc<AtomicU64>);
-
-  /// Construct fresh thread-safe state for one concurrent runtime contract.
-  fn concurrent_runtime_value() -> ConcurrentValue {
-    ConcurrentValue::default()
-  }
 
   /// Shared scalar behavior required by runtime-family handler fixtures.
   trait RuntimeValue {
@@ -1886,11 +1905,6 @@ mod tests {
     debug_name = "ConcurrentContext",
   );
 
-  /// Successful concurrent initialize handler.
-  fn initialize_concurrent(_context: ConcurrentContext<ConcurrentValue>, _params: Params<()>) -> Ready<Result<(), rpc::RpcError>> {
-    ready(Ok(()))
-  }
-
   /// Commit one concurrent value after yielding once.
   fn set_concurrent_value(
     context: ConcurrentContext<ConcurrentValue>,
@@ -1981,704 +1995,623 @@ mod tests {
   /// Require one concurrent protocol type to be transferable and shareable.
   fn require_send_sync<T: Send + Sync>() {}
 
-  /// Exercise lifecycle transitions through one runtime-specific cancellation store.
-  fn lifecycle_transitions<C: CancellationState>() -> Result<(), TestFailure> {
+  /// One native request admission, retaining both lifecycle kind and cancellation token.
+  type RequestAdmission<T> = Result<(RequestKind, T), rpc::RpcError>;
+
+  /// Native request admissions, notifications, and lifecycle checkpoints.
+  #[derive(Debug)]
+  struct LifecycleObservations<T> {
+    /// All admission results, retaining successful cancellation tokens and RPC failures.
+    requests: Vec<RequestAdmission<T>>,
+    /// Exit results before and after shutdown.
+    exits:    [Result<NotificationDisposition, ServerError>; 2],
+    /// Lifecycle state after failed initialization and failed shutdown.
+    recovery: [super::LifecycleState; 2],
+  }
+
+  impl<T> LifecycleObservations<T> {
+    /// Inspect the complete shared lifecycle contract by reference.
+    fn preserves_transitions(&self) -> bool {
+      let expected = [
+        Err(rpc::RpcError::server_not_initialized()),
+        Ok(RequestKind::Initialize),
+        Ok(RequestKind::Initialize),
+        Err(rpc::RpcError::invalid_request().with_details("server is already initialized or initializing")),
+        Ok(RequestKind::Ordinary),
+        Ok(RequestKind::Shutdown),
+        Ok(RequestKind::Ordinary),
+        Ok(RequestKind::Shutdown),
+        Err(rpc::RpcError::invalid_request().with_details("server is shutting down")),
+      ];
+      self.requests.len() == expected.len()
+        && self
+          .requests
+          .iter()
+          .zip(expected)
+          .all(|(outcome, kind)| outcome.as_ref().map(|admission| &admission.0) == kind.as_ref())
+        && matches!(self.exits, [
+          Err(ServerError::ExitBeforeShutdown),
+          Ok(NotificationDisposition::Handled)
+        ])
+        && self.recovery == [super::LifecycleState::Uninitialized, super::LifecycleState::Initialized]
+    }
+  }
+
+  /// Exercise lifecycle transitions while preserving every request admission outcome.
+  fn lifecycle_transitions<C: CancellationState>() -> LifecycleObservations<C::Token> {
     let mut session = SessionState::<C>::new();
     let ordinary = inbound_request("fixture", 2);
-    let before_initialization = ensure_some(
-      session.begin_request(&ordinary).err(),
-      "ordinary work before initialization must be rejected",
-    )?;
-    ensure(
-      before_initialization.code == -32002,
-      "ordinary work before initialization must use the server-not-initialized error",
-    )?;
-
+    let before = session.begin_request(&ordinary);
     let exit = InboundNotification {
       jsonrpc: "2.0".into(),
       method:  "exit".into(),
       params:  None,
     };
-    ensure(
-      matches!(session.prepare_notification(&exit), Err(ServerError::ExitBeforeShutdown)),
-      "exit before a successful shutdown response must retain its lifecycle error",
-    )?;
-
-    let failed_initialize = inbound_request("initialize", 0);
-    complete_failed_request(&mut session, &failed_initialize, "a first initialization attempt must begin")?;
-    ensure(
-      !session.is_initialized(),
-      "a failed initialization handler must return the protocol session to its uninitialized state",
-    )?;
-
+    let early_exit = session.prepare_notification(&exit);
+    let failed_initialize = complete_request(&mut session, &inbound_request("initialize", 0), false);
+    let after_failed_initialize = session.lifecycle;
     let initialize = inbound_request("initialize", 1);
-    let (initialize_kind, _initialize_token) = ensure_some(session.begin_request(&initialize).ok(), "initialization must begin")?;
-    ensure(
-      initialize_kind == RequestKind::Initialize,
-      "initialize must use the initialization transition",
-    )?;
-    let duplicate_initialize = inbound_request("initialize", 4);
-    let duplicate_initialization = ensure_some(
-      session.begin_request(&duplicate_initialize).err(),
-      "a second initialize request must be rejected while initialization is active",
-    )?;
-    ensure(
-      duplicate_initialization.code == -32600,
-      "duplicate initialization must use the invalid-request error",
-    )?;
-    session.commit_request(initialize_kind, true);
-    session.finish_request(&initialize.id);
-
-    let (ordinary_kind, _ordinary_token) = ensure_some(
-      session.begin_request(&ordinary).ok(),
-      "ordinary requests must follow initialization",
-    )?;
-    ensure(
-      ordinary_kind == RequestKind::Ordinary,
-      "ordinary methods must retain their lifecycle category",
-    )?;
-    session.commit_request(ordinary_kind, true);
-    session.finish_request(&ordinary.id);
-
-    let failed_shutdown = inbound_request("shutdown", 5);
-    complete_failed_request(&mut session, &failed_shutdown, "a shutdown attempt must begin after initialization")?;
-    ensure(
-      session.is_initialized(),
-      "a failed shutdown response must preserve the initialized session for a clean retry",
-    )?;
-    let (recovery_kind, _recovery_token) = ensure_some(
-      session.begin_request(&ordinary).ok(),
-      "ordinary requests must recover after a failed shutdown response",
-    )?;
-    session.commit_request(recovery_kind, true);
-    session.finish_request(&ordinary.id);
-
-    let shutdown = inbound_request("shutdown", 3);
-    let (shutdown_kind, _shutdown_token) = ensure_some(session.begin_request(&shutdown).ok(), "shutdown must begin after initialization")?;
-    ensure(
-      shutdown_kind == RequestKind::Shutdown,
-      "shutdown must retain its lifecycle category",
-    )?;
-    session.commit_request(shutdown_kind, true);
-    session.finish_request(&shutdown.id);
-    let after_shutdown = ensure_some(
-      session.begin_request(&ordinary).err(),
-      "ordinary work after shutdown must be rejected",
-    )?;
-    ensure(
-      after_shutdown.code == -32600,
-      "ordinary work after shutdown must use the invalid-request error",
-    )?;
-    ensure(
-      ensure_ok(
-        session.prepare_notification(&exit),
-        "exit must be accepted after successful shutdown",
-      )? == NotificationDisposition::Handled,
-      "exit must be fully handled by the shared lifecycle transition",
-    )
+    let initializing = session.begin_request(&initialize);
+    let duplicate = session.begin_request(&inbound_request("initialize", 4));
+    if let Ok(&(kind, ref _token)) = initializing.as_ref() {
+      session.commit_request(kind, true);
+      session.finish_request(&initialize.id);
+    }
+    let ordinary_result = complete_request(&mut session, &ordinary, true);
+    let failed_shutdown = complete_request(&mut session, &inbound_request("shutdown", 5), false);
+    let after_failed_shutdown = session.lifecycle;
+    let recovered = complete_request(&mut session, &ordinary, true);
+    let shutdown = complete_request(&mut session, &inbound_request("shutdown", 3), true);
+    let after = session.begin_request(&ordinary);
+    LifecycleObservations {
+      requests: vec![
+        before, failed_initialize, initializing, duplicate, ordinary_result, failed_shutdown, recovered, shutdown, after,
+      ],
+      exits:    [early_exit, session.prepare_notification(&exit)],
+      recovery: [after_failed_initialize, after_failed_shutdown],
+    }
   }
 
-  /// Begin, fail, and retire one request while preserving its session-owned lifecycle transition.
-  fn complete_failed_request<C: CancellationState>(
+  /// Complete one admitted request while retaining its original token and lifecycle kind.
+  fn complete_request<C: CancellationState>(
     session: &mut SessionState<C>,
     request: &InboundRequest,
-    context: &'static str,
-  ) -> Result<(), TestFailure> {
-    let (kind, token) = ensure_some(session.begin_request(request).ok(), context)?;
-    session.commit_request(kind, false);
-    session.finish_request(&request.id);
-    drop(token);
-    Ok(())
+    succeeded: bool,
+  ) -> Result<(RequestKind, C::Token), rpc::RpcError> {
+    let result = session.begin_request(request);
+    if let Ok(&(kind, ref _token)) = result.as_ref() {
+      session.commit_request(kind, succeeded);
+      session.finish_request(&request.id);
+    }
+    result
   }
 
-  /// Exercise notification guards that are independent of runtime-specific dispatch.
-  fn notification_guards<C: CancellationState>() -> Result<(), TestFailure> {
+  /// Observe all notification guards without discarding successful dispositions.
+  fn notification_guards<C: CancellationState>() -> [Result<NotificationDisposition, ServerError>; 4] {
     let session = SessionState::<C>::new();
-    let unsupported_version = InboundNotification {
-      jsonrpc: "1.0".into(),
-      method:  "fixture/observe".into(),
-      params:  None,
-    };
-    ensure(
-      ensure_ok(
-        session.prepare_notification(&unsupported_version),
-        "an unsupported notification version must be contained",
-      )? == NotificationDisposition::Handled,
-      "an unsupported notification version must not reach runtime-specific handlers",
-    )?;
-
-    let before_initialization = InboundNotification {
-      jsonrpc: "2.0".into(),
-      method:  "fixture/observe".into(),
-      params:  None,
-    };
-    ensure(
-      ensure_ok(
-        session.prepare_notification(&before_initialization),
-        "an ordinary notification before initialization must be contained",
-      )? == NotificationDisposition::Handled,
-      "an ordinary notification before initialization must not mutate runtime state",
-    )?;
-
-    let malformed_cancellation = InboundNotification {
-      jsonrpc: "2.0".into(),
-      method:  notification::Cancel::METHOD.into(),
-      params:  Some(serde_json::json!({ "id": { "invalid": true } })),
-    };
-    ensure(
-      ensure_ok(
-        session.prepare_notification(&malformed_cancellation),
-        "malformed cancellation parameters must be contained",
-      )? == NotificationDisposition::Handled,
-      "malformed cancellation parameters must neither dispatch nor terminate the session",
-    )?;
-
-    let absent_cancellation = InboundNotification {
-      jsonrpc: "2.0".into(),
-      method:  notification::Cancel::METHOD.into(),
-      params:  None,
-    };
-    ensure(
-      ensure_ok(
-        session.prepare_notification(&absent_cancellation),
-        "cancellation without parameters must be contained",
-      )? == NotificationDisposition::Handled,
-      "an absent cancellation payload must remain a handled no-op",
-    )
+    [
+      InboundNotification {
+        jsonrpc: "1.0".into(),
+        method:  "fixture/observe".into(),
+        params:  None,
+      },
+      InboundNotification {
+        jsonrpc: "2.0".into(),
+        method:  "fixture/observe".into(),
+        params:  None,
+      },
+      InboundNotification {
+        jsonrpc: "2.0".into(),
+        method:  notification::Cancel::METHOD.into(),
+        params:  Some(serde_json::json!({"id": {"invalid": true}})),
+      },
+      InboundNotification {
+        jsonrpc: "2.0".into(),
+        method:  notification::Cancel::METHOD.into(),
+        params:  None,
+      },
+    ]
+    .map(|notification| session.prepare_notification(&notification))
   }
 
-  /// Exercise ordered barrier completion through one ownership model.
-  fn mutation_ordering<S: MutationBarrierStorage>() -> Result<(), TestFailure> {
-    let barrier = MutationBarrier::<S>::default();
-    let first_revision = ensure_ok(barrier.issue(), "the first mutation revision must be available")?;
-    let second_revision = ensure_ok(barrier.issue(), "the second mutation revision must be available")?;
-    let first = MutationTicket {
-      barrier:  barrier.clone(),
-      revision: first_revision,
-    };
-    let second = MutationTicket {
-      barrier:  barrier.clone(),
-      revision: second_revision,
-    };
-    let mut wait = Box::pin(barrier.wait_for(second_revision));
-    let waker = noop_waker();
-    let mut context = Context::from_waker(&waker);
-    ensure(
-      matches!(Future::poll(wait.as_mut(), &mut context), Poll::Pending),
-      "the barrier must initially wait for both mutations",
-    )?;
-    drop(second);
-    ensure(
-      matches!(Future::poll(wait.as_mut(), &mut context), Poll::Pending),
-      "a later mutation cannot advance past an unfinished earlier mutation",
-    )?;
-    drop(first);
-    ensure(
-      matches!(Future::poll(wait.as_mut(), &mut context), Poll::Ready(())),
-      "committing the missing earlier mutation must release every contiguous completion",
-    )
+  /// Native revision issuance, polling, and storage snapshots for one barrier scenario.
+  #[derive(Debug)]
+  struct MutationObservations {
+    /// Every attempted revision allocation.
+    issued:        [Result<u64, ServerError>; 2],
+    /// Complete poll outcomes in effect order.
+    polls:         Vec<Poll<()>>,
+    /// Waiter counts captured before or after lifecycle effects.
+    waiter_counts: Vec<usize>,
+    /// Both task wake counts at each checkpoint.
+    wake_counts:   Vec<[u64; 2]>,
+    /// Uncommitted revisions retained after the tested effects.
+    completed:     HashSet<u64>,
   }
 
-  /// Exercise stable barrier waker replacement and drop-time deregistration.
-  fn mutation_waiter_lifecycle<S: MutationBarrierStorage>() -> Result<(), TestFailure> {
+  /// Exercise out-of-order barrier completion through one ownership model.
+  fn mutation_ordering<S: MutationBarrierStorage>() -> MutationObservations {
     let barrier = MutationBarrier::<S>::default();
-    let revision = ensure_ok(barrier.issue(), "a mutation revision must be available")?;
-    let ticket = MutationTicket {
-      barrier: barrier.clone(),
-      revision,
-    };
-    let mut wait = Box::pin(barrier.wait_for(revision));
+    let issued = [barrier.issue(), barrier.issue()];
+    let mut polls = Vec::new();
+    if let [Ok(first_revision), Ok(second_revision)] = issued {
+      let first = MutationTicket {
+        barrier:  barrier.clone(),
+        revision: first_revision,
+      };
+      let second = MutationTicket {
+        barrier:  barrier.clone(),
+        revision: second_revision,
+      };
+      let mut wait = Box::pin(barrier.wait_for(second_revision));
+      let waker = noop_waker();
+      let mut context = Context::from_waker(&waker);
+      polls.push(Future::poll(wait.as_mut(), &mut context));
+      drop(second);
+      polls.push(Future::poll(wait.as_mut(), &mut context));
+      drop(first);
+      polls.push(Future::poll(wait.as_mut(), &mut context));
+    }
+    MutationObservations {
+      issued,
+      polls,
+      waiter_counts: Vec::new(),
+      wake_counts: Vec::new(),
+      completed: barrier.state.with_state(|state| state.completed.clone()),
+    }
+  }
+
+  /// Exercise waiter replacement, duplicate completion, and owned drop-time deregistration.
+  fn mutation_waiter_lifecycle<S: MutationBarrierStorage>() -> MutationObservations {
+    let barrier = MutationBarrier::<S>::default();
+    let first = barrier.issue();
+    let mut polls = Vec::new();
+    let mut waiter_counts = Vec::new();
+    let mut wake_counts = Vec::new();
     let observers = WakeObservers::new();
     let mut first_context = Context::from_waker(&observers.first_waker);
     let mut second_context = Context::from_waker(&observers.second_waker);
-    ensure(
-      matches!(Future::poll(wait.as_mut(), &mut first_context), Poll::Pending),
-      "the uncommitted revision must register its first waker",
-    )?;
-    ensure(
-      matches!(Future::poll(wait.as_mut(), &mut second_context), Poll::Pending),
-      "repolling the same wait with a new task waker must remain pending",
-    )?;
-    ensure_eq(
-      &barrier.state.with_state(|state| state.waiters.len()),
-      &1,
-      "repolling one wait future must replace its registration rather than append a stale waiter",
-    )?;
-    drop(ticket);
-    ensure_eq(
-      &observers.first_counter.count.load(Ordering::SeqCst),
-      &0,
-      "committing the revision must not wake a replaced task waker",
-    )?;
-    ensure_eq(
-      &observers.second_counter.count.load(Ordering::SeqCst),
-      &1,
-      "committing the revision must wake the wait future's current task",
-    )?;
-    ensure(
-      matches!(Future::poll(wait.as_mut(), &mut second_context), Poll::Ready(())),
-      "the committed revision must resolve its registered wait",
-    )?;
-    barrier.commit(revision);
-    ensure_eq(
-      &observers.second_counter.count.load(Ordering::SeqCst),
-      &1,
-      "duplicate completion must not wake an already satisfied waiter twice",
-    )?;
-    ensure(
-      barrier
-        .state
-        .with_state(|state| (state.completed.is_empty(), state.waiters.is_empty()) == (true, true)),
-      "duplicate completion must leave neither stale revisions nor waiter registrations",
-    )?;
-
-    let abandoned_revision = ensure_ok(barrier.issue(), "another mutation revision must be available")?;
-    let abandoned_ticket = MutationTicket {
-      barrier:  barrier.clone(),
-      revision: abandoned_revision,
-    };
-    let mut abandoned = Box::pin(barrier.wait_for(abandoned_revision));
-    ensure(
-      matches!(Future::poll(abandoned.as_mut(), &mut first_context), Poll::Pending),
-      "an abandoned wait must first register",
-    )?;
-    drop(abandoned);
-    ensure_eq(
-      &barrier.state.with_state(|state| state.waiters.len()),
-      &0,
-      "dropping a wait future must remove its outstanding registration",
-    )?;
-    drop(abandoned_ticket);
-    Ok(())
+    if let Ok(revision) = first {
+      let ticket = MutationTicket {
+        barrier: barrier.clone(),
+        revision,
+      };
+      let mut wait = Box::pin(barrier.wait_for(revision));
+      polls.push(Future::poll(wait.as_mut(), &mut first_context));
+      polls.push(Future::poll(wait.as_mut(), &mut second_context));
+      waiter_counts.push(barrier.state.with_state(|state| state.waiters.len()));
+      drop(ticket);
+      wake_counts.push([
+        observers.first_counter.count.load(Ordering::SeqCst),
+        observers.second_counter.count.load(Ordering::SeqCst),
+      ]);
+      polls.push(Future::poll(wait.as_mut(), &mut second_context));
+      barrier.commit(revision);
+      wake_counts.push([
+        observers.first_counter.count.load(Ordering::SeqCst),
+        observers.second_counter.count.load(Ordering::SeqCst),
+      ]);
+      waiter_counts.push(barrier.state.with_state(|state| state.waiters.len()));
+    }
+    let abandoned = barrier.issue();
+    if let Ok(revision) = abandoned {
+      let ticket = MutationTicket {
+        barrier: barrier.clone(),
+        revision,
+      };
+      let mut wait = Box::pin(barrier.wait_for(revision));
+      polls.push(Future::poll(wait.as_mut(), &mut first_context));
+      drop(wait);
+      waiter_counts.push(barrier.state.with_state(|state| state.waiters.len()));
+      drop(ticket);
+    }
+    MutationObservations {
+      issued: [first, abandoned],
+      polls,
+      waiter_counts,
+      wake_counts,
+      completed: barrier.state.with_state(|state| state.completed.clone()),
+    }
   }
 
-  /// Register two cancellation-token clones against independent task observers.
-  fn register_cancellation_waiters<T: Future<Output = ()> + Unpin>(
-    first_token: &mut T,
-    second_token: &mut T,
-    observers: &WakeObservers,
-  ) -> Result<(), TestFailure> {
-    let mut first_context = Context::from_waker(&observers.first_waker);
-    let mut second_context = Context::from_waker(&observers.second_waker);
-    ensure(
-      matches!(Future::poll(Pin::new(first_token), &mut first_context), Poll::Pending),
-      "the first token clone must register as a waiter",
-    )?;
-    ensure(
-      matches!(Future::poll(Pin::new(second_token), &mut second_context), Poll::Pending),
-      "the second token clone must register independently",
-    )
-  }
+  /// Native token registration polls and wake counts after cancellation.
+  type CancellationWakeObservations = ([Poll<()>; 2], [u64; 2]);
 
-  /// Construct one cancellation state with two token clones and independent observers.
-  fn cancellation_fixture<C: CancellationState>() -> (C, C::Token, C::Token, WakeObservers) {
+  /// Observe independent clones and the effect of optionally dropping one registered clone.
+  fn cancellation_wake_observations<C>(drop_first: bool) -> CancellationWakeObservations
+  where
+    C: CancellationState,
+    C::Token: Future<Output = ()> + Unpin,
+  {
     let cancellation = C::default();
-    let first_token = cancellation.token();
-    let second_token = first_token.clone();
-    (cancellation, first_token, second_token, WakeObservers::new())
-  }
-
-  /// Exercise independent token-clone registration through one cancellation
-  /// storage model.
-  fn cancellation_wakes_registered_clones<C>() -> Result<(), TestFailure>
-  where
-    C: CancellationState,
-    C::Token: Future<Output = ()> + Unpin,
-  {
-    let (cancellation, mut first_token, mut second_token, observers) = cancellation_fixture::<C>();
-    register_cancellation_waiters(&mut first_token, &mut second_token, &observers)?;
+    let mut first_token = cancellation.token();
+    let mut second = first_token.clone();
+    let observers = WakeObservers::new();
+    let polls = [
+      Future::poll(Pin::new(&mut first_token), &mut Context::from_waker(&observers.first_waker)),
+      Future::poll(Pin::new(&mut second), &mut Context::from_waker(&observers.second_waker)),
+    ];
+    let retained_first = if drop_first {
+      drop(first_token);
+      None
+    } else {
+      Some(first_token)
+    };
     cancellation.cancel();
-    ensure_eq(
-      &observers.first_counter.count.load(Ordering::SeqCst),
-      &1,
-      "cancellation must wake the first independently registered waiter",
-    )?;
-    ensure_eq(
-      &observers.second_counter.count.load(Ordering::SeqCst),
-      &1,
-      "cancellation must wake the second independently registered waiter",
-    )
+    let wake_counts = [
+      observers.first_counter.count.load(Ordering::SeqCst),
+      observers.second_counter.count.load(Ordering::SeqCst),
+    ];
+    drop(retained_first);
+    (polls, wake_counts)
   }
 
-  /// Exercise registration removal when one token clone is dropped.
-  fn cancellation_drops_one_registration<C>() -> Result<(), TestFailure>
-  where
-    C: CancellationState,
-    C::Token: Future<Output = ()> + Unpin,
-  {
-    let (cancellation, mut first_token, mut second_token, observers) = cancellation_fixture::<C>();
-    register_cancellation_waiters(&mut first_token, &mut second_token, &observers)?;
-    drop(first_token);
-    cancellation.cancel();
-    ensure_eq(
-      &observers.first_counter.count.load(Ordering::SeqCst),
-      &0,
-      "dropping one token clone must remove only its waiter registration",
-    )?;
-    ensure_eq(
-      &observers.second_counter.count.load(Ordering::SeqCst),
-      &1,
-      "cancellation must still wake the independently retained token clone",
-    )
+  /// Retained admission results and cancellation polls for completed, unknown, and active IDs.
+  #[derive(Debug)]
+  struct CancellationLookup<T> {
+    /// Initialization, completed request, and active request admissions.
+    requests: [RequestAdmission<T>; 3],
+    /// Polls before and after cancelling the active identifier.
+    polls:    Vec<[Poll<()>; 2]>,
   }
 
-  /// Exercise cancellation lookup for completed, unknown, and active request IDs.
-  fn cancellation_ignores_inactive_ids<C>() -> Result<(), TestFailure>
+  /// Exercise cancellation lookup without converting admission errors to absence.
+  fn cancellation_ignores_inactive_ids<C>() -> CancellationLookup<C::Token>
   where
     C: CancellationState,
     C::Token: Future<Output = ()> + Unpin,
   {
     let mut session = SessionState::<C>::new();
-    let initialize = inbound_request(InitializeRequest::METHOD, 0);
-    let (initialize_kind, initialize_token) = ensure_some(
-      session.begin_request(&initialize).ok(),
-      "the cancellation fixture must begin initialization",
-    )?;
-    session.commit_request(initialize_kind, true);
-    session.finish_request(&initialize.id);
-    drop(initialize_token);
-
+    let initialized = complete_request(&mut session, &inbound_request(InitializeRequest::METHOD, 0), true);
     let completed = inbound_request(PendingRequest::METHOD, 1);
-    let (_completed_kind, mut completed_token) = ensure_some(
-      session.begin_request(&completed).ok(),
-      "the cancellation fixture must begin its completed request",
-    )?;
+    let mut completed_result = session.begin_request(&completed);
     session.finish_request(&completed.id);
     let active = inbound_request(PendingRequest::METHOD, 2);
-    let (_active_kind, mut active_token) = ensure_some(
-      session.begin_request(&active).ok(),
-      "the cancellation fixture must begin its active request",
-    )?;
-
+    let mut active_result = session.begin_request(&active);
     session.cancel_task(&completed.id);
     session.cancel_task(&NumberOrString::Number(99));
     let waker = noop_waker();
     let mut context = Context::from_waker(&waker);
-    ensure(
-      [
-        matches!(Future::poll(Pin::new(&mut completed_token), &mut context), Poll::Pending),
-        matches!(Future::poll(Pin::new(&mut active_token), &mut context), Poll::Pending),
-      ] == [true, true],
-      "cancelling completed or unknown IDs must leave unrelated tokens active",
-    )?;
-
-    session.cancel_task(&active.id);
-    ensure(
-      [
-        matches!(Future::poll(Pin::new(&mut active_token), &mut context), Poll::Ready(())),
-        matches!(Future::poll(Pin::new(&mut completed_token), &mut context), Poll::Pending),
-      ] == [true, true],
-      "cancelling an active ID must resolve only that request's token",
-    )?;
+    let mut polls = Vec::new();
+    if let (Ok(&mut (_completed_kind, ref mut completed_token)), Ok(&mut (_active_kind, ref mut active_token))) =
+      (completed_result.as_mut(), active_result.as_mut())
+    {
+      polls.push([
+        Future::poll(Pin::new(&mut *completed_token), &mut context),
+        Future::poll(Pin::new(&mut *active_token), &mut context),
+      ]);
+      session.cancel_task(&active.id);
+      polls.push([
+        Future::poll(Pin::new(active_token), &mut context),
+        Future::poll(Pin::new(completed_token), &mut context),
+      ]);
+    }
     session.finish_request(&active.id);
-    Ok(())
+    CancellationLookup {
+      requests: [initialized, completed_result, active_result],
+      polls,
+    }
+  }
+
+  /// Both families' native notification guard results.
+  type NotificationGuards = [[Result<NotificationDisposition, ServerError>; 4]; 2];
+
+  /// Poll and cancellation flag at the registration race boundary.
+  type CancellationRace = (Poll<()>, bool);
+
+  /// Native clone registration and wake results for both families.
+  type CancellationWakeFamilies = [CancellationWakeObservations; 2];
+
+  /// Original RPC adapter results for both token families.
+  type CancellationErrors = [Result<(), rpc::RpcError>; 2];
+
+  /// Complete barrier scenarios for both storage families.
+  type MutationFamilies = [MutationObservations; 2];
+
+  /// Complete malformed message classifications.
+  type InvalidClassifications = [Inbound; 6];
+
+  /// Native serialization failure and its complete protocol response.
+  type SerializationObservations = (Result<Option<serde_json::Value>, ServerError>, rpc::Message);
+
+  /// Native paired lifecycle observations for both runtime token families.
+  type FamilyLifecycles = (
+    LifecycleObservations<super::LocalCancelToken>,
+    LifecycleObservations<ConcurrentCancelToken>,
+  );
+
+  #[test]
+  fn lifecycle_transitions_match_across_runtime_families() -> Result<(), Box<PredicateFailure<FamilyLifecycles>>> {
+    ensure_that(
+      (
+        lifecycle_transitions::<LocalCancellation>(),
+        lifecycle_transitions::<ConcurrentCancellation>(),
+      ),
+      "both runtime families must preserve every lifecycle transition and recovery",
+      |observed| observed.0.preserves_transitions() && observed.1.preserves_transitions(),
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn lifecycle_transitions_match_across_runtime_families() -> Result<(), TestFailure> {
-    lifecycle_transitions::<LocalCancellation>()?;
-    lifecycle_transitions::<ConcurrentCancellation>()
+  fn notification_guards_match_across_runtime_families() -> Result<(), Box<PredicateFailure<NotificationGuards>>> {
+    ensure_that(
+      [
+        notification_guards::<LocalCancellation>(),
+        notification_guards::<ConcurrentCancellation>(),
+      ],
+      "both runtime families must contain invalid and premature notifications",
+      |observed| {
+        observed
+          .iter()
+          .flatten()
+          .all(|result| matches!(*result, Ok(NotificationDisposition::Handled)))
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
-  #[test]
-  fn notification_guards_match_across_runtime_families() -> Result<(), TestFailure> {
-    notification_guards::<LocalCancellation>()?;
-    notification_guards::<ConcurrentCancellation>()
-  }
+  /// Intrinsic cancellation state before and after each cancellation effect.
+  type CancellationStates = [[bool; 3]; 4];
 
   #[test]
-  fn cancellation_is_runtime_honest_and_shared_semantically() -> Result<(), TestFailure> {
+  fn cancellation_is_runtime_honest_and_shared_semantically() -> Result<(), ComparisonFailure<CancellationStates, CancellationStates>> {
     let local = LocalCancellation::default();
     let mut local_token = local.token();
-    ensure(
-      (!local_token.is_cancelled(), !local_token.is_terminated()) == (true, true),
-      "a new local token must be active and non-terminated",
-    )?;
-    {
-      let local_error = local_token.as_error();
-      ensure(
-        !local_error.is_terminated(),
-        "a new local cancellation error adapter must remain non-terminated",
-      )
-    }?;
-    local.cancel();
-    ensure(
-      (local_token.is_cancelled(), local_token.is_terminated()) == (true, true),
-      "local cancellation must update and terminate its current-thread token",
-    )?;
-    ensure(
+    let local_before = [
+      local_token.is_cancelled(),
+      local_token.is_terminated(),
       local_token.as_error().is_terminated(),
-      "local cancellation must also terminate its RPC error adapter",
-    )?;
-
+    ];
+    local.cancel();
+    let local_after = [
+      local_token.is_cancelled(),
+      local_token.is_terminated(),
+      local_token.as_error().is_terminated(),
+    ];
     let concurrent = ConcurrentCancellation::default();
     let mut concurrent_token = concurrent.token();
-    ensure(
-      (!concurrent_token.is_cancelled(), !concurrent_token.is_terminated()) == (true, true),
-      "a new concurrent token must be active and non-terminated",
-    )?;
-    {
-      let concurrent_error = concurrent_token.as_error();
-      ensure(
-        !concurrent_error.is_terminated(),
-        "a new concurrent cancellation error adapter must remain non-terminated",
-      )
-    }?;
-    concurrent.cancel();
-    ensure(
-      (concurrent_token.is_cancelled(), concurrent_token.is_terminated()) == (true, true),
-      "concurrent cancellation must update and terminate its thread-safe token",
-    )?;
-    ensure(
+    let concurrent_before = [
+      concurrent_token.is_cancelled(),
+      concurrent_token.is_terminated(),
       concurrent_token.as_error().is_terminated(),
-      "concurrent cancellation must also terminate its RPC error adapter",
+    ];
+    concurrent.cancel();
+    let concurrent_after = [
+      concurrent_token.is_cancelled(),
+      concurrent_token.is_terminated(),
+      concurrent_token.as_error().is_terminated(),
+    ];
+    ensure_eq(
+      [local_before, local_after, concurrent_before, concurrent_after],
+      [[false; 3], [true; 3], [false; 3], [true; 3]],
+      "cancellation must terminate native tokens and RPC adapters in both families",
     )
+    .map(drop)
   }
 
   #[test]
-  fn cancellation_registration_closes_the_check_register_race() -> Result<(), TestFailure> {
+  fn cancellation_registration_closes_the_check_register_race() -> Result<(), ComparisonFailure<CancellationRace, CancellationRace>> {
     let waiter = CancellationWaiter::register(LocalCancellationRegistry::default());
     let cancelled = Cell::new(false);
     let waker = noop_waker();
-    let context = Context::from_waker(&waker);
-    let observed = poll_cancellation(&waiter, &context, || {
+    let observed = poll_cancellation(&waiter, &Context::from_waker(&waker), || {
       let current = cancelled.get();
       cancelled.set(true);
       current
     });
-    ensure(
-      matches!(observed, Poll::Ready(())) && cancelled.get(),
-      "cancellation that races waker registration must be observed by the second checked read",
+    ensure_eq(
+      (observed, cancelled.get()),
+      (Poll::Ready(()), true),
+      "a cancellation racing registration must be observed on the second flag read",
     )
+    .map(drop)
   }
 
   #[test]
-  fn cancellation_wakes_every_registered_token_clone() -> Result<(), TestFailure> {
-    cancellation_wakes_registered_clones::<LocalCancellation>()?;
-    cancellation_wakes_registered_clones::<ConcurrentCancellation>()
+  fn cancellation_wakes_every_registered_token_clone() -> Result<(), ComparisonFailure<CancellationWakeFamilies, CancellationWakeFamilies>>
+  {
+    ensure_eq(
+      [
+        cancellation_wake_observations::<LocalCancellation>(false),
+        cancellation_wake_observations::<ConcurrentCancellation>(false),
+      ],
+      [([Poll::Pending; 2], [1, 1]); 2],
+      "cancellation must wake every independently registered clone",
+    )
+    .map(drop)
+  }
+
+  /// Native observations of dropped registrations and inactive identifiers.
+  type CancellationFamilies = (
+    [CancellationWakeObservations; 2],
+    CancellationLookup<super::LocalCancelToken>,
+    CancellationLookup<ConcurrentCancelToken>,
+  );
+
+  #[test]
+  fn cancellation_drop_and_inactive_id_semantics_match_across_families() -> Result<(), Box<PredicateFailure<CancellationFamilies>>> {
+    ensure_that(
+      (
+        [
+          cancellation_wake_observations::<LocalCancellation>(true),
+          cancellation_wake_observations::<ConcurrentCancellation>(true),
+        ],
+        cancellation_ignores_inactive_ids::<LocalCancellation>(),
+        cancellation_ignores_inactive_ids::<ConcurrentCancellation>(),
+      ),
+      "dropping one waiter and cancelling inactive IDs must preserve other active tokens",
+      |observed| {
+        observed.0 == [([Poll::Pending; 2], [0, 1]); 2]
+          && observed.1.requests.iter().all(Result::is_ok)
+          && observed.2.requests.iter().all(Result::is_ok)
+          && observed.1.polls == [[Poll::Pending; 2], [Poll::Ready(()), Poll::Pending]]
+          && observed.2.polls == [[Poll::Pending; 2], [Poll::Ready(()), Poll::Pending]]
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn cancellation_drop_and_inactive_id_semantics_match_across_families() -> Result<(), TestFailure> {
-    cancellation_drops_one_registration::<LocalCancellation>()?;
-    cancellation_drops_one_registration::<ConcurrentCancellation>()?;
-    cancellation_ignores_inactive_ids::<LocalCancellation>()?;
-    cancellation_ignores_inactive_ids::<ConcurrentCancellation>()
-  }
-
-  #[test]
-  fn cancellation_error_adapters_return_the_standard_request_error() -> Result<(), TestFailure> {
+  fn cancellation_error_adapters_return_the_standard_request_error()
+  -> Result<(), Box<ComparisonFailure<CancellationErrors, CancellationErrors>>> {
     let local = LocalCancellation::default();
     let mut local_token = local.token();
     local.cancel();
-    let local_error = ensure_some(
-      block_on(local_token.as_error()).err(),
-      "the local cancellation adapter must return an RPC error",
-    )?;
-    ensure_eq(
-      &local_error.code,
-      &-32800,
-      "the local cancellation adapter must use the standard request-cancelled code",
-    )?;
-
     let concurrent = ConcurrentCancellation::default();
     let mut concurrent_token = concurrent.token();
     concurrent.cancel();
-    let concurrent_error = ensure_some(
-      block_on(concurrent_token.as_error()).err(),
-      "the concurrent cancellation adapter must return an RPC error",
-    )?;
     ensure_eq(
-      &concurrent_error.code,
-      &-32800,
-      "the concurrent cancellation adapter must use the standard request-cancelled code",
+      [block_on(local_token.as_error()), block_on(concurrent_token.as_error())],
+      [Err(rpc::RpcError::request_cancelled()), Err(rpc::RpcError::request_cancelled())],
+      "both adapters must return the complete standard request-cancelled RPC error",
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn mutation_ordering_matches_across_runtime_families() -> Result<(), TestFailure> {
-    mutation_ordering::<LocalMutationStorage>()?;
-    mutation_ordering::<ConcurrentMutationStorage>()
-  }
-
-  #[test]
-  fn mutation_waiter_lifecycle_matches_across_runtime_families() -> Result<(), TestFailure> {
-    mutation_waiter_lifecycle::<LocalMutationStorage>()?;
-    mutation_waiter_lifecycle::<ConcurrentMutationStorage>()
-  }
-
-  #[test]
-  fn wire_classification_rejects_ambiguous_request_shapes() -> Result<(), TestFailure> {
-    let null_id = rpc::Message {
-      jsonrpc: "2.0".into(),
-      method:  Some("fixture".into()),
-      id:      rpc::MessageId::Null,
-      params:  None,
-      result:  None,
-      error:   None,
-    };
-    ensure(
-      matches!(classify_message(null_id), Inbound::InvalidRequest(_)),
-      "an explicit null request ID must produce an invalid-request response",
-    )?;
-
-    let scalar_params = rpc::Message {
-      jsonrpc: "2.0".into(),
-      method:  Some("fixture".into()),
-      id:      rpc::MessageId::Value(NumberOrString::Number(1)),
-      params:  Some(serde_json::Value::Bool(true)),
-      result:  None,
-      error:   None,
-    };
-    ensure(
-      matches!(classify_message(scalar_params), Inbound::InvalidRequest(_)),
-      "request parameters must be an object or array",
-    )?;
-
-    let request_with_result = rpc::Message {
-      jsonrpc: "2.0".into(),
-      method:  Some("fixture".into()),
-      id:      rpc::MessageId::Value(NumberOrString::Number(1)),
-      params:  None,
-      result:  Some(serde_json::Value::Null),
-      error:   None,
-    };
-    ensure(
-      matches!(classify_message(request_with_result), Inbound::InvalidRequest(_)),
-      "a request cannot also contain a response result",
-    )?;
-
-    let request_with_error = rpc::Message {
-      jsonrpc: "2.0".into(),
-      method:  Some("fixture".into()),
-      id:      rpc::MessageId::Value(NumberOrString::Number(2)),
-      params:  None,
-      result:  None,
-      error:   Some(rpc::RpcError::internal_error()),
-    };
-    ensure(
-      matches!(classify_message(request_with_error), Inbound::InvalidRequest(_)),
-      "a request cannot also contain a response error",
-    )?;
-
-    let response_with_params = rpc::Message {
-      jsonrpc: "2.0".into(),
-      method:  None,
-      id:      rpc::MessageId::Value(NumberOrString::Number(7)),
-      params:  Some(serde_json::json!({ "invalid": true })),
-      result:  Some(serde_json::Value::Null),
-      error:   None,
-    };
-    ensure(
-      matches!(
-        classify_message(response_with_params),
-        Inbound::InvalidResponse(ServerError::InvalidResponseShape {
-          id: NumberOrString::Number(7),
+  fn mutation_ordering_matches_across_runtime_families() -> Result<(), Box<PredicateFailure<MutationFamilies>>> {
+    ensure_that(
+      [
+        mutation_ordering::<LocalMutationStorage>(),
+        mutation_ordering::<ConcurrentMutationStorage>(),
+      ],
+      "a later mutation cannot bypass an unfinished predecessor",
+      |observed| {
+        observed.iter().all(|barrier| {
+          barrier.issued.iter().all(Result::is_ok)
+            && barrier.polls == [Poll::Pending, Poll::Pending, Poll::Ready(())]
+            && barrier.completed.is_empty()
         })
-      ),
-      "a response carrying request parameters must retain its concrete ID in the typed shape error",
-    )?;
-
-    let response_with_scalar_params = rpc::Message {
-      jsonrpc: "2.0".into(),
-      method:  None,
-      id:      rpc::MessageId::Value(NumberOrString::Number(8)),
-      params:  Some(serde_json::Value::Bool(true)),
-      result:  Some(serde_json::Value::Null),
-      error:   None,
-    };
-    ensure(
-      matches!(
-        classify_message(response_with_scalar_params),
-        Inbound::InvalidResponse(ServerError::InvalidResponseShape {
-          id: NumberOrString::Number(8),
-        })
-      ),
-      "scalar parameters on a response must remain a response-shape failure rather than a request classification",
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn serialization_failures_retain_context_and_become_internal_responses() -> Result<(), TestFailure> {
-    let serialization = ensure_some(
-      serialize_optional(Some(SerializationFailureFixture), "fixture request parameters").err(),
-      "an unrepresentable optional parameter must fail serialization",
-    )?;
-    ensure(
-      matches!(serialization, ServerError::Serialization {
-        context: "fixture request parameters",
-        ..
-      }),
-      "optional-parameter serialization must retain the operation context",
-    )?;
+  fn mutation_waiter_lifecycle_matches_across_runtime_families() -> Result<(), Box<PredicateFailure<MutationFamilies>>> {
+    ensure_that(
+      [
+        mutation_waiter_lifecycle::<LocalMutationStorage>(),
+        mutation_waiter_lifecycle::<ConcurrentMutationStorage>(),
+      ],
+      "waiter replacement, completion, and drop must leave no stale wakes or registrations",
+      |observed| {
+        observed.iter().all(|barrier| {
+          barrier.issued.iter().all(Result::is_ok)
+            && barrier.polls == [Poll::Pending, Poll::Pending, Poll::Ready(()), Poll::Pending]
+            && barrier.waiter_counts == [1, 0, 0]
+            && barrier.wake_counts == [[0, 1], [0, 1]]
+            && barrier.completed.is_empty()
+        })
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
+  }
 
-    let response = outcome_message(
-      NumberOrString::Number(8),
-      RequestOutcome::SerializationFailure(String::from("fixture result cannot serialize")),
+  #[test]
+  fn wire_classification_rejects_ambiguous_request_shapes() -> Result<(), Box<PredicateFailure<InvalidClassifications>>> {
+    let null_id = message("fixture", rpc::MessageId::Null, None);
+    let scalar = message(
+      "fixture",
+      rpc::MessageId::Value(NumberOrString::Number(1)),
+      Some(serde_json::Value::Bool(true)),
     );
-    let error = ensure_some(
-      response.error.as_ref(),
-      "a handler-result serialization failure must produce an RPC error response",
-    )?;
-    ensure(
-      (&response.id, error.code, error.details.as_ref())
-        == (
-          &rpc::MessageId::Value(NumberOrString::Number(8)),
-          -32603,
-          Some(&serde_json::json!("fixture result cannot serialize")),
-        ),
-      "a handler-result serialization failure must preserve its request ID and structured internal-error detail",
+    let mut with_result = message("fixture", rpc::MessageId::Value(NumberOrString::Number(1)), None);
+    with_result.result = Some(serde_json::Value::Null);
+    let mut with_error = message("fixture", rpc::MessageId::Value(NumberOrString::Number(2)), None);
+    with_error.error = Some(rpc::RpcError::internal_error());
+    let mut response = response_message("2.0", 7, Some(serde_json::Value::Null), None);
+    response.params = Some(serde_json::json!({"invalid": true}));
+    let mut scalar_response = response_message("2.0", 8, Some(serde_json::Value::Null), None);
+    scalar_response.params = Some(serde_json::Value::Bool(true));
+    ensure_that(
+      [null_id, scalar, with_result, with_error, response, scalar_response].map(classify_message),
+      "ambiguous requests and parameter-bearing responses must retain their directional typed classifications",
+      |observed| {
+        matches!(*observed, [
+          Inbound::InvalidRequest(_),
+          Inbound::InvalidRequest(_),
+          Inbound::InvalidRequest(_),
+          Inbound::InvalidRequest(_),
+          Inbound::InvalidResponse(ServerError::InvalidResponseShape {
+            id: NumberOrString::Number(7),
+          }),
+          Inbound::InvalidResponse(ServerError::InvalidResponseShape {
+            id: NumberOrString::Number(8),
+          })
+        ])
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn scheduling_captures_prior_mutations_before_requests() -> Result<(), TestFailure> {
-    let barrier = MutationBarrier::<LocalMutationStorage>::default();
-    let mutation_methods = HashSet::from(["mutate"]);
-    let mutation = rpc::Message {
-      jsonrpc: "2.0".into(),
-      method:  Some("mutate".into()),
-      id:      rpc::MessageId::Missing,
-      params:  None,
-      result:  None,
-      error:   None,
-    };
-    ensure(
-      matches!(
-        schedule_message(&mutation, &mutation_methods, &barrier),
-        MessageSchedule::Mutation { .. }
+  fn serialization_failures_retain_context_and_become_internal_responses() -> Result<(), Box<PredicateFailure<SerializationObservations>>> {
+    ensure_that(
+      (
+        serialize_optional(Some(SerializationFailureFixture), "fixture request parameters"),
+        outcome_message(
+          NumberOrString::Number(8),
+          RequestOutcome::SerializationFailure(String::from("fixture result cannot serialize")),
+        ),
       ),
-      "a registered mutation notification must receive an ordered ticket",
-    )?;
-    let request = rpc::Message {
-      jsonrpc: "2.0".into(),
-      method:  Some("read".into()),
-      id:      rpc::MessageId::Value(NumberOrString::Number(1)),
-      params:  None,
-      result:  None,
-      error:   None,
-    };
-    ensure(
-      matches!(schedule_message(&request, &mutation_methods, &barrier), MessageSchedule::Request {
-        prior_revision: 1,
-      }),
-      "a following request must capture the previously issued mutation revision",
-    )?;
-    let independent = rpc::Message {
-      jsonrpc: "2.0".into(),
-      method:  Some("observe".into()),
-      id:      rpc::MessageId::Missing,
-      params:  None,
-      result:  None,
-      error:   None,
-    };
-    ensure(
-      matches!(
-        schedule_message(&independent, &mutation_methods, &barrier),
-        MessageSchedule::Independent
-      ),
-      "an unregistered notification must bypass the mutation lane",
+      "serialization boundaries must retain operation context and complete same-ID internal responses",
+      |observed| {
+        matches!(
+          observed.0,
+          Err(ServerError::Serialization {
+            context: "fixture request parameters",
+            ..
+          })
+        ) && observed.1.id == rpc::MessageId::Value(NumberOrString::Number(8))
+          && observed.1.error == Some(rpc::RpcError::internal_error().with_details("fixture result cannot serialize"))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
+  }
+
+  /// Captured scheduling results retaining the mutation ticket until the final check.
+  type SchedulingObservations = [MessageSchedule<LocalMutationStorage>; 3];
+
+  #[test]
+  fn scheduling_captures_prior_mutations_before_requests() -> Result<(), Box<PredicateFailure<SchedulingObservations>>> {
+    let barrier = MutationBarrier::<LocalMutationStorage>::default();
+    let methods = HashSet::from(["mutate"]);
+    let observed = [
+      schedule_message(&message("mutate", rpc::MessageId::Missing, None), &methods, &barrier),
+      schedule_message(
+        &message("read", rpc::MessageId::Value(NumberOrString::Number(1)), None),
+        &methods,
+        &barrier,
+      ),
+      schedule_message(&message("observe", rpc::MessageId::Missing, None), &methods, &barrier),
+    ];
+    ensure_that(
+      observed,
+      "requests must capture prior mutation revisions while independent notifications bypass ordering",
+      |outcomes| {
+        matches!(*outcomes, [
+          MessageSchedule::Mutation {
+            ticket: Ok(_)
+          },
+          MessageSchedule::Request {
+            prior_revision: 1
+          },
+          MessageSchedule::Independent
+        ])
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Generate the same externally observable ordering and cancellation
@@ -2699,7 +2632,6 @@ mod tests {
       outbound_errors = $outbound_errors_test:ident,
       outbound_cancellation = $outbound_cancellation_test:ident,
       server = $server:ident,
-      world = $world:ident,
       initialize = $initialize:ident,
       initialize_runtime = $initialize_runtime:ident,
       initialized_fixture = $initialized_fixture:ident,
@@ -2721,883 +2653,234 @@ mod tests {
       deferred = $deferred:literal,
       family = $family:literal,
     ) => {
-      /// Construct one fresh initialized-handler server boundary for this runtime family.
-      fn $fixture() -> ($world_type, TestWriter, $server<$world_type>) {
-        (
-          $world(),
-          TestWriter::default(),
-          $server::new().on_request::<InitializeRequest, _>($initialize),
-        )
+      /// Construct a runtime owner with its complete mutable observation record.
+      fn $fixture() -> RuntimeObservations<$world_type, $server<$world_type>> {
+        RuntimeObservations {
+          world: <$world_type>::default(), writer: TestWriter::default(),
+          server: $server::new().on_request::<InitializeRequest, _>($initialize),
+          dispatch: Vec::new(), values: Vec::new(), messages: Vec::new(), registry: Vec::new(),
+        }
       }
 
-      /// Construct one server with the runtime family's scalar read request registered.
-      fn $read_fixture() -> ($world_type, TestWriter, $server<$world_type>) {
-        let (world, writer, server) = $fixture();
-        (world, writer, server.on_request::<GetValue, _>($read))
+      /// Register scalar reads on the original runtime fixture.
+      fn $read_fixture() -> RuntimeObservations<$world_type, $server<$world_type>> {
+        let mut observed = $fixture();
+        observed.server = observed.server.on_request::<GetValue, _>($read);
+        observed
       }
 
-      /// Dispatch one scalar read through the runtime family's public request boundary.
-      fn $read_request(
-        server: &$server<$world_type>,
-        world: &$world_type,
-        writer: &TestWriter,
-        id: rpc::MessageId,
-        params: Option<serde_json::Value>,
-      ) -> Result<(), TestFailure> {
-        ensure_ok(
-          block_on(server.handle_message(
-            Clone::clone(world),
-            message(GetValue::METHOD, id, params),
-            writer.clone(),
-          )),
-          concat!("the ", $family, " read request must receive a protocol response"),
-        )
+      /// Retain the native completion of one public read request.
+      fn $read_request(observed: &mut RuntimeObservations<$world_type, $server<$world_type>>, id: rpc::MessageId, params: Option<serde_json::Value>) {
+        observed.dispatch.push((concat!("the ", $family, " read request must receive a protocol response"), block_on(observed.server.handle_message(Clone::clone(&observed.world), message(GetValue::METHOD, id, params), observed.writer.clone()))));
       }
 
-      /// Construct the mutation notification shared by ordering and lifecycle boundaries.
+      /// Construct the mutation used by ordering and lifecycle scenarios.
       fn $mutation_message() -> rpc::Message {
-        message(
-          SetValue::METHOD,
-          rpc::MessageId::Missing,
-          Some(serde_json::json!({ "value": $expected })),
-        )
+        message(SetValue::METHOD, rpc::MessageId::Missing, Some(serde_json::json!({"value": $expected})))
       }
 
-      /// Initialize one server family through its public message boundary.
-      fn $initialize_runtime(
-        server: &$server<$world_type>,
-        world: &$world_type,
-        writer: &TestWriter,
-        context: &'static str,
-      ) -> Result<(), TestFailure> {
-        ensure_ok(
-          block_on(server.handle_message(
-            Clone::clone(world),
-            message(
-              InitializeRequest::METHOD,
-              rpc::MessageId::Value(NumberOrString::Number(0)),
-              None,
-            ),
-            writer.clone(),
-          )),
-          context,
-        )
+      /// Retain initialization delivery together with its owning runtime fixture.
+      fn $initialize_runtime(observed: &mut RuntimeObservations<$world_type, $server<$world_type>>, context: &'static str) {
+        observed.dispatch.push((context, block_on(observed.server.handle_message(Clone::clone(&observed.world), message(InitializeRequest::METHOD, rpc::MessageId::Value(NumberOrString::Number(0)), None), observed.writer.clone()))));
       }
 
-      /// Register one request handler and return its initialized runtime fixture.
+      /// Construct and initialize one registered request fixture without discarding native setup outcomes.
       macro_rules! $initialized_fixture {
         ($request:ty, $handler:ident, $context:expr) => {{
-          let (world, writer, server) = $fixture();
-          let server = server.on_request::<$request, _>($handler);
-          $initialize_runtime(&server, &world, &writer, $context)?;
-          Result::<_, TestFailure>::Ok((world, writer, server))
+          let mut observed = $fixture();
+          observed.server = observed.server.on_request::<$request, _>($handler);
+          $initialize_runtime(&mut observed, $context);
+          observed
         }};
       }
 
-      /// Construct the initialized typed-outbound server shared by result and error routing tests.
-      fn $outbound_value_fixture() -> Result<($world_type, TestWriter, $server<$world_type>), TestFailure> {
-        $initialized_fixture!(
-          OutboundValueProbe,
-          $value_probe,
-          concat!("the ", $family, " outbound-value server must initialize")
-        )
+      /// Construct the typed outbound-response fixture.
+      fn $outbound_value_fixture() -> RuntimeObservations<$world_type, $server<$world_type>> {
+        $initialized_fixture!(OutboundValueProbe, $value_probe, concat!("the ", $family, " outbound-value server must initialize"))
       }
 
-      /// Complete one typed outbound-value request and its corresponding client response.
-      fn $outbound_value_exchange(
-        server: &$server<$world_type>,
-        world: &$world_type,
-        writer: &TestWriter,
-        inbound_id: i32,
-        response: rpc::Message,
-      ) -> Result<(), TestFailure> {
-        complete_exchange(
-          server.handle_message(
-            Clone::clone(world),
-            message(
-              OutboundValueProbe::METHOD,
-              rpc::MessageId::Value(NumberOrString::Number(inbound_id)),
-              None,
-            ),
-            writer.clone(),
-          ),
-          server.handle_message(Clone::clone(world), response, writer.clone()),
+      /// Drive and retain both native halves of an outbound scalar exchange.
+      fn $outbound_value_exchange(observed: &mut RuntimeObservations<$world_type, $server<$world_type>>, inbound_id: i32, response: rpc::Message) {
+        observed.dispatch.extend(complete_exchange(
+          observed.server.handle_message(Clone::clone(&observed.world), message(OutboundValueProbe::METHOD, rpc::MessageId::Value(NumberOrString::Number(inbound_id)), None), observed.writer.clone()),
+          observed.server.handle_message(Clone::clone(&observed.world), response, observed.writer.clone()),
           concat!("the ", $family, " outbound value probe must complete"),
           concat!("the ", $family, " outbound value response must route to its waiter"),
-        )
-      }
-
-      /// Verify that requests observe every earlier ordered mutation.
-      #[test]
-      fn $ordering_test() -> Result<(), TestFailure> {
-        let world = $world();
-        let writer = TestWriter::default();
-        let server = $server::new()
-          .on_request::<InitializeRequest, _>($initialize)
-          .on_mutation_notification::<SetValue, _>($mutation)
-          .on_request::<GetValue, _>($read);
-        $initialize_runtime(
-          &server,
-          &world,
-          &writer,
-          concat!("the ", $family, " server must initialize"),
-        )?;
-
-        let mutation = server.handle_message(
-          Clone::clone(&world),
-          $mutation_message(),
-          writer.clone(),
-        );
-        let request = server.handle_message(
-          world,
-          message(
-            GetValue::METHOD,
-            rpc::MessageId::Value(NumberOrString::Number(1)),
-            None,
-          ),
-          writer.clone(),
-        );
-        ensure_ok(
-          block_on(try_join(mutation, request)),
-          concat!(
-            "the ordered ",
-            $family,
-            " mutation and following request must complete"
-          ),
-        )?;
-        let response_result = writer.result_for(&rpc::MessageId::Value(NumberOrString::Number(1)));
-        ensure(
-          response_result == Some(serde_json::json!($expected)),
-          concat!(
-            "the ",
-            $family,
-            " request must wait for and observe the prior mutation"
-          ),
-        )
-      }
-
-      /// Verify cancellation and duplicate-ID handling remain independent.
-      #[test]
-      fn $cancellation_test() -> Result<(), TestFailure> {
-        let world = $world();
-        let writer = TestWriter::default();
-        let server = $server::new()
-          .on_request::<InitializeRequest, _>($initialize)
-          .on_request::<PendingRequest, _>($pending);
-        $initialize_runtime(
-          &server,
-          &world,
-          &writer,
-          concat!("the ", $family, " cancellation server must initialize"),
-        )?;
-        let request_id = NumberOrString::Number(9);
-        let active_request = message(
-          PendingRequest::METHOD,
-          rpc::MessageId::Value(request_id.clone()),
-          None,
-        );
-        let pending_request = server.handle_message(
-          Clone::clone(&world),
-          active_request.clone(),
-          writer.clone(),
-        );
-        let duplicate_request = server.handle_message(
-          Clone::clone(&world),
-          active_request,
-          writer.clone(),
-        );
-        let cancellation = server.handle_message(
-          world,
-          message(
-            notification::Cancel::METHOD,
-            rpc::MessageId::Missing,
-            Some(serde_json::json!({ "id": request_id })),
-          ),
-          writer.clone(),
-        );
-        let (pending_result, duplicate_result, cancellation_result) =
-          block_on(join3(
-            pending_request,
-            duplicate_request,
-            cancellation,
-          ));
-        ensure_ok(
-          pending_result,
-          concat!(
-            "the cancelled ",
-            $family,
-            " request must finish its protocol response"
-          ),
-        )?;
-        ensure_ok(
-          duplicate_result,
-          concat!(
-            "the duplicate ",
-            $family,
-            " request must finish its protocol response"
-          ),
-        )?;
-        ensure_ok(
-          cancellation_result,
-          concat!(
-            "the ",
-            $family,
-            " cancellation notification must be handled"
-          ),
-        )?;
-        let codes = response_error_codes(&writer, NumberOrString::Number(9));
-        ensure(
-          codes.as_slice() == [-32800, -32600],
-          concat!(
-            "the active ",
-            $family,
-            " request must be cancelled while its duplicate is independently rejected"
-          ),
-        )
-      }
-
-      /// Verify the complete public protocol lifecycle and notification registry.
-      #[test]
-      fn $lifecycle_test() -> Result<(), TestFailure> {
-        let (world, writer, server) = $fixture();
-        let server = server
-          .on_notification::<SetValue, _>($mutation)
-          .on_request::<GetValue, _>($read);
-        $initialize_runtime(
-          &server,
-          &world,
-          &writer,
-          concat!("the ", $family, " lifecycle server must initialize"),
-        )?;
-        ensure_ok(
-          block_on(server.handle_message(
-            Clone::clone(&world),
-            $mutation_message(),
-            writer.clone(),
-          )),
-          concat!("the initialized ", $family, " notification must dispatch"),
-        )?;
-        ensure_ok(
-          block_on(server.handle_message(
-            Clone::clone(&world),
-            message(
-              GetValue::METHOD,
-              rpc::MessageId::Value(NumberOrString::Number(1)),
-              None,
-            ),
-            writer.clone(),
-          )),
-          concat!("the initialized ", $family, " request must dispatch"),
-        )?;
-        ensure_ok(
-          block_on(server.handle_message(
-            Clone::clone(&world),
-            message(
-              request::Shutdown::METHOD,
-              rpc::MessageId::Value(NumberOrString::Number(2)),
-              None,
-            ),
-            writer.clone(),
-          )),
-          concat!("the ", $family, " server must complete shutdown"),
-        )?;
-        ensure_ok(
-          block_on(server.handle_message(
-            world,
-            message(
-              notification::Exit::METHOD,
-              rpc::MessageId::Missing,
-              None,
-            ),
-            writer.clone(),
-          )),
-          concat!("the ", $family, " server must accept exit after shutdown"),
-        )?;
-        ensure(
-          block_on(server.is_shutting_down()),
-          concat!("the ", $family, " server must retain its shutdown transition"),
-        )?;
-
-        let response_count = writer.messages().len();
-        let read_result = writer.result_for(&rpc::MessageId::Value(NumberOrString::Number(1)));
-        let shutdown_result = writer.result_for(&rpc::MessageId::Value(NumberOrString::Number(2)));
-        ensure(
-          (
-            response_count,
-            read_result,
-            shutdown_result,
-          ) == (
-            3,
-            Some(serde_json::json!($expected)),
-            Some(serde_json::Value::Null),
-          ),
-          concat!(
-            "the ",
-            $family,
-            " lifecycle must emit only initialize, ordinary-request, and shutdown responses"
-          ),
-        )
-      }
-
-      /// Verify context capabilities, response-before-deferred ordering, and retry.
-      #[test]
-      fn $context_test() -> Result<(), TestFailure> {
-        let (world, writer, server) = $initialized_fixture!(
-          ContextProbe,
-          $context_probe,
-          concat!("the ", $family, " context server must initialize")
-        )?;
-        let context_request = || {
-          server.handle_message(
-            Clone::clone(&world),
-            message(
-              ContextProbe::METHOD,
-              rpc::MessageId::Value(NumberOrString::Number(1)),
-              None,
-            ),
-            writer.clone(),
-          )
-        };
-
-        writer.fail.store(true, Ordering::SeqCst);
-        let failed = block_on(context_request());
-        ensure(
-          (
-            matches!(failed, Err(ServerError::Transport(_))),
-            world.load_value(),
-          ) == (
-            true,
-            0,
-          ),
-          concat!(
-            "a failed ",
-            $family,
-            " response write must abort before deferred world mutation"
-          ),
-        )?;
-
-        writer.fail.store(false, Ordering::SeqCst);
-        ensure_ok(
-          block_on(context_request()),
-          concat!(
-            "the ",
-            $family,
-            " context request must retry after transport recovery"
-          ),
-        )?;
-        let notification_value = writer.notification_parameter(ProbeNotification::METHOD, "observed");
-        let response_value = writer.result_for(&rpc::MessageId::Value(NumberOrString::Number(1)));
-        ensure(
-          (
-            world.load_value(),
-            notification_value,
-            response_value,
-          ) == (
-            $deferred,
-            Some(serde_json::json!(0)),
-            Some(serde_json::json!(0)),
-          ),
-          concat!(
-            "the recovered ",
-            $family,
-            " context must expose initial state, emit its notification, then run deferred work"
-          ),
-        )
-      }
-
-      /// Verify replacement keeps request/notification registries and ordering distinct.
-      #[test]
-      fn $registry_test() -> Result<(), TestFailure> {
-        let mutation_server = $server::<$world_type>::default()
-          .on_notification::<SetValue, _>($mutation)
-          .on_mutation_notification::<SetValue, _>($mutation)
-          .on_request::<GetValue, _>($read)
-          .on_request::<GetValue, _>($read);
-        let mutation_debug = format!("{mutation_server:?}");
-        ensure(
-          [
-            mutation_debug.contains("request_handler_count: 1"),
-            mutation_debug.contains("notification_handler_count: 1"),
-            mutation_debug.contains("mutation_method_count: 1"),
-          ] == [true, true, true],
-          concat!(
-            "the ",
-            $family,
-            " registry must replace same-kind handlers while retaining mutation ordering"
-          ),
-        )?;
-
-        let independent_server =
-          mutation_server.on_notification::<SetValue, _>($mutation);
-        let independent_debug = format!("{independent_server:?}");
-        ensure(
-          [
-            independent_debug.contains("request_handler_count: 1"),
-            independent_debug.contains("notification_handler_count: 1"),
-            independent_debug.contains("mutation_method_count: 0"),
-          ] == [true, true, true],
-          concat!(
-            "re-registering the ",
-            $family,
-            " notification independently must replace its ordering classification"
-          ),
-        )
-      }
-
-      /// Verify public wire routing rejects work before initialization and invalid protocol versions.
-      #[test]
-      fn $wire_lifecycle_test() -> Result<(), TestFailure> {
-        let (world, writer, server) = $read_fixture();
-
-        $read_request(
-          &server,
-          &world,
-          &writer,
-          rpc::MessageId::Value(NumberOrString::Number(20)),
-          None,
-        )?;
-        let mut invalid_version = message(
-          GetValue::METHOD,
-          rpc::MessageId::Value(NumberOrString::Number(21)),
-          None,
-        );
-        invalid_version.jsonrpc = "1.0".into();
-        ensure_ok(
-          block_on(server.handle_message(
-            world,
-            invalid_version,
-            writer.clone(),
-          )),
-          concat!(
-            "the invalid-version ",
-            $family,
-            " request must receive a protocol response"
-          ),
-        )?;
-        ensure(
-          (
-            response_error_codes(&writer, NumberOrString::Number(20)),
-            response_error_codes(&writer, NumberOrString::Number(21)),
-          ) == (
-            vec![-32002],
-            vec![-32600],
-          ),
-          concat!(
-            "the ",
-            $family,
-            " wire boundary must distinguish lifecycle and version failures"
-          ),
-        )
-      }
-
-      /// Verify public wire routing distinguishes unknown methods from invalid parameters.
-      #[test]
-      fn $wire_request_test() -> Result<(), TestFailure> {
-        let (world, writer, server) = $read_fixture();
-        $initialize_runtime(
-          &server,
-          &world,
-          &writer,
-          concat!("the ", $family, " wire-boundary server must initialize"),
-        )?;
-
-        ensure_ok(
-          block_on(server.handle_message(
-            Clone::clone(&world),
-            message(
-              "fixture/unregisteredRequest",
-              rpc::MessageId::Value(NumberOrString::Number(22)),
-              None,
-            ),
-            writer.clone(),
-          )),
-          concat!(
-            "the unknown ",
-            $family,
-            " request must receive a method-not-found response"
-          ),
-        )?;
-        $read_request(
-          &server,
-          &world,
-          &writer,
-          rpc::MessageId::Value(NumberOrString::Number(23)),
-          Some(serde_json::json!({})),
-        )?;
-        ensure(
-          (
-            response_error_codes(
-              &writer,
-              NumberOrString::Number(22),
-            ),
-            response_error_codes(
-              &writer,
-              NumberOrString::Number(23),
-            ),
-          ) == (
-            vec![-32601],
-            vec![-32602],
-          ),
-          concat!(
-            "the ",
-            $family,
-            " wire boundary must distinguish method and parameter failures"
-          ),
-        )
-      }
-
-      /// Verify invalid and unregistered notifications produce no state or response side effects.
-      #[test]
-      fn $wire_notification_test() -> Result<(), TestFailure> {
-        let (world, writer, server) = $fixture();
-        let server = server.on_mutation_notification::<SetValue, _>($mutation);
-        $initialize_runtime(
-          &server,
-          &world,
-          &writer,
-          concat!("the ", $family, " notification server must initialize"),
-        )?;
-        let response_count = writer.messages().len();
-        ensure_ok(
-          block_on(server.handle_message(
-            Clone::clone(&world),
-            message(
-              SetValue::METHOD,
-              rpc::MessageId::Missing,
-              Some(serde_json::json!({ "value": "invalid" })),
-            ),
-            writer.clone(),
-          )),
-          concat!(
-            "invalid ",
-            $family,
-            " notification parameters must be ignored"
-          ),
-        )?;
-        ensure_ok(
-          block_on(server.handle_message(
-            Clone::clone(&world),
-            message(
-              "fixture/unregisteredNotification",
-              rpc::MessageId::Missing,
-              None,
-            ),
-            writer.clone(),
-          )),
-          concat!(
-            "an unregistered ",
-            $family,
-            " notification must be ignored"
-          ),
-        )?;
-        ensure(
-          (
-            world.load_value(),
-            writer.messages().len(),
-          ) == (
-            0,
-            response_count,
-          ),
-          concat!(
-            "ignored ",
-            $family,
-            " notifications must mutate neither world state nor response output"
-          ),
-        )
-      }
-
-      /// Verify null request identifiers and response messages retain their routing contracts.
-      #[test]
-      fn $wire_response_test() -> Result<(), TestFailure> {
-        let (world, writer, server) = $read_fixture();
-        $read_request(&server, &world, &writer, rpc::MessageId::Null, None)?;
-        ensure(
-          writer.messages().iter().any(|wire_message| {
-            (
-              &wire_message.id,
-              wire_message.error.as_ref().map(|error| error.code),
-            ) == (
-              &rpc::MessageId::Null,
-              Some(-32600),
-            )
-          }),
-          concat!(
-            "the null-ID ",
-            $family,
-            " request must preserve the invalid-request code and null identifier"
-          ),
-        )?;
-
-        let invalid_response = block_on(server.handle_message(
-          Clone::clone(&world),
-          response_message(
-            "1.0",
-            99,
-            Some(serde_json::Value::Null),
-            None,
-          ),
-          writer.clone(),
         ));
-        ensure(
-          matches!(
-            invalid_response,
-            Err(ServerError::InvalidResponseVersion {
-              id: NumberOrString::Number(99),
-              ref version,
-            }) if version == "1.0"
-          ),
-          concat!(
-            "the ",
-            $family,
-            " response router must retain an invalid version and request ID"
-          ),
-        )?;
-        ensure_ok(
-          block_on(server.handle_message(
-            world,
-            response_message(
-              "2.0",
-              99,
-              Some(serde_json::Value::Null),
-              None,
-            ),
-            writer,
-          )),
-          concat!(
-            "the ",
-            $family,
-            " response router must ignore a well-formed unknown request ID"
-          ),
-        )
       }
 
-      /// Verify typed outbound success and deserialization-failure routing.
+      /// Requests must observe every previously issued ordered mutation.
       #[test]
-      fn $outbound_results_test() -> Result<(), TestFailure> {
-        let (world, writer, server) = $outbound_value_fixture()?;
-
-        $outbound_value_exchange(
-          &server,
-          &world,
-          &writer,
-          10,
-          response_message("2.0", 0, Some(serde_json::json!(88)), None),
-        )?;
-        $outbound_value_exchange(
-          &server,
-          &world,
-          &writer,
-          11,
-          response_message("2.0", 1, Some(serde_json::json!("not-a-number")), None),
-        )?;
-        ensure(
-          (
-            writer.result_for(&rpc::MessageId::Value(NumberOrString::Number(10))),
-            response_error_codes(&writer, NumberOrString::Number(11)),
-            writer.method_count(OutboundValueRequest::METHOD),
-          ) == (
-            Some(serde_json::json!(88)),
-            vec![-32603],
-            2,
-          ),
-          concat!(
-            "the ",
-            $family,
-            " outbound router must preserve typed success and deserialization failure"
-          ),
-        )
+      fn $ordering_test() -> RuntimeAssertion<$world_type, $server<$world_type>> {
+        let mut observed = $read_fixture();
+        observed.server = observed.server.on_mutation_notification::<SetValue, _>($mutation);
+        $initialize_runtime(&mut observed, concat!("the ", $family, " ordering server must initialize"));
+        let mutation = observed.server.handle_message(Clone::clone(&observed.world), $mutation_message(), observed.writer.clone());
+        let request = observed.server.handle_message(Clone::clone(&observed.world), message(GetValue::METHOD, rpc::MessageId::Value(NumberOrString::Number(1)), None), observed.writer.clone());
+        observed.dispatch.extend(complete_exchange(mutation, request, "the prior mutation must complete", "the dependent request must complete"));
+        ensure_that(observed, concat!("the ", $family, " request must wait for and observe its prior mutation"), |state| state.dispatch.iter().all(|&(_, ref outcome)| outcome.is_ok()) && state.writer.result_for(&rpc::MessageId::Value(NumberOrString::Number(1))) == Some(serde_json::json!($expected))).map(drop).map_err(Box::new)
       }
 
-      /// Verify outbound RPC errors and unknown-response routing.
+      /// Active cancellation must preserve the duplicate-ID rejection independently.
       #[test]
-      fn $outbound_errors_test() -> Result<(), TestFailure> {
-        let (world, writer, server) = $outbound_value_fixture()?;
-        $outbound_value_exchange(
-          &server,
-          &world,
-          &writer,
-          12,
-          response_message("2.0", 0, None, Some(rpc::RpcError::method_not_found())),
-        )?;
-        ensure_ok(
-          block_on(server.handle_message(
-            world,
-            response_message(
-              "2.0",
-              100,
-              Some(serde_json::json!(5)),
-              None,
-            ),
-            writer.clone(),
-          )),
-          concat!(
-            "the ",
-            $family,
-            " outbound router must ignore an unknown valid response"
-          ),
-        )?;
-
-        ensure(
-          (
-            response_error_codes(&writer, NumberOrString::Number(12)),
-            writer.method_count(OutboundValueRequest::METHOD),
-          ) == (
-            vec![-32601],
-            1,
-          ),
-          concat!(
-            "the ",
-            $family,
-            " outbound router must preserve RPC errors and ignore unknown responses"
-          ),
-        )
+      fn $cancellation_test() -> RuntimeAssertion<$world_type, $server<$world_type>> {
+        let mut observed = $initialized_fixture!(PendingRequest, $pending, concat!("the ", $family, " cancellation server must initialize"));
+        let active = message(PendingRequest::METHOD, rpc::MessageId::Value(NumberOrString::Number(9)), None);
+        let pending_request = observed.server.handle_message(Clone::clone(&observed.world), active.clone(), observed.writer.clone());
+        let duplicate_request = observed.server.handle_message(Clone::clone(&observed.world), active, observed.writer.clone());
+        let cancellation = observed.server.handle_message(Clone::clone(&observed.world), message(notification::Cancel::METHOD, rpc::MessageId::Missing, Some(serde_json::json!({"id": 9}))), observed.writer.clone());
+        let (pending_result, duplicate_result, cancellation_result) = block_on(join3(pending_request, duplicate_request, cancellation));
+        observed.dispatch.extend([("cancelled request", pending_result), ("duplicate request", duplicate_result), ("cancellation notification", cancellation_result)]);
+        ensure_that(observed, concat!("the ", $family, " runtime must cancel the active request while rejecting its duplicate"), |state| state.dispatch.iter().all(|&(_, ref outcome)| outcome.is_ok()) && response_error_codes(&state.writer, NumberOrString::Number(9)) == [-32800, -32600]).map(drop).map_err(Box::new)
       }
 
-      /// Verify outbound cancellation targets the request that established the active waiter.
+      /// Initialization, ordinary work, shutdown, and exit retain complete protocol results.
       #[test]
-      fn $outbound_cancellation_test() -> Result<(), TestFailure> {
-        let (world, writer, server) = $initialized_fixture!(
-          OutboundCancelProbe,
-          $cancel_probe,
-          concat!("the ", $family, " outbound-cancellation server must initialize")
-        )?;
-        complete_exchange(
-          server.handle_message(
-            Clone::clone(&world),
-            message(
-              OutboundCancelProbe::METHOD,
-              rpc::MessageId::Value(NumberOrString::Number(13)),
-              None,
-            ),
-            writer.clone(),
-          ),
-          server.handle_message(
-            world,
-            response_message(
-              "2.0",
-              0,
-              Some(serde_json::json!(1)),
-              None,
-            ),
-            writer.clone(),
-          ),
-          concat!(
-            "the ",
-            $family,
-            " outbound cancellation probe must complete"
-          ),
-          concat!(
-            "the ",
-            $family,
-            " response to the cancelled outbound request must be absorbed"
-          ),
-        )?;
-        ensure(
-          (
-            writer.notification_parameter(notification::Cancel::METHOD, "id"),
-            writer.method_count(OutboundValueRequest::METHOD),
-          ) == (
-            Some(serde_json::json!(0)),
-            1,
-          ),
-          concat!(
-            "the ",
-            $family,
-            " outbound cancellation must retain its request identity and request count"
-          ),
-        )
+      fn $lifecycle_test() -> RuntimeAssertion<$world_type, $server<$world_type>> {
+        let mut observed = $read_fixture();
+        observed.server = observed.server.on_notification::<SetValue, _>($mutation);
+        $initialize_runtime(&mut observed, concat!("the ", $family, " lifecycle server must initialize"));
+        for (context, wire) in [
+          ("initialized notification", $mutation_message()),
+          ("ordinary request", message(GetValue::METHOD, rpc::MessageId::Value(NumberOrString::Number(1)), None)),
+          ("shutdown request", message(request::Shutdown::METHOD, rpc::MessageId::Value(NumberOrString::Number(2)), None)),
+          ("terminal exit", message(notification::Exit::METHOD, rpc::MessageId::Missing, None)),
+        ] {
+          observed.dispatch.push((context, block_on(observed.server.handle_message(Clone::clone(&observed.world), wire, observed.writer.clone()))));
+        }
+        ensure_that(observed, concat!("the ", $family, " runtime must preserve complete lifecycle dispatch and sole request responses"), |state| {
+          state.dispatch.iter().all(|&(_, ref outcome)| outcome.is_ok()) && block_on(state.server.is_shutting_down())
+            && state.writer.messages().len() == 3
+            && state.writer.result_for(&rpc::MessageId::Value(NumberOrString::Number(1))) == Some(serde_json::json!($expected))
+            && state.writer.result_for(&rpc::MessageId::Value(NumberOrString::Number(2))) == Some(serde_json::Value::Null)
+        }).map(drop).map_err(Box::new)
       }
 
-      /// Verify malformed outbound responses clear the context cancellation target.
+      /// Deferred work follows successful response delivery and clean retry.
       #[test]
-      fn $outbound_cleanup_test() -> Result<(), TestFailure> {
-        let (world, writer, server) = $initialized_fixture!(
-          OutboundProbe,
-          $outbound_probe,
-          concat!("the ", $family, " outbound-response server must initialize")
-        )?;
+      fn $context_test() -> RuntimeAssertion<$world_type, $server<$world_type>> {
+        let mut observed = $initialized_fixture!(ContextProbe, $context_probe, concat!("the ", $family, " context server must initialize"));
+        observed.writer.fail.store(true, Ordering::SeqCst);
+        observed.dispatch.push(("rejected context response", block_on(observed.server.handle_message(Clone::clone(&observed.world), message(ContextProbe::METHOD, rpc::MessageId::Value(NumberOrString::Number(1)), None), observed.writer.clone()))));
+        observed.values.push(observed.world.load_value());
+        observed.writer.fail.store(false, Ordering::SeqCst);
+        observed.dispatch.push(("recovered context response", block_on(observed.server.handle_message(Clone::clone(&observed.world), message(ContextProbe::METHOD, rpc::MessageId::Value(NumberOrString::Number(1)), None), observed.writer.clone()))));
+        ensure_that(observed, concat!("the ", $family, " runtime must preserve failed writes, defer no mutation on failure, and recover its original request"), |state| {
+          matches!(state.dispatch.as_slice(), [(_, Ok(())), (_, Err(ServerError::Transport(_))), (_, Ok(()))])
+            && state.values == [0] && state.world.load_value() == $deferred
+            && state.writer.notification_parameter(ProbeNotification::METHOD, "observed") == Some(serde_json::json!(0))
+            && state.writer.result_for(&rpc::MessageId::Value(NumberOrString::Number(1))) == Some(serde_json::json!(0))
+        }).map(drop).map_err(Box::new)
+      }
 
-        let outbound_probe = server.handle_message(
-          Clone::clone(&world),
-          message(
-            OutboundProbe::METHOD,
-            rpc::MessageId::Value(NumberOrString::Number(1)),
-            None,
-          ),
-          writer.clone(),
-        );
-        let malformed_response = server.handle_message(
-          world,
-          response_message("2.0", 0, None, None),
-          writer.clone(),
-        );
-        let (probe_result, response_result) =
-          block_on(join(outbound_probe, malformed_response));
-        ensure_ok(
-          probe_result,
-          concat!(
-            "the ",
-            $family,
-            " handler must observe and recover from the closed response channel"
-          ),
-        )?;
-        let malformed_error = ensure_some(
-          response_result.err(),
-          concat!("the malformed ", $family, " response must be rejected"),
-        )?;
-        ensure(
-          matches!(
-            malformed_error,
-            ServerError::InvalidResponseShape {
-              id: NumberOrString::Number(0)
-            }
-          ),
-          concat!(
-            "the malformed ",
-            $family,
-            " response must retain its outbound request ID"
-          ),
-        )?;
+      /// Same-kind replacement preserves independent request and mutation classification.
+      #[test]
+      fn $registry_test() -> RuntimeAssertion<$world_type, $server<$world_type>> {
+        let mut observed = $fixture();
+        observed.server = $server::<$world_type>::default().on_notification::<SetValue, _>($mutation).on_mutation_notification::<SetValue, _>($mutation).on_request::<GetValue, _>($read).on_request::<GetValue, _>($read);
+        observed.registry.push(format!("{:?}", observed.server));
+        observed.server = observed.server.on_notification::<SetValue, _>($mutation);
+        observed.registry.push(format!("{:?}", observed.server));
+        ensure_that(observed, concat!("the ", $family, " registry must preserve kind-specific replacement and remove superseded mutation ordering"), |state| {
+          state.registry.len() == 2 && state.registry.iter().zip([1, 0]).all(|(description, mutation_count)| description.contains("request_handler_count: 1") && description.contains("notification_handler_count: 1") && description.contains(&format!("mutation_method_count: {mutation_count}")))
+        }).map(drop).map_err(Box::new)
+      }
 
-        let messages = writer.messages();
-        ensure(
-          messages.iter().any(|wire_message| {
-            (
-              wire_message.method.as_deref(),
-              &wire_message.id,
-            ) == (
-              Some(OutboundRequest::METHOD),
-              &rpc::MessageId::Value(NumberOrString::Number(0)),
-            )
-          }),
-          concat!("the ", $family, " handler must emit its outbound request"),
-        )?;
-        ensure(
-          messages.iter().any(|wire_message| {
-            (
-              &wire_message.id,
-              &wire_message.result,
-            ) == (
-              &rpc::MessageId::Value(NumberOrString::Number(1)),
-              &Some(serde_json::Value::Null),
-            )
-          }),
-          concat!(
-            "the ",
-            $family,
-            " inbound request must complete after response cleanup"
-          ),
-        )?;
-        ensure(
-          !messages.iter().any(|wire_message| {
-            wire_message.method.as_deref() == Some(notification::Cancel::METHOD)
-          }),
-          concat!(
-            "the ",
-            $family,
-            " context must not cancel a response target after its channel closes"
-          ),
-        )
+      /// Uninitialized and invalid-version requests retain distinct response errors.
+      #[test]
+      fn $wire_lifecycle_test() -> RuntimeAssertion<$world_type, $server<$world_type>> {
+        let mut observed = $read_fixture();
+        $read_request(&mut observed, rpc::MessageId::Value(NumberOrString::Number(20)), None);
+        let mut invalid = message(GetValue::METHOD, rpc::MessageId::Value(NumberOrString::Number(21)), None);
+        invalid.jsonrpc = "1.0".into();
+        observed.dispatch.push(("invalid-version request", block_on(observed.server.handle_message(Clone::clone(&observed.world), invalid, observed.writer.clone()))));
+        ensure_that(observed, concat!("the ", $family, " wire boundary must distinguish lifecycle and version errors"), |state| state.dispatch.iter().all(|&(_, ref outcome)| outcome.is_ok()) && response_error_codes(&state.writer, NumberOrString::Number(20)) == [-32002] && response_error_codes(&state.writer, NumberOrString::Number(21)) == [-32600]).map(drop).map_err(Box::new)
+      }
+
+      /// Unknown methods and invalid parameters retain distinct protocol failures.
+      #[test]
+      fn $wire_request_test() -> RuntimeAssertion<$world_type, $server<$world_type>> {
+        let mut observed = $read_fixture();
+        $initialize_runtime(&mut observed, concat!("the ", $family, " wire-boundary server must initialize"));
+        observed.dispatch.push(("unknown request", block_on(observed.server.handle_message(Clone::clone(&observed.world), message("fixture/unregisteredRequest", rpc::MessageId::Value(NumberOrString::Number(22)), None), observed.writer.clone()))));
+        $read_request(&mut observed, rpc::MessageId::Value(NumberOrString::Number(23)), Some(serde_json::json!({})));
+        ensure_that(observed, concat!("the ", $family, " wire boundary must distinguish method and parameter errors"), |state| state.dispatch.iter().all(|&(_, ref outcome)| outcome.is_ok()) && response_error_codes(&state.writer, NumberOrString::Number(22)) == [-32601] && response_error_codes(&state.writer, NumberOrString::Number(23)) == [-32602]).map(drop).map_err(Box::new)
+      }
+
+      /// Invalid and unknown notifications have no world or output side effects.
+      #[test]
+      fn $wire_notification_test() -> RuntimeAssertion<$world_type, $server<$world_type>> {
+        let mut observed = $fixture();
+        observed.server = observed.server.on_mutation_notification::<SetValue, _>($mutation);
+        $initialize_runtime(&mut observed, concat!("the ", $family, " notification server must initialize"));
+        observed.messages.push(observed.writer.messages());
+        for (context, wire) in [
+          ("invalid notification", message(SetValue::METHOD, rpc::MessageId::Missing, Some(serde_json::json!({"value": "invalid"})))),
+          ("unknown notification", message("fixture/unregisteredNotification", rpc::MessageId::Missing, None)),
+        ] { observed.dispatch.push((context, block_on(observed.server.handle_message(Clone::clone(&observed.world), wire, observed.writer.clone())))); }
+        ensure_that(observed, concat!("ignored ", $family, " notifications must preserve both world and protocol output"), |state| state.dispatch.iter().all(|&(_, ref outcome)| outcome.is_ok()) && state.world.load_value() == 0 && state.messages == [state.writer.messages()]).map(drop).map_err(Box::new)
+      }
+
+      /// Null-ID requests and malformed or unknown responses retain routing direction.
+      #[test]
+      fn $wire_response_test() -> RuntimeAssertion<$world_type, $server<$world_type>> {
+        let mut observed = $read_fixture();
+        $read_request(&mut observed, rpc::MessageId::Null, None);
+        observed.messages.push(observed.writer.messages());
+        observed.dispatch.push(("invalid response version", block_on(observed.server.handle_message(Clone::clone(&observed.world), response_message("1.0", 99, Some(serde_json::Value::Null), None), observed.writer.clone()))));
+        observed.dispatch.push(("unknown response ID", block_on(observed.server.handle_message(Clone::clone(&observed.world), response_message("2.0", 99, Some(serde_json::Value::Null), None), observed.writer.clone()))));
+        ensure_that(observed, concat!("the ", $family, " wire boundary must preserve null request IDs and native response failures"), |state| {
+          matches!(state.dispatch.as_slice(), [(_, Ok(())), (_, Err(ServerError::InvalidResponseVersion { id: NumberOrString::Number(99), version })), (_, Ok(()))] if version == "1.0")
+            && state.messages.iter().flatten().any(|wire| wire.id == rpc::MessageId::Null && wire.error.as_ref().is_some_and(|error| error.code == -32600))
+            && state.messages == [state.writer.messages()]
+        }).map(drop).map_err(Box::new)
+      }
+
+      /// Outbound typed values and deserialization errors reach the matching inbound requests.
+      #[test]
+      fn $outbound_results_test() -> RuntimeAssertion<$world_type, $server<$world_type>> {
+        let mut observed = $outbound_value_fixture();
+        $outbound_value_exchange(&mut observed, 10, response_message("2.0", 0, Some(serde_json::json!(88)), None));
+        $outbound_value_exchange(&mut observed, 11, response_message("2.0", 1, Some(serde_json::json!("not-a-number")), None));
+        ensure_that(observed, concat!("the ", $family, " outbound router must preserve typed success and deserialization failure"), |state| state.dispatch.iter().all(|&(_, ref outcome)| outcome.is_ok()) && state.writer.result_for(&rpc::MessageId::Value(NumberOrString::Number(10))) == Some(serde_json::json!(88)) && response_error_codes(&state.writer, NumberOrString::Number(11)) == [-32603] && state.writer.method_count(OutboundValueRequest::METHOD) == 2).map(drop).map_err(Box::new)
+      }
+
+      /// Outbound RPC errors survive and valid unknown responses remain inert.
+      #[test]
+      fn $outbound_errors_test() -> RuntimeAssertion<$world_type, $server<$world_type>> {
+        let mut observed = $outbound_value_fixture();
+        $outbound_value_exchange(&mut observed, 12, response_message("2.0", 0, None, Some(rpc::RpcError::method_not_found())));
+        observed.dispatch.push(("unknown valid response", block_on(observed.server.handle_message(Clone::clone(&observed.world), response_message("2.0", 100, Some(serde_json::json!(5)), None), observed.writer.clone()))));
+        ensure_that(observed, concat!("the ", $family, " outbound router must preserve RPC errors and ignore unknown responses"), |state| state.dispatch.iter().all(|&(_, ref outcome)| outcome.is_ok()) && response_error_codes(&state.writer, NumberOrString::Number(12)) == [-32601] && state.writer.method_count(OutboundValueRequest::METHOD) == 1).map(drop).map_err(Box::new)
+      }
+
+      /// Cancellation names the outbound request that owns the pending response.
+      #[test]
+      fn $outbound_cancellation_test() -> RuntimeAssertion<$world_type, $server<$world_type>> {
+        let mut observed = $initialized_fixture!(OutboundCancelProbe, $cancel_probe, concat!("the ", $family, " outbound-cancellation server must initialize"));
+        observed.dispatch.extend(complete_exchange(
+          observed.server.handle_message(Clone::clone(&observed.world), message(OutboundCancelProbe::METHOD, rpc::MessageId::Value(NumberOrString::Number(13)), None), observed.writer.clone()),
+          observed.server.handle_message(Clone::clone(&observed.world), response_message("2.0", 0, Some(serde_json::json!(1)), None), observed.writer.clone()),
+          "outbound cancellation probe", "cancelled outbound response",
+        ));
+        ensure_that(observed, concat!("the ", $family, " cancellation must preserve the active outbound request identity"), |state| state.dispatch.iter().all(|&(_, ref outcome)| outcome.is_ok()) && state.writer.notification_parameter(notification::Cancel::METHOD, "id") == Some(serde_json::json!(0)) && state.writer.method_count(OutboundValueRequest::METHOD) == 1).map(drop).map_err(Box::new)
+      }
+
+      /// Malformed responses retire the response channel before later cancellation.
+      #[test]
+      fn $outbound_cleanup_test() -> RuntimeAssertion<$world_type, $server<$world_type>> {
+        let mut observed = $initialized_fixture!(OutboundProbe, $outbound_probe, concat!("the ", $family, " outbound-response server must initialize"));
+        observed.dispatch.extend(complete_exchange(
+          observed.server.handle_message(Clone::clone(&observed.world), message(OutboundProbe::METHOD, rpc::MessageId::Value(NumberOrString::Number(1)), None), observed.writer.clone()),
+          observed.server.handle_message(Clone::clone(&observed.world), response_message("2.0", 0, None, None), observed.writer.clone()),
+          "closed response channel recovery", "malformed outbound response",
+        ));
+        ensure_that(observed, concat!("the ", $family, " context must complete recovery and forget its closed cancellation target"), |state| {
+          matches!(state.dispatch.as_slice(), [(_, Ok(())), (_, Ok(())), (_, Err(ServerError::InvalidResponseShape { id: NumberOrString::Number(0) }))])
+            && state.writer.messages().iter().any(|wire| wire.method.as_deref() == Some(OutboundRequest::METHOD) && wire.id == rpc::MessageId::Value(NumberOrString::Number(0)))
+            && state.writer.messages().iter().any(|wire| wire.id == rpc::MessageId::Value(NumberOrString::Number(1)) && wire.result == Some(serde_json::Value::Null))
+            && state.writer.method_count(notification::Cancel::METHOD) == 0
+        }).map(drop).map_err(Box::new)
       }
     };
   }
@@ -3619,7 +2902,6 @@ mod tests {
       $outbound_errors:ident =>
       $outbound_cancellation:ident =>
       $server:ident =>
-      $world:ident =>
       $initialize:ident =>
       $initialize_runtime:ident =>
       $initialized_fixture:ident =>
@@ -3656,7 +2938,6 @@ mod tests {
         outbound_errors = $outbound_errors,
         outbound_cancellation = $outbound_cancellation,
         server = $server,
-        world = $world,
         initialize = $initialize,
         initialize_runtime = $initialize_runtime,
         initialized_fixture = $initialized_fixture,
@@ -3761,8 +3042,7 @@ mod tests {
       concurrent_outbound_cancellation_targets_active_waiter
     ),
     (LocalServer, ConcurrentServer),
-    (local_runtime_value, concurrent_runtime_value),
-    (initialize_local, initialize_concurrent),
+    (initialize_runtime_context, initialize_runtime_context),
     (initialize_local_runtime, initialize_concurrent_runtime),
     (initialized_local_request_fixture, initialized_concurrent_request_fixture),
     (
@@ -3788,72 +3068,74 @@ mod tests {
   );
 
   #[test]
-  fn writer_io_failure_retains_its_original_boxed_source() -> Result<(), TestFailure> {
-    let error = MessageWriterError::from(io::Error::from(io::ErrorKind::PermissionDenied));
-    ensure(
-      error.kind() == io::ErrorKind::PermissionDenied,
-      "the writer error category must delegate to the original I/O source",
-    )?;
-    match error {
-      MessageWriterError::Io {
-        source,
-      } => ensure(
-        source.kind() == io::ErrorKind::PermissionDenied,
-        "the writer error must retain the original boxed I/O source",
-      ),
-      MessageWriterError::OutputChannelClosed {
-        ..
-      } => ensure(false, "a native I/O failure must not become an output-channel closure"),
-    }
+  fn writer_io_failure_retains_its_original_boxed_source() -> Result<(), PredicateFailure<MessageWriterError>> {
+    ensure_that(
+      MessageWriterError::from(io::Error::from(io::ErrorKind::PermissionDenied)),
+      "the writer category and original boxed source must retain permission denial",
+      |error| {
+        error.kind() == io::ErrorKind::PermissionDenied
+          && matches!(*error, MessageWriterError::Io { ref source } if source.kind() == io::ErrorKind::PermissionDenied)
+      },
+    )
+    .map(drop)
   }
 
+  /// Idle writer and native close completion.
+  type ClosedWriter = (TestWriter, Result<(), MessageWriterError>);
+
   #[test]
-  fn discrete_message_writers_close_without_buffered_work() -> Result<(), TestFailure> {
+  fn discrete_message_writers_close_without_buffered_work() -> Result<(), PredicateFailure<ClosedWriter>> {
     let mut writer = TestWriter::default();
-    ensure_ok(
-      block_on(futures::SinkExt::close(&mut writer)),
-      "a discrete message writer must close immediately when it owns no buffered work",
-    )?;
-    ensure(
-      writer.messages().is_empty(),
-      "closing an idle message writer must not fabricate protocol output",
+    let closed = block_on(futures::SinkExt::close(&mut writer));
+    ensure_that(
+      (writer, closed),
+      "closing an idle discrete writer must succeed without fabricating output",
+      |observed| observed.1.is_ok() && observed.0.messages().is_empty(),
     )
+    .map(drop)
   }
 
   #[test]
-  fn writer_failure_aborts_initialization_for_a_clean_retry() -> Result<(), TestFailure> {
-    let world = Rc::new(Cell::new(0));
-    let server = LocalServer::new().on_request::<InitializeRequest, _>(initialize_local);
-    let failed = block_on(server.handle_message(
-      Rc::clone(&world),
-      message(InitializeRequest::METHOD, rpc::MessageId::Value(NumberOrString::Number(0)), None),
-      TestWriter::failing(),
-    ));
-    ensure(
-      matches!(failed, Err(ServerError::Transport(_))),
-      "a failed response write must reach the server boundary",
-    )?;
-
-    let writer = TestWriter::default();
-    ensure_ok(
-      block_on(server.handle_message(
-        world,
-        message(InitializeRequest::METHOD, rpc::MessageId::Value(NumberOrString::Number(0)), None),
-        writer.clone(),
-      )),
-      "a failed initialize write must leave the lifecycle ready for retry",
-    )?;
-    ensure(
-      writer
-        .messages()
-        .iter()
-        .any(|message| (&message.result, message.error.is_none()) == (&Some(serde_json::Value::Null), true)),
-      "the retried initialization must emit one successful response",
+  fn writer_failure_aborts_initialization_for_a_clean_retry() -> RuntimeAssertion<LocalValue, LocalServer<LocalValue>> {
+    let mut observed = local_runtime_fixture();
+    observed.writer = TestWriter::failing();
+    initialize_local_runtime(&mut observed, "failed initialization response");
+    observed.writer.fail.store(false, Ordering::SeqCst);
+    initialize_local_runtime(&mut observed, "recovered initialization response");
+    ensure_that(
+      observed,
+      "a failed initialize write must leave the lifecycle ready to retry its original request",
+      |state| {
+        matches!(state.dispatch.as_slice(), [(_, Err(ServerError::Transport(_))), (_, Ok(()))])
+          && state
+            .writer
+            .messages()
+            .iter()
+            .any(|wire| wire.result == Some(serde_json::Value::Null) && wire.error.is_none())
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
+  }
+
+  /// Native thread spawn, panic, and server-completion layers.
+  type RequestThread = Result<thread::Result<Result<(), ServerError>>, io::Error>;
+
+  /// Native initialization, thread creation/join, and entry-channel results.
+  #[derive(Debug)]
+  struct OverlapObservations {
+    /// Initialization delivery outcome before launching request threads.
+    initialized: Result<(), ServerError>,
+    /// Both spawn and join layers, including original panic payloads if a worker panics.
+    threads:     [RequestThread; 2],
+    /// Entry notifications observed before releasing either handler.
+    starts:      [Result<(), mpsc::RecvTimeoutError>; 2],
+    /// Output owner retaining complete messages from both request threads.
+    writer:      TestWriter,
   }
 
   #[test]
-  fn independent_concurrent_requests_overlap_on_separate_threads() -> Result<(), TestFailure> {
+  fn independent_concurrent_requests_overlap_on_separate_threads() -> Result<(), Box<PredicateFailure<OverlapObservations>>> {
     let (started, observations) = mpsc::channel();
     let release = Arc::new(AtomicBool::new(false));
     let world = OverlapWorld {
@@ -3864,54 +3146,53 @@ mod tests {
     let server = ConcurrentServer::new()
       .on_request::<InitializeRequest, _>(initialize_overlap)
       .on_request::<OverlapRequest, _>(overlap_handler);
-    ensure_ok(
-      block_on(server.handle_message(
-        world.clone(),
-        message(InitializeRequest::METHOD, rpc::MessageId::Value(NumberOrString::Number(0)), None),
-        writer.clone(),
-      )),
-      "the overlap server must initialize",
-    )?;
+    let initialized = block_on(server.handle_message(
+      world.clone(),
+      message(InitializeRequest::METHOD, rpc::MessageId::Value(NumberOrString::Number(0)), None),
+      writer.clone(),
+    ));
     let shared_server = Arc::new(server);
-
     let first_server = Arc::clone(&shared_server);
     let first_world = world.clone();
     let first_writer = writer.clone();
-    let first = ensure_ok(
-      Builder::new().name("first-overlapping-request".to_owned()).spawn(move || {
-        block_on(first_server.handle_message(
-          first_world,
-          message(OverlapRequest::METHOD, rpc::MessageId::Value(NumberOrString::Number(1)), None),
-          first_writer,
-        ))
-      }),
-      "the first request thread must start",
-    )?;
-    let second_server = shared_server;
-    let second_world = world;
-    let second_writer = writer;
-    let second = ensure_ok(
-      Builder::new().name("second-overlapping-request".to_owned()).spawn(move || {
-        block_on(second_server.handle_message(
-          second_world,
-          message(OverlapRequest::METHOD, rpc::MessageId::Value(NumberOrString::Number(2)), None),
-          second_writer,
-        ))
-      }),
-      "the second request thread must start",
-    )?;
-
-    let first_started = observations.recv_timeout(Duration::from_secs(2)).is_ok();
-    let second_started = observations.recv_timeout(Duration::from_secs(2)).is_ok();
+    let first = Builder::new().name("first-overlapping-request".to_owned()).spawn(move || {
+      block_on(first_server.handle_message(
+        first_world,
+        message(OverlapRequest::METHOD, rpc::MessageId::Value(NumberOrString::Number(1)), None),
+        first_writer,
+      ))
+    });
+    let second_writer = writer.clone();
+    let second = Builder::new().name("second-overlapping-request".to_owned()).spawn(move || {
+      block_on(shared_server.handle_message(
+        world,
+        message(OverlapRequest::METHOD, rpc::MessageId::Value(NumberOrString::Number(2)), None),
+        second_writer,
+      ))
+    });
+    let starts = [
+      observations.recv_timeout(Duration::from_secs(2)),
+      observations.recv_timeout(Duration::from_secs(2)),
+    ];
     release.store(true, Ordering::SeqCst);
-    let first_result = ensure_some(first.join().ok(), "the first request thread must not panic")?;
-    let second_result = ensure_some(second.join().ok(), "the second request thread must not panic")?;
-    ensure_ok(first_result, "the first overlapping request must complete")?;
-    ensure_ok(second_result, "the second overlapping request must complete")?;
-    ensure(
-      [first_started, second_started] == [true, true],
-      "both independent handlers must enter before either is released",
+    let threads = [first.map(thread::JoinHandle::join), second.map(thread::JoinHandle::join)];
+    ensure_that(
+      OverlapObservations {
+        initialized,
+        threads,
+        starts,
+        writer,
+      },
+      "both native handlers must enter before release and preserve successful spawn, join, and response delivery",
+      |observed| {
+        observed.initialized.is_ok()
+          && observed.starts.iter().all(Result::is_ok)
+          && observed.threads.iter().all(|outcome| matches!(*outcome, Ok(Ok(Ok(())))))
+          && observed.writer.messages().len() == 3
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]

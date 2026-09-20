@@ -109,11 +109,8 @@ fn validated_toml(toml: &str) -> Result<Node, ConvertError> {
 
 #[cfg(test)]
 mod tests {
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_eq;
-  use strict_test_support::ensure_ok;
-  use strict_test_support::ensure_some;
+  use strict_test_support::PredicateFailure;
+  use strict_test_support::ensure_that;
 
   use super::ConvertError;
   use super::JsonFormatting;
@@ -121,91 +118,83 @@ mod tests {
   use super::toml_to_json;
   use super::toml_to_json_with_format;
 
-  #[test]
-  fn converts_only_valid_toml_and_supported_json_values() -> Result<(), TestFailure> {
-    let json = ensure_ok(
-      toml_to_json_with_format("name = \"taplo\"\nenabled = true\n", JsonFormatting::Pretty),
-      "valid TOML must convert to JSON",
-    )?;
-    ensure_eq(
-      &json.as_str(),
-      &"{\n  \"name\": \"taplo\",\n  \"enabled\": true\n}",
-      "the established conversion entry point must retain pretty JSON output",
-    )?;
-    let decoded: serde_json::Value = ensure_ok(serde_json::from_str(&json), "converted JSON must decode")?;
-    ensure_eq(
-      &decoded,
-      &serde_json::json!({
-        "name": "taplo",
-        "enabled": true,
-      }),
-      "conversion must preserve TOML scalar meaning",
-    )?;
-    ensure_eq(
-      &ensure_ok(
-        toml_to_json("name = \"taplo\"\nenabled = true\n"),
-        "the compatibility conversion must succeed",
-      )?,
-      &json,
-      "the established conversion entry point must select explicit pretty formatting",
-    )?;
-    let compact = ensure_ok(
-      toml_to_json_with_format("name = \"taplo\"\nenabled = true\n", JsonFormatting::Compact),
-      "valid TOML must convert to compact JSON",
-    )?;
-    ensure_eq(
-      &compact.as_str(),
-      &"{\"name\":\"taplo\",\"enabled\":true}",
-      "compact conversion must preserve member order without presentation whitespace",
-    )?;
-
-    let toml = ensure_ok(
-      json_to_toml(r#"{"name":"taplo","enabled":true}"#, false),
-      "supported JSON objects must convert to TOML",
-    )?;
-    ensure(
-      [toml.contains("name = \"taplo\""), toml.contains("enabled = true")] == [true, true],
-      "JSON conversion must render both object members",
-    )
+  /// Conversion results and the decoded meaning of the pretty JSON output.
+  #[derive(Debug)]
+  struct Conversions {
+    /// Explicit pretty presentation.
+    pretty:  Result<String, ConvertError>,
+    /// Decoding is attempted only after conversion yields JSON text.
+    decoded: Option<Result<serde_json::Value, serde_json::Error>>,
+    /// Established pretty-printing entry point.
+    default: Result<String, ConvertError>,
+    /// Compact presentation.
+    compact: Result<String, ConvertError>,
+    /// Reverse conversion to TOML.
+    toml:    Result<String, ConvertError>,
   }
 
   #[test]
-  fn rejects_syntax_semantic_and_json_failures_distinctly() -> Result<(), TestFailure> {
-    for formatting in [JsonFormatting::Compact, JsonFormatting::Pretty] {
-      let syntax = ensure_some(
-        toml_to_json_with_format("value = [1 2]", formatting).err(),
-        "recoverable syntax diagnostics must reject every JSON presentation",
-      )?;
-      ensure(
-        matches!(syntax, ConvertError::SyntaxDiagnostics { .. }),
-        "recoverable syntax diagnostics must not produce partial JSON",
-      )?;
-      ensure_eq(
-        &syntax.to_string().as_str(),
-        &"the TOML input contains syntax diagnostics",
-        "syntax failures must identify the rejected JavaScript-facing input",
-      )?;
-      let semantic = ensure_some(
-        toml_to_json_with_format("value = 1\nvalue = 2\n", formatting).err(),
-        "semantic conflicts must reject every JSON presentation",
-      )?;
-      ensure(
-        matches!(semantic, ConvertError::SemanticDiagnostics { .. }),
-        "semantic conflicts must not produce partial JSON",
-      )?;
-      ensure_eq(
-        &semantic.to_string().as_str(),
-        &"the TOML input contains semantic diagnostics",
-        "semantic failures must identify the rejected JavaScript-facing input",
-      )?;
-    }
-    ensure(
-      matches!(json_to_toml("{", false), Err(ConvertError::Json(_))),
-      "malformed JSON must retain the JSON error channel",
-    )?;
-    ensure(
-      matches!(json_to_toml("null", false), Err(ConvertError::Json(_))),
-      "JSON values without a TOML representation must be rejected",
+  fn converts_only_valid_toml_and_supported_json_values() -> Result<(), Box<PredicateFailure<Conversions>>> {
+    let source = "name = \"taplo\"\nenabled = true\n";
+    let pretty = toml_to_json_with_format(source, JsonFormatting::Pretty);
+    let decoded = pretty.as_ref().ok().map(|json| serde_json::from_str(json));
+    let observed = Conversions {
+      pretty,
+      decoded,
+      default: toml_to_json(source),
+      compact: toml_to_json_with_format(source, JsonFormatting::Compact),
+      toml: json_to_toml(r#"{"name":"taplo","enabled":true}"#, false),
+    };
+    ensure_that(
+      observed,
+      "conversions must preserve scalar meaning, member order, and the selected presentation",
+      |actual| {
+        actual
+          .pretty
+          .as_ref()
+          .is_ok_and(|json| json == "{\n  \"name\": \"taplo\",\n  \"enabled\": true\n}")
+          && actual.decoded.as_ref().is_some_and(|result| {
+            result
+              .as_ref()
+              .is_ok_and(|value| value == &serde_json::json!({"name": "taplo", "enabled": true}))
+          })
+          && actual
+            .default
+            .as_ref()
+            .is_ok_and(|json| actual.pretty.as_ref().is_ok_and(|formatted| json == formatted))
+          && actual
+            .compact
+            .as_ref()
+            .is_ok_and(|json| json == r#"{"name":"taplo","enabled":true}"#)
+          && actual
+            .toml
+            .as_ref()
+            .is_ok_and(|toml| toml.contains("name = \"taplo\"") && toml.contains("enabled = true"))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
+  }
+
+  /// All rejected conversions, retaining the native diagnostics in presentation order.
+  type RejectedConversions = [Result<String, ConvertError>; 6];
+
+  #[test]
+  fn rejects_syntax_semantic_and_json_failures_distinctly() -> Result<(), Box<PredicateFailure<RejectedConversions>>> {
+    let observed = [
+      toml_to_json_with_format("value = [1 2]", JsonFormatting::Compact),
+      toml_to_json_with_format("value = 1\nvalue = 2\n", JsonFormatting::Compact),
+      toml_to_json_with_format("value = [1 2]", JsonFormatting::Pretty),
+      toml_to_json_with_format("value = 1\nvalue = 2\n", JsonFormatting::Pretty),
+      json_to_toml("{", false),
+      json_to_toml("null", false),
+    ];
+    ensure_that(observed, "syntax, semantic, malformed JSON, and unrepresentable JSON failures must retain distinct native channels", |actual| {
+      let [ref compact_syntax, ref compact_semantic, ref pretty_syntax, ref pretty_semantic, ref malformed, ref unrepresentable] = *actual;
+      [compact_syntax, pretty_syntax].into_iter().all(|result| matches!(result, Err(error @ ConvertError::SyntaxDiagnostics { .. }) if error.to_string() == "the TOML input contains syntax diagnostics"))
+        && [compact_semantic, pretty_semantic].into_iter().all(|result| matches!(result, Err(error @ ConvertError::SemanticDiagnostics { .. }) if error.to_string() == "the TOML input contains semantic diagnostics"))
+        && matches!(malformed, Err(ConvertError::Json(_)))
+        && matches!(unrepresentable, Err(ConvertError::Json(_)))
+    }).map(drop).map_err(Box::new)
   }
 }

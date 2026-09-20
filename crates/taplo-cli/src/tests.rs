@@ -1,25 +1,26 @@
+use std::fmt::Debug;
 #[cfg(feature = "lint")]
 use std::iter::empty;
+use std::slice::from_ref;
+use std::string::FromUtf8Error;
 
 use codespan_reporting::diagnostic::Diagnostic;
 use codespan_reporting::diagnostic::LabelStyle;
+use codespan_reporting::files;
 use codespan_reporting::files::SimpleFile;
-use strict_test_support::TestFailure;
-use strict_test_support::ensure;
-use strict_test_support::ensure_contains;
-use strict_test_support::ensure_eq;
-use strict_test_support::ensure_lacks;
-use strict_test_support::ensure_ok;
-use strict_test_support::ensure_some;
+use strict_test_support::PredicateFailure;
+use strict_test_support::ensure_that;
 use taplo::dom;
 use taplo::parser;
 use taplo::parser::Parse;
+use taplo::parser::ParseFailure;
 #[cfg(feature = "lint")]
 use taplo::rowan::TextRange;
 #[cfg(feature = "lint")]
 use taplo::rowan::TextSize;
-use taplo::syntax::SyntaxElement;
+use thiserror::Error;
 
+use crate::CliError;
 use crate::printing::dom_error_diagnostic;
 #[cfg(feature = "lint")]
 use crate::printing::message_diagnostics;
@@ -28,274 +29,415 @@ use crate::printing::render_diagnostics;
 #[cfg(feature = "lint")]
 use crate::printing::schema_error_diagnostics;
 
+/// ANSI control-sequence prefix expected only from colored rendering.
 const ESC: &str = "\u{1b}[";
 
-fn render_plain(source: &str, diagnostics: &[Diagnostic<()>]) -> Result<String, TestFailure> {
-  let file = SimpleFile::new("test.toml", source);
-  let bytes = ensure_ok(render_diagnostics(false, &file, diagnostics), "plain rendering must succeed")?;
-  ensure_ok(String::from_utf8(bytes), "rendered output must be valid UTF-8")
+/// Native failures at the byte-rendering and text-decoding boundaries.
+#[derive(Debug, Error)]
+enum RenderingError {
+  /// Codespan rendering failed.
+  #[error(transparent)]
+  Render(#[from] files::Error),
+  /// Rendered bytes could not be decoded as UTF-8.
+  #[error(transparent)]
+  Utf8(#[from] FromUtf8Error),
 }
 
-/// Parse one source fixture through the panic-free test vocabulary.
-fn parse_fixture(source: &str) -> Result<Parse, TestFailure> {
-  ensure_ok(parser::parse(source), "the diagnostic fixture tree must build")
+/// Render complete diagnostics through the public byte boundary.
+fn render(source: &str, diagnostics: &[Diagnostic<()>], colored: bool) -> Result<String, RenderingError> {
+  Ok(String::from_utf8(render_diagnostics(
+    colored,
+    &SimpleFile::new("test.toml", source),
+    diagnostics,
+  )?)?)
 }
 
-/// Parse one fixture and extract its first typed parser diagnostic.
-fn parse_with_first_diagnostic(source: &str, context: &'static str) -> Result<(Parse, parser::Diagnostic), TestFailure> {
-  let parse = parse_fixture(source)?;
-  let diagnostic = ensure_some(parse.diagnostics().first(), context)?.clone();
-  Ok((parse, diagnostic))
+/// Complete ordered diagnostic collection returned by the CLI mapping boundary.
+type MappedDiagnostics = Result<Vec<Diagnostic<()>>, CliError>;
+
+/// Complete parse and host-diagnostic mapping observations.
+#[derive(Debug)]
+struct ParseDiagnostics {
+  /// Native parser result, including recoverable syntax diagnostics.
+  parsed: Result<Parse, ParseFailure>,
+  /// Mapping attempted when a tree could be constructed.
+  mapped: Option<MappedDiagnostics>,
 }
 
-/// Map and render one source fixture that is expected to contain parse diagnostics.
-fn render_parse_failure(source: &str, colored: bool) -> Result<String, TestFailure> {
-  let parse = parse_fixture(source)?;
-  let diagnostics = ensure_ok(
-    parse_error_diagnostics(parse.diagnostics()),
-    "parse diagnostics must map into host ranges",
-  )?;
-  ensure(!diagnostics.is_empty(), "the parse-failure fixture must yield diagnostics")?;
-  if colored {
-    let file = SimpleFile::new("test.toml", source);
-    let bytes = ensure_ok(render_diagnostics(true, &file, &diagnostics), "colored rendering must succeed")?;
-    ensure_ok(String::from_utf8(bytes), "rendered output must be valid UTF-8")
-  } else {
-    render_plain(source, &diagnostics)
+/// Parse one fixture and retain both native results.
+fn parse_diagnostics(source: &str) -> ParseDiagnostics {
+  let parsed = parser::parse(source);
+  let mapped = parsed.as_ref().ok().map(|parse| parse_error_diagnostics(parse.diagnostics()));
+  ParseDiagnostics {
+    parsed,
+    mapped,
   }
 }
 
-fn validation_errors(source: &str) -> Result<Vec<dom::Diagnostic>, TestFailure> {
-  let parse = ensure_ok(parser::parse(source), "fixture syntax tree must build")?;
-  ensure(parse.diagnostics().is_empty(), "fixture must parse cleanly")?;
-  Ok(match parse.into_dom().validate() {
-    Ok(()) => Vec::new(),
-    Err(errors) => errors,
-  })
+/// Complete parsed syntax diagnostics, DOM owner, and semantic validation result.
+type Validation = (Vec<parser::Diagnostic>, dom::Node, Result<(), Vec<dom::Diagnostic>>);
+
+/// DOM validation and the selected diagnostic converted for rendering.
+#[derive(Debug)]
+struct DomDiagnostic {
+  /// Syntax and semantic evidence owned by the fixture.
+  validation: Result<Validation, ParseFailure>,
+  /// Selected native semantic diagnostic's host representation.
+  mapped:     Option<Result<Diagnostic<()>, CliError>>,
 }
 
-fn sample_syntax() -> Result<SyntaxElement, TestFailure> {
-  parse_fixture("a = 1").map(|parse| parse.into_syntax().into())
+/// Select a semantic diagnostic only from a syntax-clean fixture while retaining the complete
+/// source evidence.
+fn select_dom_diagnostic(source: &str, selected: impl Fn(&dom::Diagnostic) -> bool) -> DomDiagnostic {
+  let validation = parser::parse(source).map(|parse| {
+    let diagnostics = parse.diagnostics().to_vec();
+    let root = parse.into_dom();
+    let result = root.validate();
+    (diagnostics, root, result)
+  });
+  let mapped = validation
+    .as_ref()
+    .ok()
+    .filter(|observed| observed.0.is_empty())
+    .and_then(|observed| observed.2.as_ref().err())
+    .and_then(|errors| errors.iter().find(|error| selected(error)))
+    .map(dom_error_diagnostic);
+  DomDiagnostic {
+    validation,
+    mapped,
+  }
 }
 
-/// Require one selected DOM diagnostic to retain its two-party source labeling.
+/// Require a selected structural diagnostic to retain both source labels and its full native
+/// evidence.
 fn ensure_two_label_diagnostic(
   source: &str,
   selected: impl Fn(&dom::Diagnostic) -> bool,
-  expected_message: &str,
-) -> Result<(), TestFailure> {
-  let errors = validation_errors(source)?;
-  let error = ensure_some(
-    errors.iter().find(|diagnostic| selected(diagnostic)),
-    "the fixture must produce the selected structural diagnostic",
-  )?;
-  let diagnostic = ensure_ok(
-    dom_error_diagnostic(error),
-    "the structural diagnostic ranges must map into host coordinates",
-  )?;
-  ensure_eq(&diagnostic.message.as_str(), &expected_message, "diagnostic header")?;
-  ensure_eq(&diagnostic.labels.len(), &2, "offender and requirer must both be labelled")
-}
-
-/// Require one DOM diagnostic to retain its message and single source label.
-fn single_label_diagnostic(error: &dom::Diagnostic, expected_message: &str) -> Result<Diagnostic<()>, TestFailure> {
-  let diagnostic = ensure_ok(
-    dom_error_diagnostic(error),
-    "the single-label diagnostic range must map into host coordinates",
-  )?;
-  ensure_eq(&diagnostic.message.as_str(), &expected_message, "diagnostic header")?;
-  ensure_eq(&diagnostic.labels.len(), &1, "the offending span must be labelled")?;
-  Ok(diagnostic)
-}
-
-/// Require parse-diagnostic range deduplication to produce one exact count.
-fn ensure_parse_diagnostic_count(errors: &[parser::Diagnostic], expected: usize, context: &'static str) -> Result<(), TestFailure> {
-  let diagnostics = ensure_ok(parse_error_diagnostics(errors), "parse diagnostics must map into host ranges")?;
-  ensure_eq(&diagnostics.len(), &expected, context)
+  expected: &str,
+) -> Result<DomDiagnostic, Box<PredicateFailure<DomDiagnostic>>> {
+  ensure_that(
+    select_dom_diagnostic(source, selected),
+    "the structural diagnostic must retain its header, offender, and requirer labels",
+    |actual| {
+      actual.validation.as_ref().is_ok_and(|parsed| parsed.0.is_empty())
+        && actual.mapped.as_ref().is_some_and(|result| {
+          result
+            .as_ref()
+            .is_ok_and(|diagnostic| diagnostic.message == expected && diagnostic.labels.len() == 2)
+        })
+    },
+  )
+  .map_err(Box::new)
 }
 
 #[test]
-fn parse_errors_map_to_invalid_toml_diagnostics() -> Result<(), TestFailure> {
-  let parse = parse_fixture("x = ")?;
-  ensure(!parse.diagnostics().is_empty(), "fixture must produce parse errors")?;
-  let diagnostics = ensure_ok(
-    parse_error_diagnostics(parse.diagnostics()),
-    "parse diagnostics must map into host ranges",
-  )?;
-  ensure(!diagnostics.is_empty(), "parse errors must yield diagnostics")?;
-  let first = ensure_some(diagnostics.first(), "first diagnostic must exist")?;
-  ensure_eq(&first.message.as_str(), &"invalid TOML", "diagnostic header")?;
-  let label = ensure_some(first.labels.first(), "diagnostic must carry a primary label")?;
-  ensure(label.style == LabelStyle::Primary, "label must be primary")?;
-  ensure(!label.message.is_empty(), "label must carry the parser message")?;
-  Ok(())
+fn parse_errors_map_to_invalid_toml_diagnostics() -> Result<(), impl Debug> {
+  ensure_that(
+    parse_diagnostics("x = "),
+    "parse failures must map to a primary invalid-TOML diagnostic carrying the parser message",
+    |actual| {
+      let Some(Ok(ref diagnostics)) = actual.mapped else {
+        return false;
+      };
+      let Some(diagnostic) = diagnostics.first() else {
+        return false;
+      };
+      actual.parsed.as_ref().is_ok_and(|parse| !parse.diagnostics().is_empty())
+        && diagnostic.message == "invalid TOML"
+        && diagnostic
+          .labels
+          .first()
+          .is_some_and(|label| label.style == LabelStyle::Primary && !label.message.is_empty())
+    },
+  )
+  .map(drop)
+  .map_err(Box::new)
 }
 
 #[test]
-fn clean_source_yields_no_parse_diagnostics() -> Result<(), TestFailure> {
-  let parse = parse_fixture("x = 1\n")?;
-  ensure(parse.diagnostics().is_empty(), "fixture must parse cleanly")?;
-  let diagnostics = ensure_ok(
-    parse_error_diagnostics(parse.diagnostics()),
-    "clean parse diagnostics must map into host ranges",
-  )?;
-  ensure_eq(&diagnostics.len(), &0, "clean source must yield zero diagnostics")
+fn clean_source_yields_no_parse_diagnostics() -> Result<(), impl Debug> {
+  ensure_that(
+    parse_diagnostics("x = 1\n"),
+    "clean source must retain an empty parser and host diagnostic collection",
+    |actual| {
+      actual.parsed.as_ref().is_ok_and(|parse| parse.diagnostics().is_empty())
+        && actual
+          .mapped
+          .as_ref()
+          .is_some_and(|result| result.as_ref().is_ok_and(Vec::is_empty))
+    },
+  )
+  .map(drop)
+  .map_err(Box::new)
 }
 
 #[test]
-fn parse_errors_with_identical_ranges_dedup_to_one() -> Result<(), TestFailure> {
-  let (_, error) = parse_with_first_diagnostic("x = ", "the duplicate diagnostic fixture must have one diagnostic")?;
-  let errors = Vec::from([error.clone(), error.clone()]);
-  ensure_parse_diagnostic_count(&errors, 1, "identical ranges must dedup to one diagnostic")
+fn parse_errors_with_identical_ranges_dedup_to_one() -> Result<(), impl Debug> {
+  let parsed = parser::parse("x = ");
+  let errors = parsed
+    .as_ref()
+    .ok()
+    .and_then(|parse| parse.diagnostics().first())
+    .map(|error| [error.clone(), error.clone()]);
+  let mapped = errors.as_ref().map(|diagnostics| parse_error_diagnostics(diagnostics));
+  ensure_that(
+    (parsed, errors, mapped),
+    "identical parser ranges must produce exactly one diagnostic",
+    |actual| {
+      actual
+        .2
+        .as_ref()
+        .is_some_and(|result| result.as_ref().is_ok_and(|diagnostics| diagnostics.len() == 1))
+    },
+  )
+  .map(drop)
+  .map_err(Box::new)
 }
 
 #[test]
-fn parse_errors_with_distinct_ranges_stay_separate() -> Result<(), TestFailure> {
-  let (parse, first) = parse_with_first_diagnostic("x = @\ny = $\n", "the distinct diagnostic fixture must have a first diagnostic")?;
-  let second = ensure_some(
-    parse
-      .diagnostics()
-      .iter()
-      .find(|diagnostic| diagnostic.range() != first.range()),
-    "the distinct diagnostic fixture must have another diagnostic range",
-  )?;
-  let errors = Vec::from([first, second.clone()]);
-  ensure_parse_diagnostic_count(&errors, 2, "distinct ranges must not dedup")
+fn parse_errors_with_distinct_ranges_stay_separate() -> Result<(), impl Debug> {
+  let parsed = parser::parse("x = @\ny = $\n");
+  let errors = parsed.as_ref().ok().and_then(|parse| {
+    parse.diagnostics().first().and_then(|first| {
+      parse
+        .diagnostics()
+        .iter()
+        .find(|error| error.range() != first.range())
+        .map(|second| [first.clone(), second.clone()])
+    })
+  });
+  let mapped = errors.as_ref().map(|diagnostics| parse_error_diagnostics(diagnostics));
+  ensure_that(
+    (parsed, errors, mapped),
+    "distinct parser ranges must remain two separate diagnostics",
+    |actual| {
+      actual
+        .2
+        .as_ref()
+        .is_some_and(|result| result.as_ref().is_ok_and(|diagnostics| diagnostics.len() == 2))
+    },
+  )
+  .map(drop)
+  .map_err(Box::new)
 }
 
 #[test]
-fn colored_rendering_emits_ansi_styles() -> Result<(), TestFailure> {
-  let text = render_parse_failure("x = ", true)?;
-  ensure_contains(&text, ESC, "colored output must contain ANSI escape sequences")?;
-  ensure_contains(&text, "invalid TOML", "colored output must contain the diagnostic header")
+fn colored_rendering_emits_ansi_styles() -> Result<(), impl Debug> {
+  let diagnostics = parse_diagnostics("x = ");
+  let rendered = diagnostics
+    .mapped
+    .as_ref()
+    .and_then(|mapped| mapped.as_ref().ok())
+    .map(|mapped| render("x = ", mapped, true));
+  ensure_that(
+    (diagnostics, rendered),
+    "colored parse diagnostics must retain their header and ANSI styles",
+    |actual| {
+      actual.1.as_ref().is_some_and(|result| {
+        result
+          .as_ref()
+          .is_ok_and(|text| text.contains(ESC) && text.contains("invalid TOML"))
+      })
+    },
+  )
+  .map(drop)
+  .map_err(Box::new)
 }
 
 #[test]
-fn plain_rendering_carries_text_without_ansi_styles() -> Result<(), TestFailure> {
-  let text = render_parse_failure("x = ", false)?;
-  ensure_lacks(&text, ESC, "plain output must not contain ANSI escape sequences")?;
-  ensure_contains(&text, "invalid TOML", "plain output must contain the diagnostic header")
+fn plain_rendering_carries_text_without_ansi_styles() -> Result<(), impl Debug> {
+  let diagnostics = parse_diagnostics("x = ");
+  let rendered = diagnostics
+    .mapped
+    .as_ref()
+    .and_then(|mapped| mapped.as_ref().ok())
+    .map(|mapped| render("x = ", mapped, false));
+  ensure_that(
+    (diagnostics, rendered),
+    "plain parse diagnostics must retain their header without ANSI styles",
+    |actual| {
+      actual.1.as_ref().is_some_and(|result| {
+        result
+          .as_ref()
+          .is_ok_and(|text| !text.contains(ESC) && text.contains("invalid TOML"))
+      })
+    },
+  )
+  .map(drop)
+  .map_err(Box::new)
 }
 
 #[test]
-fn conflicting_keys_diagnostic_carries_both_labels() -> Result<(), TestFailure> {
-  let errors = validation_errors("a = 1\na = 2\n")?;
-  let error = ensure_some(
-    errors
-      .iter()
-      .find(|diagnostic| matches!(diagnostic, dom::Diagnostic::ConflictingKeys { .. })),
-    "fixture must produce a ConflictingKeys error",
-  )?;
-  let diagnostic = ensure_ok(dom_error_diagnostic(error), "conflicting-key ranges must map into host coordinates")?;
-  ensure_eq(&diagnostic.message.as_str(), &"conflicting keys", "diagnostic header")?;
-  ensure_eq(&diagnostic.labels.len(), &2, "both key occurrences must be labelled")?;
-  let primary = ensure_some(diagnostic.labels.first(), "primary label must exist")?;
-  ensure(primary.style == LabelStyle::Primary, "first label must be primary")?;
-  let secondary = ensure_some(diagnostic.labels.get(1), "secondary label must exist")?;
-  ensure(secondary.style == LabelStyle::Secondary, "second label must be secondary")?;
-  Ok(())
+fn conflicting_keys_diagnostic_carries_both_labels() -> Result<(), impl Debug> {
+  let observed = select_dom_diagnostic("a = 1\na = 2\n", |diagnostic| {
+    matches!(diagnostic, dom::Diagnostic::ConflictingKeys { .. })
+  });
+  ensure_that(observed, "conflicting keys must retain both labeled occurrences in primary-then-secondary order", |actual| {
+    actual.mapped.as_ref().is_some_and(|result| result.as_ref().is_ok_and(|diagnostic| diagnostic.message == "conflicting keys"
+      && matches!(diagnostic.labels.as_slice(), [primary, secondary] if primary.style == LabelStyle::Primary && secondary.style == LabelStyle::Secondary)))
+  }).map(drop).map_err(Box::new)
 }
 
 #[test]
-fn conflicting_keys_render_names_file_line_and_roles() -> Result<(), TestFailure> {
+fn conflicting_keys_render_names_file_line_and_roles() -> Result<(), impl Debug> {
   let source = "a = 1\na = 2\n";
-  let errors = validation_errors(source)?;
-  let error = ensure_some(
-    errors
-      .iter()
-      .find(|diagnostic| matches!(diagnostic, dom::Diagnostic::ConflictingKeys { .. })),
-    "fixture must produce a ConflictingKeys error",
-  )?;
-  let diagnostic = ensure_ok(
-    dom_error_diagnostic(error),
-    "rendered conflicting-key ranges must map into host coordinates",
-  )?;
-  let text = render_plain(source, &[diagnostic])?;
-  ensure_contains(&text, "conflicting keys", "rendered header")?;
-  ensure_contains(&text, "test.toml:2:", "primary location is the second occurrence")?;
-  ensure_contains(&text, "duplicate key", "primary label message")?;
-  ensure_contains(&text, "duplicate found here", "secondary label message")?;
-  ensure_lacks(&text, ESC, "plain rendering must not contain ANSI escapes")
+  let observed = select_dom_diagnostic(source, |diagnostic| matches!(diagnostic, dom::Diagnostic::ConflictingKeys { .. }));
+  let rendered = observed
+    .mapped
+    .as_ref()
+    .and_then(|result| result.as_ref().ok())
+    .map(|diagnostic| render(source, from_ref(diagnostic), false));
+  ensure_that(
+    (observed, rendered),
+    "conflicting-key rendering must retain the header, file line, both roles, and plain presentation",
+    |actual| {
+      actual.1.as_ref().is_some_and(|result| {
+        result.as_ref().is_ok_and(|text| {
+          ["conflicting keys", "test.toml:2:", "duplicate key", "duplicate found here"]
+            .iter()
+            .all(|part| text.contains(part))
+            && !text.contains(ESC)
+        })
+      })
+    },
+  )
+  .map(drop)
+  .map_err(Box::new)
 }
 
 #[test]
-fn expected_table_diagnostic_labels_offender_and_requirer() -> Result<(), TestFailure> {
+fn expected_table_diagnostic_labels_offender_and_requirer() -> Result<(), impl Debug> {
   ensure_two_label_diagnostic(
     "a = 1\n[a.b]\n",
     |diagnostic| matches!(diagnostic, dom::Diagnostic::ExpectedTable { .. }),
     "expected table",
   )
+  .map(drop)
 }
 
 #[test]
-fn expected_array_of_tables_diagnostic_labels_offender_and_requirer() -> Result<(), TestFailure> {
+fn expected_array_of_tables_diagnostic_labels_offender_and_requirer() -> Result<(), impl Debug> {
   ensure_two_label_diagnostic(
     "a = 1\n[[a]]\n",
     |diagnostic| matches!(diagnostic, dom::Diagnostic::ExpectedArrayOfTables { .. }),
     "expected array of tables",
   )
+  .map(drop)
 }
 
 #[test]
-fn unexpected_syntax_renders_instead_of_panicking() -> Result<(), TestFailure> {
-  let error = dom::Diagnostic::UnexpectedSyntax {
-    syntax: sample_syntax()?
-  };
-  let diagnostic = single_label_diagnostic(&error, "unexpected syntax")?;
-  let text = render_plain("a = 1", &[diagnostic])?;
-  ensure_contains(&text, "unexpected syntax", "rendered output must carry the header")
+fn unexpected_syntax_renders_instead_of_panicking() -> Result<(), impl Debug> {
+  let parsed = parser::parse("a = 1").map(|parse| dom::Diagnostic::UnexpectedSyntax {
+    syntax: parse.into_syntax().into(),
+  });
+  let mapped = parsed.as_ref().ok().map(dom_error_diagnostic);
+  let rendered = mapped
+    .as_ref()
+    .and_then(|result| result.as_ref().ok())
+    .map(|diagnostic| render("a = 1", from_ref(diagnostic), false));
+  ensure_that(
+    (parsed, mapped, rendered),
+    "unexpected syntax must retain its single source label and render its diagnostic header",
+    |actual| {
+      actual.1.as_ref().is_some_and(|result| {
+        result
+          .as_ref()
+          .is_ok_and(|diagnostic| diagnostic.message == "unexpected syntax" && diagnostic.labels.len() == 1)
+      }) && actual
+        .2
+        .as_ref()
+        .is_some_and(|result| result.as_ref().is_ok_and(|text| text.contains("unexpected syntax")))
+    },
+  )
+  .map(drop)
+  .map_err(Box::new)
 }
 
 #[test]
-fn invalid_escape_sequence_diagnostic_labels_the_string() -> Result<(), TestFailure> {
-  let error = dom::Diagnostic::InvalidEscapeSequence {
-    string: sample_syntax()?
-  };
-  drop(single_label_diagnostic(&error, "the string contains invalid escape sequence(s)")?);
-  Ok(())
+fn invalid_escape_sequence_diagnostic_labels_the_string() -> Result<(), impl Debug> {
+  let parsed = parser::parse("a = 1").map(|parse| dom::Diagnostic::InvalidEscapeSequence {
+    string: parse.into_syntax().into(),
+  });
+  let mapped = parsed.as_ref().ok().map(dom_error_diagnostic);
+  ensure_that(
+    (parsed, mapped),
+    "invalid escapes must retain their diagnostic message and offending string label",
+    |actual| {
+      actual.1.as_ref().is_some_and(|result| {
+        result
+          .as_ref()
+          .is_ok_and(|diagnostic| diagnostic.message == "the string contains invalid escape sequence(s)" && diagnostic.labels.len() == 1)
+      })
+    },
+  )
+  .map(drop)
+  .map_err(Box::new)
 }
 
 #[test]
-fn syntaxless_keys_degrade_to_labelless_diagnostic() -> Result<(), TestFailure> {
+fn syntaxless_keys_degrade_to_labelless_diagnostic() -> Result<(), impl Debug> {
   use taplo::dom::node::Key;
   let error = dom::Diagnostic::ConflictingKeys {
     key:   Key::new("a"),
     other: Key::new("a"),
   };
-  let diagnostic = ensure_ok(dom_error_diagnostic(&error), "syntax-less key diagnostics must remain convertible")?;
-  ensure_eq(&diagnostic.labels.len(), &0, "syntax-less keys must yield no labels")?;
-  let text = render_plain("a = 1", &[diagnostic])?;
-  ensure_contains(&text, "conflicting keys", "label-less diagnostic must still render its header")
+  let mapped = dom_error_diagnostic(&error);
+  let rendered = mapped
+    .as_ref()
+    .ok()
+    .map(|diagnostic| render("a = 1", from_ref(diagnostic), false));
+  ensure_that(
+    (error, mapped, rendered),
+    "syntaxless keys must retain a renderable conflicting-keys header with no fabricated source labels",
+    |actual| {
+      actual.1.as_ref().is_ok_and(|diagnostic| diagnostic.labels.is_empty())
+        && actual
+          .2
+          .as_ref()
+          .is_some_and(|result| result.as_ref().is_ok_and(|text| text.contains("conflicting keys")))
+    },
+  )
+  .map(drop)
+  .map_err(Box::new)
 }
 
 #[cfg(feature = "lint")]
 #[test]
-fn message_diagnostics_yield_one_per_range() -> Result<(), TestFailure> {
-  let ranges = Vec::from([
+fn message_diagnostics_yield_one_per_range() -> Result<(), impl Debug> {
+  let ranges = [
     TextRange::new(TextSize::from(0), TextSize::from(1)),
     TextRange::new(TextSize::from(2), TextSize::from(3)),
-  ]);
-  let diagnostics = ensure_ok(
-    message_diagnostics("value mismatch", ranges),
-    "schema message ranges must map into host coordinates",
-  )?;
-  ensure_eq(&diagnostics.len(), &2, "each range must yield a diagnostic")?;
-  let first = ensure_some(diagnostics.first(), "first diagnostic must exist")?;
-  ensure_eq(&first.message.as_str(), &"value mismatch", "diagnostic header")?;
-  let label = ensure_some(first.labels.first(), "diagnostic must carry a primary label")?;
-  ensure(label.style == LabelStyle::Primary, "label must be primary")?;
-  ensure(label.range == (0..1), "label must carry the source range")?;
-  Ok(())
+  ];
+  let mapped = message_diagnostics("value mismatch", ranges);
+  ensure_that(
+    (ranges, mapped),
+    "message diagnostics must preserve one primary diagnostic per input range",
+    |actual| {
+      actual.1.as_ref().is_ok_and(|diagnostics| {
+        diagnostics.len() == 2
+          && diagnostics.first().is_some_and(|diagnostic| {
+            diagnostic.message == "value mismatch"
+              && diagnostic
+                .labels
+                .first()
+                .is_some_and(|label| label.style == LabelStyle::Primary && label.range == (0..1))
+          })
+      })
+    },
+  )
+  .map(drop)
+  .map_err(Box::new)
 }
 
 #[cfg(feature = "lint")]
 #[test]
-fn empty_schema_errors_yield_no_diagnostics() -> Result<(), TestFailure> {
-  let messages = ensure_ok(
-    message_diagnostics("msg", empty::<TextRange>()),
-    "empty schema message ranges must remain convertible",
-  )?;
-  ensure_eq(&messages.len(), &0, "no ranges, no diagnostics")?;
-  let diagnostics = ensure_ok(schema_error_diagnostics(&[]), "empty schema failures must remain convertible")?;
-  ensure_eq(&diagnostics.len(), &0, "no errors, no diagnostics")
+fn empty_schema_errors_yield_no_diagnostics() -> Result<(), impl Debug> {
+  let observed = [message_diagnostics("msg", empty::<TextRange>()), schema_error_diagnostics(&[])];
+  ensure_that(
+    observed,
+    "empty message ranges and schema failures must produce empty diagnostic collections",
+    |actual| actual.iter().all(|result| result.as_ref().is_ok_and(Vec::is_empty)),
+  )
+  .map(drop)
+  .map_err(Box::new)
 }

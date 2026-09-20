@@ -54,6 +54,7 @@ tokio = { workspace = true, features = ["sync", "fs", "time", "io-std", "rt-mult
 tokio = { workspace = true, features = ["sync", "parking_lot", "io-util"] }
 
 [dev-dependencies]
+futures             = { workspace = true }
 strict-test-support = { workspace = true }
 taplo-test-support  = { workspace = true }
 time                = { workspace = true }

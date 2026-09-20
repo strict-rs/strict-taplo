@@ -116,23 +116,29 @@ define_checked_document_handler_execution_families!(
 
 #[cfg(test)]
 mod tests {
+  use std::fmt::Debug;
+
   use futures::executor::block_on;
   use lsp_types::DocumentFormattingParams;
   use serde_json::json;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
+  use strict_test_support::ResultFailure;
   use strict_test_support::ensure_ok;
-  use strict_test_support::ensure_some;
+  use strict_test_support::ensure_that;
   use taplo_lsp_async::Params;
 
   use super::format_concurrent;
   use super::format_local;
+  use crate::handlers::test_support::FixtureFailure;
   use crate::handlers::test_support::concurrent_world;
   use crate::handlers::test_support::local_world;
   use crate::handlers::test_support::url as fixture_url;
 
   /// Decode formatting parameters through their real wire representation.
-  fn parameters(document_uri: &str, insert_spaces: bool, final_newline: Option<bool>) -> Result<DocumentFormattingParams, TestFailure> {
+  fn parameters(
+    document_uri: &str,
+    insert_spaces: bool,
+    final_newline: Option<bool>,
+  ) -> Result<DocumentFormattingParams, ResultFailure<serde_json::Error>> {
     ensure_ok(
       serde_json::from_value(json!({
         "textDocument": {
@@ -149,109 +155,93 @@ mod tests {
   }
 
   #[test]
-  fn formatting_applies_client_indentation_and_returns_absence_or_typed_parameter_failure() -> Result<(), TestFailure> {
-    block_on(async {
+  fn formatting_applies_client_indentation_and_returns_absence_or_typed_parameter_failure() -> Result<(), impl Debug> {
+    let observed = block_on(async {
       let world = local_world()?;
-      let configuration = json!({
-        "schema": {
-          "enabled": false,
-          "catalogs": []
-        },
-        "formatter": {
-          "indentEntries": true
-        }
-      });
-      drop(ensure_ok(
-        world.apply_configuration_values_local(Some(&configuration), &[]).await,
-        "the formatting configuration must commit",
-      )?);
-      let document = fixture_url("file:///workspace/format.toml", "the formatting document URL must parse")?;
-      drop(ensure_ok(
-        world.replace_document(&document, "[table]\nvalue=1\n").await,
-        "the formatting document must install",
-      )?);
-
-      let edits = ensure_some(
-        ensure_ok(
-          format_local(&world, Params::from(Some(parameters(document.as_str(), false, Some(false))?))).await,
-          "tab-indented formatting must succeed",
-        )?,
-        "an installed document must return formatting edits",
-      )?;
-      let edit = ensure_some(edits.first(), "formatting must return its whole-document edit")?;
-      ensure(
-        (edit.new_text.as_str(), edit.range.end.line, edit.range.end.character) == ("[table]\n\tvalue = 1", 2, 0),
-        "formatting must apply tab indentation, explicit final-newline removal, and the complete source range",
-      )?;
-
-      ensure(
-        ensure_ok(
-          format_local(
-            &world,
-            Params::from(Some(parameters("file:///workspace/missing.toml", true, Some(true))?)),
-          )
-          .await,
-          "formatting an unopened document must remain a successful absent response",
-        )?
-        .is_none(),
-        "formatting must not fabricate edits for an unopened document",
-      )?;
-
       let concurrent = concurrent_world()?;
-      drop(ensure_ok(
-        concurrent
-          .apply_configuration_values_concurrent(Some(&configuration), &[])
-          .await,
-        "the concurrent formatting configuration must commit",
-      )?);
-      drop(ensure_ok(
-        concurrent.replace_document_concurrent(&document, "[table]\nvalue=1\n").await,
-        "the concurrent formatting document must install",
-      )?);
-      let concurrent_edits = ensure_some(
-        ensure_ok(
-          format_concurrent(&concurrent, Params::from(Some(parameters(document.as_str(), false, Some(false))?))).await,
-          "concurrent tab-indented formatting must succeed",
-        )?,
-        "an installed concurrent document must return formatting edits",
-      )?;
-      ensure(
-        concurrent_edits == edits,
-        "local and concurrent formatting families must return identical whole-document edits",
-      )?;
-
-      let missing_params_error = ensure_some(
-        format_local(&world, Params::<DocumentFormattingParams>::from(None)).await.err(),
-        "formatting without parameters must return a typed RPC error",
-      )?;
-      ensure(
-        (missing_params_error.code, missing_params_error.details.is_some()) == (-32602, true),
-        "formatting without parameters must preserve the standard typed invalid-params response",
-      )
-    })
+      let document = fixture_url("file:///workspace/format.toml", "the formatting document URL must parse")?;
+      let local_params = parameters(document.as_str(), false, Some(false))?;
+      let concurrent_params = parameters(document.as_str(), false, Some(false))?;
+      let missing_params = parameters("file:///workspace/missing.toml", true, Some(true))?;
+      let configuration = json!({
+        "schema": { "enabled": false, "catalogs": [] },
+        "formatter": { "indentEntries": true }
+      });
+      let configured = world.apply_configuration_values_local(Some(&configuration), &[]).await;
+      let installed = world.replace_document(&document, "[table]\nvalue=1\n").await;
+      let edits = format_local(&world, Params::from(Some(local_params))).await;
+      let missing = format_local(&world, Params::from(Some(missing_params))).await;
+      let concurrent_configured = concurrent
+        .apply_configuration_values_concurrent(Some(&configuration), &[])
+        .await;
+      let concurrent_installed = concurrent.replace_document_concurrent(&document, "[table]\nvalue=1\n").await;
+      let concurrent_edits = format_concurrent(&concurrent, Params::from(Some(concurrent_params))).await;
+      let rejected = format_local(&world, Params::<DocumentFormattingParams>::from(None)).await;
+      Ok::<_, FixtureFailure>((
+        world,
+        concurrent,
+        (configured, concurrent_configured),
+        (installed, concurrent_installed),
+        (edits, concurrent_edits, missing, rejected),
+      ))
+    });
+    ensure_that(
+      observed,
+      "formatting must preserve indentation, full source ranges, execution-family parity and absence or parameter errors",
+      |result| {
+        let Ok(ref scenario) = *result else {
+          return false;
+        };
+        scenario.2.0.is_ok()
+          && scenario.2.1.is_ok()
+          && scenario.3.0.is_ok()
+          && scenario.3.1.is_ok()
+          && scenario
+            .4
+            .0
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .and_then(|changes| changes.first())
+            .is_some_and(|edit| (edit.new_text.as_str(), edit.range.end.line, edit.range.end.character) == ("[table]\n\tvalue = 1", 2, 0))
+          && scenario.4.1 == scenario.4.0
+          && matches!(scenario.4.2, Ok(None))
+          && scenario
+            .4
+            .3
+            .as_ref()
+            .is_err_and(|error| (error.code, error.details.is_some()) == (-32602, true))
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn formatting_rejects_open_non_local_documents_with_typed_context() -> Result<(), TestFailure> {
-    block_on(async {
+  fn formatting_rejects_open_non_local_documents_with_typed_context() -> Result<(), impl Debug> {
+    let observed = block_on(async {
       let world = local_world()?;
       let document = fixture_url("untitled:format-buffer", "the non-local formatting document URL must parse")?;
-      drop(ensure_ok(
-        world.replace_document(&document, "value=1\n").await,
-        "the non-local formatting document must install",
-      )?);
-
-      let error = ensure_some(
-        format_local(&world, Params::from(Some(parameters(document.as_str(), true, Some(true))?)))
-          .await
-          .err(),
-        "formatting an open non-local document must return a typed RPC error",
-      )?;
-      ensure(
-        (error.code, error.details.as_ref().and_then(serde_json::Value::as_str))
-          == (-32600, Some("invalid (non-local) uri for file: untitled:format-buffer")),
-        "non-local formatting rejection must preserve the invalid-request code and exact URI context",
-      )
-    })
+      let request = parameters(document.as_str(), true, Some(true))?;
+      let installed = world.replace_document(&document, "value=1\n").await;
+      let response = format_local(&world, Params::from(Some(request))).await;
+      Ok::<_, FixtureFailure>((world, document, installed, response))
+    });
+    ensure_that(
+      observed,
+      "non-local formatting must retain the invalid-request code and exact URI context",
+      |result| {
+        let Ok(ref scenario) = *result else {
+          return false;
+        };
+        scenario.2.is_ok()
+          && scenario.3.as_ref().is_err_and(|error| {
+            (error.code, error.details.as_ref().and_then(serde_json::Value::as_str))
+              == (-32600, Some("invalid (non-local) uri for file: untitled:format-buffer"))
+          })
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

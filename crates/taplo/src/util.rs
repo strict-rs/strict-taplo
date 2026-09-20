@@ -171,11 +171,14 @@ pub fn overlaps(range: TextRange, other: TextRange) -> bool {
 #[cfg(test)]
 /// Character, string, syntax-navigation, and range utility contracts.
 mod tests {
+  use core::fmt::Debug;
+
   use rowan::TextRange;
   use rowan::TextSize;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_some;
+  use strict_test_support::ComparisonFailure;
+  use strict_test_support::PredicateFailure;
+  use strict_test_support::ensure_eq;
+  use strict_test_support::ensure_that;
 
   use super::CharacterPolicy;
   use super::StrExt as _;
@@ -183,108 +186,112 @@ mod tests {
   use super::overlaps;
   use super::try_join_ranges;
   use super::validate_characters;
+  use crate::parser::Parse;
+  use crate::parser::ParseFailure;
+  use crate::parser::parse;
   use crate::syntax::SyntaxKind;
-  use crate::test_support::parse_syntax;
+
+  /// Ordered validation results for every character-policy polarity.
+  type CharacterResults = [Result<(), Vec<usize>>; 8];
+  /// Source-range joins and intrinsic overlap predicates.
+  type RangeResults = ([Option<TextRange>; 2], [bool; 3]);
 
   #[test]
-  fn character_policies_accept_their_whitespace_and_report_exact_invalid_bytes() -> Result<(), TestFailure> {
-    for (policy, valid) in [
+  fn character_policies_accept_their_whitespace_and_report_exact_invalid_bytes() -> Result<(), impl Debug> {
+    let observed: CharacterResults = [
       (CharacterPolicy::CommentOrLiteral, "text\t\u{00e9}"),
       (CharacterPolicy::BasicString, "text\t\u{00e9}"),
       (CharacterPolicy::MultilineBasicString, "text\t\r\n\u{00e9}"),
       (CharacterPolicy::MultilineLiteralString, "text\t\r\n\u{00e9}"),
-    ] {
-      ensure(
-        validate_characters(valid, policy).is_ok(),
-        "each TOML character policy must accept its complete supported whitespace and text set",
-      )?;
-    }
-
-    for (policy, source, expected) in [
-      (CharacterPolicy::CommentOrLiteral, "a\n\u{0000}", vec![1, 2]),
-      (CharacterPolicy::BasicString, "a\n\u{007f}", vec![1, 2]),
-      (CharacterPolicy::MultilineBasicString, "a\n\u{0000}", vec![2]),
-      (CharacterPolicy::MultilineLiteralString, "a\n\u{0000}", vec![2]),
-    ] {
-      ensure(
-        validate_characters(source, policy) == Err(expected),
-        "each TOML character policy must return every violating byte offset in source order",
-      )?;
-    }
-    Ok(())
+      (CharacterPolicy::CommentOrLiteral, "a\n\u{0000}"),
+      (CharacterPolicy::BasicString, "a\n\u{007f}"),
+      (CharacterPolicy::MultilineBasicString, "a\n\u{0000}"),
+      (CharacterPolicy::MultilineLiteralString, "a\n\u{0000}"),
+    ]
+    .map(|(policy, source)| validate_characters(source, policy));
+    ensure_eq(
+      observed,
+      [
+        Ok(()),
+        Ok(()),
+        Ok(()),
+        Ok(()),
+        Err(vec![1, 2]),
+        Err(vec![1, 2]),
+        Err(vec![2]),
+        Err(vec![2]),
+      ],
+      "character policies must accept supported whitespace and return every invalid byte in order",
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn quote_stripping_requires_one_matching_outer_pair() -> Result<(), TestFailure> {
-    ensure(
-      ["\"double\"".strip_quotes(), "'single'".strip_quotes()] == ["double", "single"],
-      "matching basic and literal quote pairs must expose their exact interior",
-    )?;
-    ensure(
+  fn quote_stripping_requires_one_matching_outer_pair() -> Result<(), impl Debug> {
+    ensure_eq(
       [
+        "\"double\"".strip_quotes(),
+        "'single'".strip_quotes(),
         "\"mismatch'".strip_quotes(),
         "\"unterminated".strip_quotes(),
         "plain".strip_quotes(),
-      ] == ["\"mismatch'", "\"unterminated", "plain"],
-      "mismatched, incomplete, and absent quote pairs must preserve the original slice",
+      ],
+      ["double", "single", "\"mismatch'", "\"unterminated", "plain"],
+      "matching quote pairs must expose their interior and all other forms must retain their original slice",
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn syntax_navigation_distinguishes_deep_containment_boundaries_and_kind_lookup() -> Result<(), TestFailure> {
-    let syntax = parse_syntax("alpha = [1]\n", "the syntax-navigation fixture must parse")?;
-    let array = ensure_some(syntax.find(SyntaxKind::ARRAY), "kind lookup must find the array element")?;
-    let array_end = array.text_range().end();
-    ensure(
-      (array.kind(), array.to_string()) == (SyntaxKind::ARRAY, String::from("[1]")),
-      "kind lookup must return the first complete matching syntax element",
-    )?;
+  fn syntax_navigation_distinguishes_deep_containment_boundaries_and_kind_lookup()
+  -> Result<(), PredicateFailure<Result<Parse, ParseFailure>>> {
+    ensure_that(
+      parse("alpha = [1]\n"),
+      "syntax navigation must preserve kinds, deepest containment, and endpoint boundaries",
+      |parsed| {
+        let Ok(ref value) = *parsed else {
+          return false;
+        };
 
-    let value_offset = TextSize::new(9);
-    let deepest = ensure_some(
-      syntax.find_node_deep(value_offset, false),
-      "deep lookup must find the innermost node containing the scalar offset",
-    )?;
-    ensure(
-      [
-        deepest.text_range().contains(value_offset),
-        deepest.find_node(value_offset, false).is_none(),
-      ] == [true, true],
-      "deep lookup must stop only when no descendant node contains the offset",
-    )?;
-    ensure(
-      [
-        syntax.find_node(array_end, false).is_none(),
-        syntax.find_node(array_end, true).is_some(),
-        syntax.find_node(syntax.text_range().end(), true).is_none(),
-        syntax.find_node(TextSize::new(99), true).is_none(),
-      ] == [true, true, true, true],
-      "node lookup must distinguish descendant endpoints, root-only trailing trivia, and out-of-document offsets",
+        let syntax = value.clone().into_syntax();
+        let value_offset = TextSize::new(9);
+        syntax.find(SyntaxKind::ARRAY).is_some_and(|array| {
+          let array_end = array.text_range().end();
+          array.kind() == SyntaxKind::ARRAY
+            && array.to_string() == "[1]"
+            && syntax
+              .find_node_deep(value_offset, false)
+              .is_some_and(|deepest| deepest.text_range().contains(value_offset) && deepest.find_node(value_offset, false).is_none())
+            && syntax.find_node(array_end, false).is_none()
+            && syntax.find_node(array_end, true).is_some()
+            && syntax.find_node(syntax.text_range().end(), true).is_none()
+            && syntax.find_node(TextSize::new(99), true).is_none()
+        })
+      },
     )
+    .map(drop)
   }
 
   #[test]
-  fn range_utilities_join_empty_and_covering_inputs_and_treat_only_strict_separation_as_disjoint() -> Result<(), TestFailure> {
+  fn range_utilities_join_empty_and_covering_inputs_and_treat_only_strict_separation_as_disjoint()
+  -> Result<(), ComparisonFailure<RangeResults, RangeResults>> {
     let first = TextRange::new(TextSize::new(1), TextSize::new(3));
     let touching = TextRange::new(TextSize::new(3), TextSize::new(5));
     let contained = TextRange::new(TextSize::new(2), TextSize::new(3));
     let separated = TextRange::new(TextSize::new(4), TextSize::new(6));
-
-    ensure(
-      try_join_ranges(Vec::<TextRange>::new()).is_none(),
-      "joining no source ranges must remain absent",
-    )?;
-    ensure(
-      try_join_ranges([touching, first]) == Some(TextRange::new(TextSize::new(1), TextSize::new(5))),
-      "joining source ranges must cover the minimum start and maximum end independent of input order",
-    )?;
-    ensure(
-      [
+    ensure_eq(
+      ([try_join_ranges(Vec::<TextRange>::new()), try_join_ranges([touching, first])], [
         overlaps(first, touching),
         overlaps(first, contained),
         overlaps(first, separated),
-      ] == [true, true, false],
-      "range overlap must include endpoint contact and containment while rejecting strict separation",
+      ]),
+      ([None, Some(TextRange::new(TextSize::new(1), TextSize::new(5)))], [
+        true, true, false,
+      ]),
+      "joins must preserve absence and covering endpoints while overlap accepts contact and rejects separation",
     )
+    .map(drop)
   }
 }

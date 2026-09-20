@@ -266,15 +266,12 @@ fn ensure_non_empty_key(key_text: String) -> String {
 
 #[cfg(test)]
 mod tests {
+  use std::fmt::Debug;
   use std::iter::repeat_n;
 
   use lsp_types::Position;
   use lsp_types::Range;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_eq;
-  use strict_test_support::ensure_ok;
-  use strict_test_support::ensure_some;
+  use strict_test_support::ensure_that;
 
   use super::create_symbols;
   use crate::handlers::test_support::parse_document;
@@ -286,49 +283,68 @@ mod tests {
   }
 
   #[test]
-  fn nested_symbols_select_their_source_keys() -> Result<(), TestFailure> {
-    let document = parse_document(
+  fn nested_symbols_select_their_source_keys() -> Result<(), impl Debug> {
+    let observed = parse_document(
       "parent.child = 1\n[table]\nvalue = true\n",
       "the document-symbol fixture must parse",
-    )?;
-    let symbols = ensure_ok(create_symbols(&document), "document symbols must map")?;
-    let parent = ensure_some(named(&symbols, "parent"), "the dotted parent symbol must exist")?;
-    ensure(
-      parent.selection_range == Range::new(Position::new(0, 0), Position::new(0, 6)),
-      "an implicit dotted-key table must select its real parent key",
-    )?;
-    let parent_children = ensure_some(parent.children.as_deref(), "the dotted parent symbol must retain nested children")?;
-    let child = ensure_some(named(parent_children, "child"), "the dotted child symbol must exist")?;
-    ensure(
-      child.selection_range == Range::new(Position::new(0, 7), Position::new(0, 12)),
-      "a dotted child must select only its own key segment",
-    )?;
-
-    let table = ensure_some(named(&symbols, "table"), "the table symbol must exist")?;
-    ensure(
-      table.selection_range == Range::new(Position::new(1, 1), Position::new(1, 6)),
-      "a table symbol must select the key inside its header delimiters",
     )
+    .map(|document| {
+      let symbols = create_symbols(&document);
+      (document, symbols)
+    });
+    ensure_that(
+      observed,
+      "nested document symbols must select their own dotted or table-header keys",
+      |result| {
+        let Ok(ref projection) = *result else {
+          return false;
+        };
+        let Ok(ref symbols) = projection.1 else {
+          return false;
+        };
+        named(symbols, "parent").is_some_and(|parent| {
+          parent.selection_range == Range::new(Position::new(0, 0), Position::new(0, 6))
+            && parent
+              .children
+              .as_deref()
+              .and_then(|children| named(children, "child"))
+              .is_some_and(|child| child.selection_range == Range::new(Position::new(0, 7), Position::new(0, 12)))
+        }) && named(symbols, "table").is_some_and(|table| table.selection_range == Range::new(Position::new(1, 1), Position::new(1, 6)))
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn heap_backed_symbol_walk_preserves_deep_array_nesting() -> Result<(), TestFailure> {
+  fn heap_backed_symbol_walk_preserves_deep_array_nesting() -> Result<(), impl Debug> {
     let depth = 512;
     let source = format!("root = {}0{}\n", "[".repeat(depth), "]".repeat(depth));
-    let document = parse_document(&source, "the deeply nested document-symbol fixture must parse")?;
-    let symbols = ensure_ok(create_symbols(&document), "the heap-backed symbol walk must complete")?;
-    let mut level = ensure_some(named(&symbols, "root"), "the root array symbol must exist")?;
-    for expected_name in repeat_n("0", depth) {
-      let children = ensure_some(level.children.as_deref(), "every nested array level must retain its child")?;
-      level = ensure_some(
-        named(children, expected_name),
-        "each nested array child must preserve its numeric name",
-      )?;
-    }
-    ensure_eq(
-      &level.name,
-      &String::from("0"),
-      "the deepest scalar must remain reachable after iterative traversal",
+    let observed = parse_document(&source, "the deeply nested document-symbol fixture must parse").map(|document| {
+      let symbols = create_symbols(&document);
+      (document, symbols)
+    });
+    ensure_that(
+      observed,
+      "iterative traversal must retain every nested array child and the deepest scalar",
+      |result| {
+        let Ok(ref projection) = *result else {
+          return false;
+        };
+        let Ok(ref symbols) = projection.1 else {
+          return false;
+        };
+        let Some(root) = named(symbols, "root") else {
+          return false;
+        };
+        repeat_n("0", depth)
+          .try_fold(root, |level, name| {
+            level.children.as_deref().and_then(|children| named(children, name))
+          })
+          .is_some_and(|level| level.name == "0")
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

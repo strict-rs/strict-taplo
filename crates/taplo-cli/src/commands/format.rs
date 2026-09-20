@@ -281,113 +281,83 @@ fn render_diff(path: &Path, original: &str, formatted: &str, colors: bool) -> St
   output
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
+  use std::fmt::Debug;
   use std::path::Path;
 
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_contains;
   use strict_test_support::ensure_eq;
-  use strict_test_support::ensure_lacks;
+  use strict_test_support::ensure_that;
 
   use super::append_equal_context;
   use super::render_diff;
 
   #[test]
-  fn equal_diff_context_preserves_short_interiors_and_bounds_long_edges() -> Result<(), TestFailure> {
-    let mut visible = Vec::new();
+  fn equal_diff_context_preserves_short_interiors_and_bounds_long_edges() -> Result<(), impl Debug> {
     let short = ["middle-a", "middle-b"];
-    let short_length = append_equal_context(&short, 1, 3, &mut visible);
-    ensure_eq(
-      &short_length,
-      &short.len(),
-      "a short unchanged segment between edits must remain complete",
-    )?;
-    ensure(
-      visible.iter().map(String::as_str).collect::<Vec<_>>() == short,
-      "a short interior context segment must retain every unchanged line in order",
-    )?;
-
     let long = [
       "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen",
       "fifteen",
     ];
-    visible.clear();
-    let leading_length = append_equal_context(&long, 0, 2, &mut visible);
-    ensure_eq(
-      &leading_length,
-      &super::DIFF_CONTEXT_LINES,
-      "leading unchanged content must expose only the trailing context window",
-    )?;
-    ensure(
-      visible.iter().map(String::as_str).collect::<Vec<_>>() == ["nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen"],
-      "leading context must retain the lines closest to the following edit",
-    )?;
-
-    visible.clear();
-    let trailing_length = append_equal_context(&long, 1, 2, &mut visible);
-    ensure_eq(
-      &trailing_length,
-      &super::DIFF_CONTEXT_LINES,
-      "trailing unchanged content must expose only the leading context window",
-    )?;
-    ensure(
-      visible.iter().map(String::as_str).collect::<Vec<_>>() == ["zero", "one", "two", "three", "four", "five", "six"],
-      "trailing context must retain the lines closest to the preceding edit",
-    )?;
-
-    visible.clear();
-    let middle_length = append_equal_context(&long, 1, 3, &mut visible);
-    ensure_eq(
-      &middle_length,
-      &super::DIFF_CONTEXT_LINES.saturating_mul(2),
-      "a long interior segment must expose one context window beside each edit",
-    )?;
-    ensure(
-      visible.iter().map(String::as_str).collect::<Vec<_>>()
-        == [
+    let observed = [(&short[..], 1, 3), (&long[..], 0, 2), (&long[..], 1, 2), (&long[..], 1, 3)].map(|(lines, index, count)| {
+      let mut visible = Vec::new();
+      let length = append_equal_context(lines, index, count, &mut visible);
+      (length, visible)
+    });
+    let expected = [
+      (short.len(), &short[..]),
+      (
+        super::DIFF_CONTEXT_LINES,
+        &["nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen"][..],
+      ),
+      (
+        super::DIFF_CONTEXT_LINES,
+        &["zero", "one", "two", "three", "four", "five", "six"][..],
+      ),
+      (
+        super::DIFF_CONTEXT_LINES.saturating_mul(2),
+        &[
           "zero", "one", "two", "three", "four", "five", "six", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen",
-        ],
-      "long interior context must retain both edit-adjacent windows without the distant middle",
+        ][..],
+      ),
+    ]
+    .map(|(length, lines)| (length, lines.iter().map(|line| (*line).to_owned()).collect::<Vec<_>>()));
+    ensure_eq(
+      observed,
+      expected,
+      "diff context must preserve complete short interiors and exact windows beside long-segment edits",
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn rendered_diffs_distinguish_insert_remove_replace_context_and_color() -> Result<(), TestFailure> {
+  fn rendered_diffs_distinguish_insert_remove_replace_context_and_color() -> Result<(), impl Debug> {
     let path = Path::new("nested/document.toml");
-    let inserted = render_diff(path, "keep\n", "keep\nadded\n", false);
-    ensure_contains(
-      &inserted,
-      "diff a/nested/document.toml b/nested/document.toml",
-      "diff output must identify both sides of the selected path",
-    )?;
-    ensure_contains(&inserted, "+added", "an insertion must be rendered with the added-line prefix")?;
-    ensure_lacks(&inserted, "-added", "an insertion must not fabricate a removed counterpart")?;
-    ensure_contains(
-      &inserted,
-      "keep",
-      "an edit beside unchanged content must retain its bounded context",
-    )?;
-
-    let removed = render_diff(path, "keep\nremoved\n", "keep\n", false);
-    ensure_contains(&removed, "-removed", "a removal must be rendered with the removed-line prefix")?;
-    ensure_lacks(&removed, "+removed", "a removal must not fabricate an inserted counterpart")?;
-
-    let replaced = render_diff(path, "old\n", "new\n", true);
-    ensure_contains(
-      &replaced,
-      "\u{1b}[31m-old\u{1b}[0m",
-      "colored replacement output must style the removed line in red",
-    )?;
-    ensure_contains(
-      &replaced,
-      "\u{1b}[32m+new\u{1b}[0m",
-      "colored replacement output must style the inserted line in green",
-    )?;
-    ensure(
-      [replaced.contains("\n-old\n"), replaced.contains("\n+new\n")] == [false, false],
-      "colored replacement output must not duplicate unstyled edit lines",
+    let observed = [
+      render_diff(path, "keep\n", "keep\nadded\n", false),
+      render_diff(path, "keep\nremoved\n", "keep\n", false),
+      render_diff(path, "old\n", "new\n", true),
+    ];
+    ensure_that(
+      observed,
+      "rendered diffs must preserve path headers, bounded context, edit polarity, and unique colored replacements",
+      |actual| {
+        let [ref inserted, ref removed, ref replaced] = *actual;
+        inserted.contains("diff a/nested/document.toml b/nested/document.toml")
+          && inserted.contains("+added")
+          && !inserted.contains("-added")
+          && inserted.contains("keep")
+          && removed.contains("-removed")
+          && !removed.contains("+removed")
+          && replaced.contains("\u{1b}[31m-old\u{1b}[0m")
+          && replaced.contains("\u{1b}[32m+new\u{1b}[0m")
+          && !replaced.contains("\n-old\n")
+          && !replaced.contains("\n+new\n")
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

@@ -38,6 +38,7 @@ pub(super) enum DiagnosticError {
 }
 
 /// One current diagnostics result ready for protocol output.
+#[derive(Debug)]
 pub(super) struct DiagnosticBatch {
   /// Document URI on the LSP wire.
   pub(super) uri:         Uri,
@@ -356,12 +357,15 @@ fn single_dom_error(document: &DocumentState, source_range: TextRange, message: 
 
 #[cfg(test)]
 mod tests {
+  use std::fmt::Debug;
+
+  use lsp_types::Diagnostic;
   use lsp_types::DiagnosticSeverity;
   use lsp_types::Uri;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
+  use strict_test_support::ResultFailure;
   use strict_test_support::ensure_ok;
-  use strict_test_support::ensure_some;
+  use strict_test_support::ensure_that;
+  use taplo_lsp_async::util::MappingError;
   use url::Url;
 
   use super::cleared_diagnostics;
@@ -369,173 +373,197 @@ mod tests {
   use super::collect_syntax_errors;
   use super::excluded_diagnostics;
   use crate::handlers::test_support::parse_document;
+  use crate::world::DocumentState;
+  use crate::world::WorldError;
+
+  /// A complete parsed document and its native diagnostic projection.
+  type SemanticObservation = (DocumentState, Result<Vec<Diagnostic>, MappingError>);
+
+  /// Expected diagnostic contract alongside its complete semantic observation.
+  type SemanticCase<Expected> = (Expected, Result<SemanticObservation, Box<ResultFailure<WorldError>>>);
 
   /// Parse one absolute document URL used by diagnostic wire fixtures.
-  fn document_url() -> Result<Url, TestFailure> {
+  fn document_url() -> Result<Url, ResultFailure<url::ParseError>> {
     ensure_ok(
       Url::parse("file:///workspace/diagnostics.toml"),
       "the diagnostic document URL must parse",
     )
   }
 
-  /// Convert the diagnostic fixture URL into its LSP wire URI.
-  fn document_wire_uri() -> Result<Uri, TestFailure> {
-    ensure_some(
-      super::super::uri::to_uri(&document_url()?),
-      "the diagnostic document URL must convert to an LSP URI",
-    )
+  /// Preserve a complete semantic fixture and its native diagnostic projection.
+  fn semantic_observation(source: &str, uri: &Uri) -> Result<SemanticObservation, Box<ResultFailure<WorldError>>> {
+    parse_document(source, "the semantic-diagnostic document must construct").map(|document| {
+      let diagnostics = collect_dom_errors(&document, uri);
+      (document, diagnostics)
+    })
   }
 
   #[test]
-  fn syntax_diagnostics_preserve_error_ranges_while_clean_source_stays_empty() -> Result<(), TestFailure> {
-    let malformed = parse_document("value =\n", "the recoverable syntax-error document must construct")?;
-    let diagnostics = ensure_ok(
-      collect_syntax_errors(&malformed),
-      "recoverable parser diagnostics must map to LSP coordinates",
-    )?;
-    ensure(
-      !diagnostics.is_empty(),
-      "recoverable malformed source must produce at least one parser diagnostic",
-    )?;
-    ensure(
-      diagnostics.iter().all(|diagnostic| {
-        (diagnostic.severity, diagnostic.source.as_deref(), diagnostic.message.is_empty())
-          == (Some(DiagnosticSeverity::ERROR), Some("Even Better TOML"), false)
-      }),
-      "every parser diagnostic must retain its error severity, source, and message",
-    )?;
-
-    let clean = parse_document("value = 1\n", "the clean diagnostic document must construct")?;
-    ensure(
-      ensure_ok(collect_syntax_errors(&clean), "clean parser state must remain mappable")?.is_empty(),
-      "clean source must not fabricate parser diagnostics",
+  fn syntax_diagnostics_preserve_error_ranges_while_clean_source_stays_empty() -> Result<(), impl Debug> {
+    let observed = ["value =\n", "value = 1\n"].map(|source| {
+      parse_document(source, "the syntax-diagnostic document must construct").map(|document| {
+        let diagnostics = collect_syntax_errors(&document);
+        (document, diagnostics)
+      })
+    });
+    ensure_that(
+      observed,
+      "malformed syntax must retain error ranges, source and messages while clean source remains empty",
+      |fixtures| {
+        let [ref malformed, ref clean] = *fixtures;
+        let Ok(ref malformed_fixture) = *malformed else {
+          return false;
+        };
+        let Ok(ref diagnostics) = malformed_fixture.1 else {
+          return false;
+        };
+        !diagnostics.is_empty()
+          && diagnostics.iter().all(|diagnostic| {
+            (diagnostic.severity, diagnostic.source.as_deref(), diagnostic.message.is_empty())
+              == (Some(DiagnosticSeverity::ERROR), Some("Even Better TOML"), false)
+          })
+          && clean.as_ref().is_ok_and(|fixture| fixture.1.as_ref().is_ok_and(Vec::is_empty))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn semantic_diagnostics_cover_paired_source_contracts() -> Result<(), TestFailure> {
-    let uri = document_wire_uri()?;
-    for (source, expected_message, context) in [
-      (
-        "a = 1\na = 2\n",
-        "conflicting keys",
-        "conflicting keys must retain paired diagnostics",
-      ),
-      (
-        "a = 1\n[a.b]\n",
-        "expected table",
-        "table requirements must retain paired diagnostics",
-      ),
-      (
-        "a = 1\n[[a]]\n",
-        "expected array of tables",
-        "array-of-table requirements must retain paired diagnostics",
-      ),
-    ] {
-      let document = parse_document(source, "the semantic-diagnostic document must construct")?;
-      let diagnostics = ensure_ok(
-        collect_dom_errors(&document, &uri),
-        "semantic diagnostics must map to complete LSP values",
-      )?;
+  fn semantic_diagnostics_cover_paired_source_contracts() -> Result<(), impl Debug> {
+    let observed = document_url().map(|url| {
+      let wire = super::super::uri::to_uri(&url);
+      let cases = wire.as_ref().map(|uri| {
+        [
+          ("a = 1\na = 2\n", "conflicting keys"),
+          ("a = 1\n[a.b]\n", "expected table"),
+          ("a = 1\n[[a]]\n", "expected array of tables"),
+        ]
+        .map(|(source, message)| (message, semantic_observation(source, uri)))
+      });
+      (url, wire, cases)
+    });
+    let matches_paired = |case: &SemanticCase<&str>| {
+      let Ok(ref fixture) = case.1 else {
+        return false;
+      };
+      let Ok(ref diagnostics) = fixture.1 else {
+        return false;
+      };
       let matching = diagnostics
         .iter()
-        .filter(|diagnostic| diagnostic.message == expected_message)
+        .filter(|diagnostic| diagnostic.message == case.0)
         .collect::<Vec<_>>();
-      ensure(matching.len() == 2, context)?;
-      let primary = ensure_some(
-        matching.first().copied(),
-        "a paired semantic diagnostic must retain its primary side",
-      )?;
-      let related = ensure_some(
-        matching.get(1).copied(),
-        "a paired semantic diagnostic must retain its contextual side",
-      )?;
-      ensure(
-        (
-          primary.severity,
-          related.severity,
-          primary.related_information.as_ref().map(Vec::len),
-          related.related_information.as_ref().map(Vec::len),
-        ) == (Some(DiagnosticSeverity::ERROR), Some(DiagnosticSeverity::HINT), Some(1), Some(1)),
-        "paired semantic diagnostics must retain error/hint polarity and reciprocal source context",
-      )?;
-    }
-    Ok(())
+      matching.len() == 2
+        && matching.first().zip(matching.get(1)).map(|(primary, related)| {
+          (
+            primary.severity,
+            related.severity,
+            primary.related_information.as_ref().map(Vec::len),
+            related.related_information.as_ref().map(Vec::len),
+          )
+        }) == Some((Some(DiagnosticSeverity::ERROR), Some(DiagnosticSeverity::HINT), Some(1), Some(1)))
+    };
+    ensure_that(
+      observed,
+      "paired semantic diagnostics must retain both source locations, error/hint polarity and reciprocal context",
+      |result| {
+        let Ok(ref scenario) = *result else {
+          return false;
+        };
+        let Some(ref cases) = scenario.2 else {
+          return false;
+        };
+        cases.iter().all(matches_paired)
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn semantic_diagnostics_cover_single_source_and_clean_contracts() -> Result<(), TestFailure> {
-    let uri = document_wire_uri()?;
-    for (source, expected_prefix, context) in [
-      (
-        "\"\\q\" = 1\n",
-        "the string contains invalid escape sequence(s)",
-        "invalid key escapes must retain one source diagnostic",
-      ),
-      (
-        "value = 999999999999999999999999999999\n",
-        "the integer scalar could not be decoded:",
-        "malformed integers must retain one typed decode diagnostic",
-      ),
-      (
-        "missing =\nnext = 1\n",
-        "the syntax was not expected here:",
-        "missing values must retain one unexpected-source diagnostic",
-      ),
-    ] {
-      let document = parse_document(source, "the semantic-diagnostic document must construct")?;
-      let diagnostics = ensure_ok(
-        collect_dom_errors(&document, &uri),
-        "semantic diagnostics must map to complete LSP values",
-      )?;
-      let matching = diagnostics
-        .iter()
-        .filter(|diagnostic| diagnostic.message.starts_with(expected_prefix))
-        .collect::<Vec<_>>();
-      ensure(matching.len() == 1, context)?;
-      ensure(
-        matching
-          .first()
-          .is_some_and(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR)),
-        "single-source semantic diagnostics must retain error severity",
-      )?;
-    }
-
-    let clean = parse_document("value = 1\n", "the clean semantic-diagnostic document must construct")?;
-    ensure(
-      ensure_ok(collect_dom_errors(&clean, &uri), "clean semantic state must remain mappable")?.is_empty(),
-      "clean semantic state must not fabricate diagnostics",
+  fn semantic_diagnostics_cover_single_source_and_clean_contracts() -> Result<(), impl Debug> {
+    let observed = document_url().map(|url| {
+      let wire = super::super::uri::to_uri(&url);
+      let cases = wire.as_ref().map(|uri| {
+        [
+          ("\"\\q\" = 1\n", Some("the string contains invalid escape sequence(s)")),
+          (
+            "value = 999999999999999999999999999999\n",
+            Some("the integer scalar could not be decoded:"),
+          ),
+          ("missing =\nnext = 1\n", Some("the syntax was not expected here:")),
+          ("value = 1\n", None),
+        ]
+        .map(|(source, prefix)| (prefix, semantic_observation(source, uri)))
+      });
+      (url, wire, cases)
+    });
+    let matches_single = |case: &SemanticCase<Option<&str>>| {
+      let Ok(ref fixture) = case.1 else {
+        return false;
+      };
+      let Ok(ref diagnostics) = fixture.1 else {
+        return false;
+      };
+      case.0.map_or_else(
+        || diagnostics.is_empty(),
+        |prefix| {
+          diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.starts_with(prefix))
+            .map(|diagnostic| diagnostic.severity)
+            .eq([Some(DiagnosticSeverity::ERROR)])
+        },
+      )
+    };
+    ensure_that(
+      observed,
+      "single-source semantic errors must retain error severity while clean semantic state remains empty",
+      |result| {
+        let Ok(ref scenario) = *result else {
+          return false;
+        };
+        let Some(ref cases) = scenario.2 else {
+          return false;
+        };
+        cases.iter().all(matches_single)
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn cleared_and_excluded_batches_map_to_complete_publish_payloads() -> Result<(), TestFailure> {
-    let url = document_url()?;
-    let cleared = ensure_ok(
-      cleared_diagnostics(&url),
-      "a closed document must produce a cleared diagnostics batch",
-    )?;
-    ensure(
-      cleared.diagnostics.is_empty(),
-      "a cleared diagnostics batch must contain no stale entries",
-    )?;
-
-    let excluded = ensure_ok(
-      excluded_diagnostics(&url),
-      "an excluded document must produce its explanatory diagnostics batch",
-    )?;
-    let excluded_observation = excluded
-      .diagnostics
-      .first()
-      .map(|diagnostic| (diagnostic.severity, diagnostic.message.as_str()));
-    ensure(
-      (excluded.diagnostics.len(), excluded_observation) == (1, Some((Some(DiagnosticSeverity::HINT), "this document has been excluded"))),
-      "an excluded document must publish exactly one explanatory hint",
-    )?;
-    let published = super::super::documents::publish_params(excluded);
-    ensure(
-      (published.uri, published.version, published.diagnostics.len()) == (cleared.uri, None, 1),
-      "diagnostic publication must preserve the URI, omit a version, and retain the complete batch",
+  fn cleared_and_excluded_batches_map_to_complete_publish_payloads() -> Result<(), impl Debug> {
+    let observed = document_url().map(|url| {
+      let cleared = cleared_diagnostics(&url);
+      let excluded = excluded_diagnostics(&url).map(super::super::documents::publish_params);
+      (url, cleared, excluded)
+    });
+    ensure_that(
+      observed,
+      "cleared publication must remove stale entries and excluded publication must retain one unversioned explanatory hint",
+      |result| {
+        let Ok(ref scenario) = *result else {
+          return false;
+        };
+        let Ok(ref cleared) = scenario.1 else {
+          return false;
+        };
+        let Ok(ref published) = scenario.2 else {
+          return false;
+        };
+        cleared.diagnostics.is_empty()
+          && published.uri == cleared.uri
+          && published.version.is_none()
+          && published.diagnostics.len() == 1
+          && published.diagnostics.first().is_some_and(|diagnostic| {
+            (diagnostic.severity, diagnostic.message.as_str()) == (Some(DiagnosticSeverity::HINT), "this document has been excluded")
+          })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

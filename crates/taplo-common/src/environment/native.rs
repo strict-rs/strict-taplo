@@ -270,13 +270,16 @@ async fn find_config_file(from: &Path) -> Result<Option<PathBuf>, EnvironmentErr
 
 #[cfg(test)]
 mod tests {
+  use std::fmt::Debug;
   use std::fs;
+  use std::io;
   use std::io::ErrorKind;
   use std::io::IsTerminal as _;
   use std::io::stderr;
   #[cfg(unix)]
   use std::os::unix::fs::symlink;
   use std::path::Path;
+  #[cfg(not(unix))]
   use std::path::PathBuf;
   use std::process::id;
   use std::sync::Arc;
@@ -284,11 +287,7 @@ mod tests {
   use std::sync::atomic::Ordering;
 
   use strict_test_support::TempDir;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_eq;
-  use strict_test_support::ensure_ok;
-  use strict_test_support::ensure_some;
+  use strict_test_support::ensure_that;
   use tokio::runtime::Builder;
   use tokio::runtime::Runtime;
   use tokio::task::yield_now;
@@ -301,375 +300,299 @@ mod tests {
   use crate::environment::EnvironmentError;
   use crate::environment::LocalEnvironment as _;
 
+  /// Native filesystem setup, discovery, and cleanup of a rejected metadata candidate.
+  #[cfg(not(unix))]
+  type MetadataFailure = (PathBuf, io::Result<()>, Result<Option<PathBuf>, EnvironmentError>, io::Result<()>);
+
   /// Construct the current-thread executor required by native host operations.
-  fn test_runtime() -> Result<Runtime, TestFailure> {
-    ensure_ok(
-      Builder::new_current_thread().enable_all().build(),
-      "the native-environment test runtime must initialize",
-    )
-  }
-
-  /// Project one typed I/O failure into its comparable operation, path, and kind facts.
-  fn io_failure_facts(failure: EnvironmentError) -> Option<(&'static str, PathBuf, ErrorKind)> {
-    if let EnvironmentError::Io {
-      operation,
-      path,
-      source,
-    } = failure
-    {
-      Some((operation, path, source.kind()))
-    } else {
-      None
-    }
+  fn test_runtime() -> io::Result<Runtime> {
+    Builder::new_current_thread().enable_all().build()
   }
 
   #[test]
-  fn runtime_capture_and_process_facts_preserve_both_capability_polarities() -> Result<(), TestFailure> {
-    ensure(
-      matches!(
-        NativeEnvironment::new(),
-        Err(EnvironmentError::RuntimeUnavailable {
-          message
-        }) if !message.is_empty()
-      ),
-      "native environment construction must reject a thread without an entered Tokio runtime",
-    )?;
+  fn runtime_capture_and_process_facts_preserve_both_capability_polarities() -> Result<(), impl Debug> {
+    let outside_runtime = NativeEnvironment::new();
+    let runtime = test_runtime();
+    let environment = runtime
+      .as_ref()
+      .ok()
+      .map(|executor| executor.block_on(async { NativeEnvironment::new() }));
+    let observations = environment
+      .as_ref()
+      .and_then(|result| result.as_ref().ok())
+      .zip(runtime.as_ref().ok())
+      .map(|(host, executor)| {
+        let now = host.now();
+        let path = host.env_var("PATH");
+        let variables = host.env_vars();
+        let absent = host.env_var(&format!("TAPLO_TEST_ABSENT_{}", id()));
+        let terminal = host.atty_stderr();
+        let local = host.spawn_local(async {});
+        let completed = Arc::new(AtomicBool::new(false));
+        let task_observation = Arc::clone(&completed);
+        host.spawn(async move {
+          task_observation.store(true, Ordering::Release);
+        });
+        executor.block_on(yield_now());
+        (now, path, variables, absent, terminal, local, completed.load(Ordering::Acquire))
+      });
+    ensure_that(
+      (outside_runtime, runtime, environment, observations),
+      "native runtime capture and process facts must retain both capability polarities",
+      |actual| {
+        let Some(ref facts) = actual.3 else {
+          return false;
+        };
+        let Ok(Some(ref process_path)) = facts.1 else {
+          return false;
+        };
+        matches!(&actual.0, Err(EnvironmentError::RuntimeUnavailable { message }) if !message.is_empty())
+          && facts
+            .0
+            .as_ref()
+            .is_ok_and(|instant| *instant > time::OffsetDateTime::UNIX_EPOCH)
+          && !process_path.is_empty()
+          && facts.2.as_ref().is_ok_and(|variables| {
+            variables
+              .iter()
+              .any(|variable| variable.0 == "PATH" && &variable.1 == process_path)
+          })
+          && matches!(&facts.3, Ok(None))
+          && facts.4.as_ref().is_ok_and(|terminal| *terminal == stderr().is_terminal())
+          && matches!(&facts.5, Err(EnvironmentError::LocalExecutorUnavailable))
+          && facts.6
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
+  }
 
-    let runtime = test_runtime()?;
-    let environment = ensure_ok(
-      runtime.block_on(async { NativeEnvironment::new() }),
-      "native environment construction must capture an entered Tokio runtime",
-    )?;
-    ensure(
-      ensure_ok(environment.now(), "the native clock must be readable")? > time::OffsetDateTime::UNIX_EPOCH,
-      "the native clock must report a post-epoch UTC instant",
-    )?;
-    let path = ensure_some(
-      ensure_ok(environment.env_var("PATH"), "the native process environment must be readable")?,
-      "the native test process must expose PATH",
-    )?;
-    ensure(!path.is_empty(), "the native PATH value must not be empty")?;
-    let variables = ensure_ok(environment.env_vars(), "all native process environment entries must be readable")?;
-    ensure(
-      variables
-        .iter()
-        .any(|variable| (variable.0.as_str(), variable.1.as_str()) == ("PATH", path.as_str())),
-      "bulk environment enumeration must retain the individually observed PATH entry",
-    )?;
-    let absent_name = format!("TAPLO_TEST_ABSENT_{}", id());
-    ensure(
-      ensure_ok(
-        environment.env_var(&absent_name),
-        "an absent native environment entry must remain readable",
-      )?
-      .is_none(),
-      "an unconfigured native environment entry must remain absent",
-    )?;
-    ensure_eq(
-      &ensure_ok(environment.atty_stderr(), "native terminal detection must succeed")?,
-      &stderr().is_terminal(),
-      "native terminal detection must reflect the actual standard-error handle",
-    )?;
-
-    ensure(
-      matches!(environment.spawn_local(async {}), Err(EnvironmentError::LocalExecutorUnavailable)),
-      "the concurrent native host must reject local-only task spawning",
-    )?;
-    let task_completed = Arc::new(AtomicBool::new(false));
-    let task_observation = Arc::clone(&task_completed);
-    environment.spawn(async move {
-      task_observation.store(true, Ordering::Release);
+  #[test]
+  fn native_path_capabilities_round_trip_and_reject_incompatible_inputs() -> Result<(), impl Debug> {
+    let runtime = test_runtime();
+    let remote_url = Url::parse("https://example.invalid/schema.json");
+    let observed = runtime.as_ref().ok().map(|executor| {
+      let environment = NativeEnvironment::from_handle(executor.handle().clone());
+      let cwd = environment.cwd();
+      let normalized = environment.cwd_normalized();
+      let file_url = cwd
+        .as_ref()
+        .ok()
+        .and_then(Option::as_ref)
+        .map(|directory| environment.to_file_url(directory));
+      let roundtrip = file_url
+        .as_ref()
+        .and_then(|result| result.as_ref().ok())
+        .and_then(Option::as_ref)
+        .map(|url| (environment.to_file_path(url), environment.to_file_path_normalized(url)));
+      let remote = remote_url.as_ref().ok().map(|url| environment.to_file_path(url));
+      let relative = environment.to_file_url(Path::new("relative.toml"));
+      let absolute = cwd
+        .as_ref()
+        .ok()
+        .and_then(Option::as_ref)
+        .map(|directory| environment.is_absolute(directory));
+      let relative_classification = environment.is_absolute(Path::new("relative.toml"));
+      (
+        cwd, normalized, file_url, roundtrip, remote, relative, absolute, relative_classification,
+      )
     });
-    runtime.block_on(yield_now());
-    ensure(
-      task_completed.load(Ordering::Acquire),
-      "the captured native runtime handle must execute spawned concurrent tasks",
+    ensure_that(
+      (runtime, remote_url, observed),
+      "native paths must round-trip while relative paths and non-file URLs remain unrepresentable",
+      |actual| {
+        let Some(ref paths) = actual.2 else {
+          return false;
+        };
+        let Ok(Some(ref directory)) = paths.0 else {
+          return false;
+        };
+        let Some(ref roundtrip) = paths.3 else {
+          return false;
+        };
+        directory.is_absolute()
+          && roundtrip.0.as_ref().is_ok_and(|path| path.as_ref() == Some(directory))
+          && roundtrip
+            .1
+            .as_ref()
+            .is_ok_and(|path| path.as_ref().is_some_and(|value| value.is_absolute()))
+          && paths
+            .1
+            .as_ref()
+            .is_ok_and(|path| path.as_ref().is_some_and(|value| value.is_absolute()))
+          && matches!(&paths.4, Some(Ok(None)))
+          && matches!(&paths.5, Ok(None))
+          && matches!(&paths.6, Some(Ok(true)))
+          && matches!(&paths.7, Ok(false))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn native_path_capabilities_round_trip_and_reject_incompatible_inputs() -> Result<(), TestFailure> {
-    let runtime = test_runtime()?;
-    let environment = NativeEnvironment::from_handle(runtime.handle().clone());
-    let working_directory = ensure_some(
-      ensure_ok(environment.cwd(), "the native current directory must be readable")?,
-      "the native host must expose a current directory",
-    )?;
-    ensure(working_directory.is_absolute(), "the native current directory must be absolute")?;
-    ensure(
-      ensure_some(
-        ensure_ok(
-          environment.cwd_normalized(),
-          "the normalized native current directory must be readable",
-        )?,
-        "the normalized native host must retain its current directory",
-      )?
-      .is_absolute(),
-      "normalization must preserve current-directory absoluteness",
-    )?;
-
-    let file_url = ensure_some(
-      ensure_ok(
-        environment.to_file_url(&working_directory),
-        "an absolute native path must convert to a file URL",
-      )?,
-      "an absolute native path must have a file-URL representation",
-    )?;
-    ensure(
-      ensure_ok(environment.to_file_path(&file_url), "a native file URL must convert back to a path")? == Some(working_directory.clone()),
-      "native path and file-URL conversion must round-trip",
-    )?;
-    ensure(
-      ensure_ok(
-        environment.to_file_path_normalized(&file_url),
-        "a native file URL must convert to a normalized path",
-      )?
-      .is_some_and(|path| path.is_absolute()),
-      "normalized native file-URL conversion must retain an absolute path",
-    )?;
-    let remote_url = ensure_ok(
-      Url::parse("https://example.invalid/schema.json"),
-      "the non-file URL fixture must parse",
-    )?;
-    ensure(
-      ensure_ok(
-        environment.to_file_path(&remote_url),
-        "a non-file URL must be handled without a host callback failure",
-      )?
-      .is_none(),
-      "a non-file URL must not fabricate a native filesystem path",
-    )?;
-    ensure(
-      ensure_ok(
-        environment.to_file_url(Path::new("relative.toml")),
-        "a relative path must be handled without a host callback failure",
-      )?
-      .is_none(),
-      "a relative path must not fabricate an absolute file URL",
-    )?;
-    ensure(
-      ensure_ok(
-        environment.is_absolute(&working_directory),
-        "absolute-path classification must succeed",
-      )?,
-      "the native path classifier must accept the current directory",
-    )?;
-    ensure(
-      !ensure_ok(
-        environment.is_absolute(Path::new("relative.toml")),
-        "relative-path classification must succeed",
-      )?,
-      "the native path classifier must reject a relative path",
+  fn native_file_operations_replace_atomically_across_execution_models() -> Result<(), impl Debug> {
+    let fixture = TempDir::new("taplo-native-io");
+    let runtime = test_runtime();
+    let observed = fixture.as_ref().ok().zip(runtime.as_ref().ok()).map(|(directory, executor)| {
+      let environment = NativeEnvironment::from_handle(executor.handle().clone());
+      let document = directory.child("document.toml");
+      let local_write = executor.block_on(environment.write_file(&document, b"value = 1\n"));
+      let local_read = executor.block_on(environment.read_file(&document));
+      let concurrent_write = executor.block_on(environment.write_file_concurrent(document.clone(), b"value = 2\n".to_vec()));
+      let concurrent_read = executor.block_on(environment.read_file_concurrent(document.clone()));
+      let committed = fs::read(&document);
+      (document, local_write, local_read, concurrent_write, concurrent_read, committed)
+    });
+    ensure_that(
+      (fixture, runtime, observed),
+      "local and concurrent native writes must commit complete atomic replacements",
+      |actual| {
+        let Some(ref io) = actual.2 else {
+          return false;
+        };
+        io.1.is_ok()
+          && io.2.as_ref().is_ok_and(|bytes| bytes == b"value = 1\n")
+          && io.3.is_ok()
+          && io.4.as_ref().is_ok_and(|bytes| bytes == b"value = 2\n")
+          && io.5.as_ref().is_ok_and(|bytes| bytes == b"value = 2\n")
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn native_file_operations_replace_atomically_across_execution_models() -> Result<(), TestFailure> {
-    let fixture = TempDir::new("taplo-native-io")?;
-    let runtime = test_runtime()?;
-    let environment = NativeEnvironment::from_handle(runtime.handle().clone());
-    let document = fixture.child("document.toml");
-
-    ensure_ok(
-      runtime.block_on(environment.write_file(&document, b"value = 1\n")),
-      "the local native writer must create a file atomically",
-    )?;
-    ensure(
-      ensure_ok(
-        runtime.block_on(environment.read_file(&document)),
-        "the local native reader must read the created file",
-      )? == b"value = 1\n",
-      "the local native reader must preserve exact bytes",
-    )?;
-    ensure_ok(
-      runtime.block_on(environment.write_file_concurrent(document.clone(), b"value = 2\n".to_vec())),
-      "the concurrent native writer must replace the file atomically",
-    )?;
-    ensure(
-      ensure_ok(
-        runtime.block_on(environment.read_file_concurrent(document.clone())),
-        "the concurrent native reader must read the replacement",
-      )? == b"value = 2\n",
-      "the concurrent native reader must observe the complete replacement",
-    )?;
-    ensure(
-      ensure_ok(fs::read(&document), "the atomically replaced host file must remain readable")? == b"value = 2\n",
-      "atomic replacement must commit the exact requested bytes",
-    )
-  }
-
-  #[test]
-  fn missing_native_reads_preserve_operation_path_and_kind_in_both_execution_models() -> Result<(), TestFailure> {
-    let fixture = TempDir::new("taplo-native-missing")?;
-    let runtime = test_runtime()?;
-    let environment = NativeEnvironment::from_handle(runtime.handle().clone());
-    let missing = fixture.child("missing.toml");
-
-    let local_failure = ensure_some(
-      runtime.block_on(environment.read_file(&missing)).err(),
-      "a missing local file must return a typed failure",
-    )?;
-    ensure(
-      io_failure_facts(local_failure) == Some(("read_file", missing.clone(), ErrorKind::NotFound)),
-      "a missing local file must retain its operation, path, and typed I/O source",
-    )?;
-    let concurrent_failure = ensure_some(
-      runtime.block_on(environment.read_file_concurrent(missing.clone())).err(),
-      "a missing concurrent file must return a typed failure",
-    )?;
-    ensure(
-      io_failure_facts(concurrent_failure) == Some(("read_file", missing, ErrorKind::NotFound)),
-      "a missing concurrent file must retain its operation, path, and typed I/O source",
-    )
-  }
-
-  #[test]
-  fn atomic_writes_reject_invalid_targets_and_remove_temporary_files() -> Result<(), TestFailure> {
-    let fixture = TempDir::new("taplo-native-atomic-write")?;
-    let runtime = test_runtime()?;
-
-    ensure(
-      matches!(
-        runtime.block_on(atomic_write(Path::new("/"), b"invalid")),
-        Err(EnvironmentError::Io {
-          operation: "create_atomic_write_path",
-          source,
-          ..
-        }) if source.kind() == ErrorKind::InvalidInput
-      ),
-      "an ownerless path must be rejected before an atomic temporary file is created",
-    )?;
-    let missing_parent = fixture.child("absent").join("document.toml");
-    ensure(
-      matches!(
-        runtime.block_on(atomic_write(&missing_parent, b"invalid")),
-        Err(EnvironmentError::Io {
-          operation: "create_atomic_write",
-          ..
+  fn missing_native_reads_preserve_operation_path_and_kind_in_both_execution_models() -> Result<(), impl Debug> {
+    let fixture = TempDir::new("taplo-native-missing");
+    let runtime = test_runtime();
+    let observed = fixture.as_ref().ok().zip(runtime.as_ref().ok()).map(|(directory, executor)| {
+      let environment = NativeEnvironment::from_handle(executor.handle().clone());
+      let missing = directory.child("missing.toml");
+      let local = executor.block_on(environment.read_file(&missing));
+      let concurrent = executor.block_on(environment.read_file_concurrent(missing.clone()));
+      (missing, [local, concurrent])
+    });
+    ensure_that(
+      (fixture, runtime, observed),
+      "missing native reads must retain their operation, path, and native I/O source",
+      |actual| {
+        let Some(ref io) = actual.2 else {
+          return false;
+        };
+        io.1.iter().all(|result| {
+          matches!(result,
+        Err(EnvironmentError::Io { operation: "read_file", path, source }) if path == &io.0 && source.kind() == ErrorKind::NotFound)
         })
-      ),
-      "an absent parent directory must retain the atomic-create failure boundary",
-    )?;
-
-    let directory_target = fixture.child("directory.toml");
-    ensure_ok(
-      fs::create_dir_all(&directory_target),
-      "the atomic-replacement directory target must be created",
-    )?;
-    ensure(
-      matches!(
-        runtime.block_on(atomic_write(&directory_target, b"invalid")),
-        Err(EnvironmentError::Io {
-          operation: "replace_file",
-          path,
-          ..
-        }) if path == directory_target
-      ),
-      "a directory replacement target must retain the typed rename boundary",
-    )?;
-    let fixture_entries = ensure_ok(
-      fs::read_dir(fixture.path()).and_then(Iterator::collect::<Result<Vec<_>, _>>),
-      "the atomic-write fixture directory must remain enumerable",
-    )?;
-    ensure_eq(
-      &fixture_entries.len(),
-      &1_usize,
-      "failed atomic replacement must remove its temporary file",
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn native_glob_and_configuration_discovery_select_nearest_files_and_recover() -> Result<(), TestFailure> {
-    let fixture = TempDir::new("taplo-native-discovery")?;
-    let project = fixture.child("project");
-    let nested = project.join("nested");
-    ensure_ok(
-      fs::create_dir_all(&nested),
-      "the nested configuration search fixture must be created",
-    )?;
-    ensure_ok(
-      fs::create_dir_all(project.join("taplo.toml")),
-      "a directory-shaped candidate must be created",
-    )?;
-    let root_config = fixture.child(".taplo.toml");
-    ensure_ok(
-      fs::write(&root_config, b"include = [\"**/*.toml\"]\n"),
-      "the root configuration fixture must be written",
-    )?;
+  fn atomic_writes_reject_invalid_targets_and_remove_temporary_files() -> Result<(), impl Debug> {
+    let fixture = TempDir::new("taplo-native-atomic-write");
+    let runtime = test_runtime();
+    let observed = fixture.as_ref().ok().zip(runtime.as_ref().ok()).map(|(directory, executor)| {
+      let ownerless = executor.block_on(atomic_write(Path::new("/"), b"invalid"));
+      let missing_parent = directory.child("absent").join("document.toml");
+      let absent = executor.block_on(atomic_write(&missing_parent, b"invalid"));
+      let target = directory.child("directory.toml");
+      let created = fs::create_dir_all(&target);
+      let replacement = executor.block_on(atomic_write(&target, b"invalid"));
+      let entries = fs::read_dir(directory.path()).and_then(Iterator::collect::<Result<Vec<_>, _>>);
+      (ownerless, missing_parent, absent, target, created, replacement, entries)
+    });
+    ensure_that((fixture, runtime, observed), "atomic writes must retain invalid-target failures and remove failed-replacement temporary files", |actual| {
+      let Some(ref io) = actual.2 else { return false; };
+        matches!(&io.0, Err(EnvironmentError::Io { operation: "create_atomic_write_path", source, .. }) if source.kind() == ErrorKind::InvalidInput)
+          && matches!(&io.2, Err(EnvironmentError::Io { operation: "create_atomic_write", .. }))
+          && io.4.is_ok()
+          && matches!(&io.5, Err(EnvironmentError::Io { operation: "replace_file", path, .. }) if path == &io.3)
+          && io.6.as_ref().is_ok_and(|entries| entries.len() == 1)
 
-    let runtime = test_runtime()?;
-    let environment = NativeEnvironment::from_handle(runtime.handle().clone());
-    ensure(
-      ensure_ok(
-        runtime.block_on(environment.find_config_file(&nested)),
-        "local configuration discovery must complete",
-      )? == Some(root_config.clone()),
-      "local configuration discovery must skip non-files and select the nearest supported file",
-    )?;
-    ensure(
-      ensure_ok(
-        runtime.block_on(environment.find_config_file_concurrent(nested.clone())),
-        "concurrent configuration discovery must complete",
-      )? == Some(root_config.clone()),
-      "concurrent configuration discovery must share nearest-file semantics",
-    )?;
+    }).map(drop).map_err(Box::new)
+  }
 
-    ensure_ok(fs::remove_file(&root_config), "the root configuration fixture must be removable")?;
-    ensure(
-      ensure_ok(
-        runtime.block_on(environment.find_config_file(&nested)),
-        "configuration discovery must complete after removal",
-      )?
-      .is_none(),
-      "configuration discovery must report absence after the selected file is removed",
-    )?;
-
-    #[cfg(unix)]
-    {
-      let looping_candidate = nested.join(".taplo.toml");
-      ensure_ok(
-        symlink(&looping_candidate, &looping_candidate),
-        "the metadata-failure symlink fixture must be created",
-      )?;
-      ensure(
-        matches!(
-          runtime.block_on(environment.find_config_file(&nested)),
-          Err(EnvironmentError::Io {
-            operation: "inspect_config_candidate",
-            path,
-            ..
-          }) if path == looping_candidate
-        ),
-        "configuration discovery must retain unexpected metadata failures",
-      )?;
-      ensure_ok(
-        fs::remove_file(looping_candidate),
-        "the metadata-failure symlink fixture must be removable",
-      )?;
-    };
-
-    let matched = fixture.child("matched.toml");
-    let ignored = fixture.child("ignored.txt");
-    ensure_ok(fs::write(&matched, b"value = 1\n"), "the matched glob fixture must be written")?;
-    ensure_ok(fs::write(ignored, b"ignored\n"), "the ignored glob fixture must be written")?;
-    let pattern_path = fixture.child("*.toml");
-    let pattern = ensure_some(pattern_path.to_str(), "the temporary glob fixture path must be valid Unicode")?;
-    ensure(
-      ensure_ok(
-        environment.glob_files_normalized(pattern),
-        "the native glob must enumerate matching paths",
-      )? == [matched],
-      "the native glob must include only matching regular paths",
-    )?;
-    ensure(
-      matches!(
-        environment.glob_files("["),
-        Err(EnvironmentError::GlobPattern {
-          pattern: rejected,
-          ..
-        }) if rejected == "["
-      ),
-      "an invalid native glob must retain its rejected expression and typed parser source",
+  #[test]
+  fn native_glob_and_configuration_discovery_select_nearest_files_and_recover() -> Result<(), impl Debug> {
+    let fixture = TempDir::new("taplo-native-discovery");
+    let runtime = test_runtime();
+    let observed = fixture.as_ref().ok().zip(runtime.as_ref().ok()).map(|(directory, executor)| {
+      let project = directory.child("project");
+      let nested = project.join("nested");
+      let directories = [fs::create_dir_all(&nested), fs::create_dir_all(project.join("taplo.toml"))];
+      let root_config = directory.child(".taplo.toml");
+      let seeded = fs::write(&root_config, b"include = [\"**/*.toml\"]\n");
+      let environment = NativeEnvironment::from_handle(executor.handle().clone());
+      let discoveries = [
+        executor.block_on(environment.find_config_file(&nested)),
+        executor.block_on(environment.find_config_file_concurrent(nested.clone())),
+      ];
+      let removed = fs::remove_file(&root_config);
+      let absent = executor.block_on(environment.find_config_file(&nested));
+      #[cfg(unix)]
+      let metadata_failures = {
+        let candidate = nested.join(".taplo.toml");
+        let linked = symlink(&candidate, &candidate);
+        let result = executor.block_on(environment.find_config_file(&nested));
+        let unlinked = fs::remove_file(&candidate);
+        Vec::from([(candidate, linked, result, unlinked)])
+      };
+      #[cfg(not(unix))]
+      let metadata_failures = Vec::<MetadataFailure>::new();
+      let matched = directory.child("matched.toml");
+      let ignored = directory.child("ignored.txt");
+      let files = [fs::write(&matched, b"value = 1\n"), fs::write(ignored, b"ignored\n")];
+      let pattern = directory.child("*.toml");
+      let globbed = pattern.to_str().map(|value| environment.glob_files_normalized(value));
+      let invalid = environment.glob_files("[");
+      (
+        directories, root_config, seeded, discoveries, removed, absent, metadata_failures, matched, files, pattern, globbed, invalid,
+      )
+    });
+    ensure_that(
+      (fixture, runtime, observed),
+      "configuration discovery must select nearest files, recover from removal, retain metadata failures, and preserve glob selection",
+      |actual| {
+        let Some(ref io) = actual.2 else {
+          return false;
+        };
+        let (
+          ref directories,
+          ref root_config,
+          ref seeded,
+          ref discoveries,
+          ref removed,
+          ref absent,
+          ref metadata_failures,
+          ref matched,
+          ref files,
+          ref _pattern,
+          ref globbed,
+          ref invalid,
+        ) = *io;
+        directories.iter().all(Result::is_ok)
+          && seeded.is_ok()
+          && discoveries
+            .iter()
+            .all(|result| result.as_ref().is_ok_and(|path| path.as_ref() == Some(root_config)))
+          && removed.is_ok()
+          && matches!(absent, Ok(None))
+          && metadata_failures.iter().all(|failure| {
+            failure.1.is_ok()
+              && failure.3.is_ok()
+              && matches!(&failure.2, Err(EnvironmentError::Io { operation: "inspect_config_candidate", path, .. }) if path == &failure.0)
+          })
+          && files.iter().all(Result::is_ok)
+          && globbed
+            .as_ref()
+            .is_some_and(|result| result.as_ref().is_ok_and(|paths| paths.as_slice() == [matched.clone()]))
+          && matches!(invalid, Err(EnvironmentError::GlobPattern { pattern, .. }) if pattern == "[")
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

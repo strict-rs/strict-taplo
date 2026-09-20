@@ -569,6 +569,8 @@ pub(super) fn create_concurrent_server<E: ConcurrentEnvironment>() -> Concurrent
 
 #[cfg(test)]
 mod tests {
+  use std::fmt::Debug;
+  use std::io;
   use std::pin::Pin;
   use std::rc::Rc;
   use std::sync::Arc;
@@ -583,18 +585,21 @@ mod tests {
   use lsp_types::request;
   use lsp_types::request::Request as _;
   use parking_lot::Mutex;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
+  use strict_test_support::PredicateFailure;
+  use strict_test_support::ResultFailure;
   use strict_test_support::ensure_ok;
-  use strict_test_support::ensure_some;
+  use strict_test_support::ensure_that;
+  use taplo_common::schema::transport::TransportError;
   use taplo_common::schema::transport::local_http_client;
   use taplo_lsp_async::MessageWriterError;
+  use taplo_lsp_async::ServerError;
   use taplo_lsp_async::rpc;
-  use url::Url;
+  use thiserror::Error;
 
   use crate::lsp_ext::notification as extension_notification;
   use crate::lsp_ext::request as extension_request;
   use crate::world::TestEnvironment;
+  use crate::world::WorldError;
 
   /// Document exercised through every registered document request family.
   const DOCUMENT_URI: &str = "file:///workspace/document.toml";
@@ -667,33 +672,78 @@ mod tests {
     }
   }
 
-  /// Extract the successful result emitted for one request ID.
-  fn successful_result(writer: &CapturedWriter, id: i32) -> Result<serde_json::Value, TestFailure> {
-    let response = ensure_some(
-      writer
-        .messages()
-        .into_iter()
-        .find(|message| (message.method.is_none(), &message.id) == (true, &rpc::MessageId::Value(NumberOrString::Number(id)))),
-      "the registered request must emit its correlated response",
-    )?;
-    ensure(response.error.is_none(), "a valid registered request must not emit an RPC error")?;
-    ensure_some(response.result, "a successful registered request must carry a result channel")
+  /// Native failures constructing the runtime scenario before protocol messages are sent.
+  #[derive(Debug, Error)]
+  enum RuntimeFixtureFailure {
+    /// HTTP capability initialization failed.
+    #[error(transparent)]
+    Transport(#[from] Box<ResultFailure<TransportError>>),
+    /// World initialization failed.
+    #[error(transparent)]
+    World(#[from] Box<ResultFailure<WorldError>>),
+    /// Executor construction failed.
+    #[error(transparent)]
+    Executor(#[from] ResultFailure<io::Error>),
   }
 
-  /// Extract the ordered configuration items from one server request.
-  fn configuration_items<'message>(
-    message: &'message rpc::Message,
+  /// One complete routed message and its native server outcome.
+  #[derive(Debug)]
+  struct RoutedMessage {
+    /// Exact inbound protocol message.
+    message: rpc::Message,
+    /// Native route result, including its original typed failure.
+    result:  Result<(), ServerError>,
+    /// Behavioral context attached to this route.
     context: &'static str,
-  ) -> Result<&'message [serde_json::Value], TestFailure> {
-    let items = ensure_some(
-      message
-        .params
-        .as_ref()
-        .and_then(|params| params.get("items"))
-        .and_then(serde_json::Value::as_array),
-      context,
-    )?;
-    Ok(items)
+  }
+
+  /// Complete protocol evidence accumulated across the registry lifecycle.
+  #[derive(Debug, Default)]
+  struct RuntimeObservation {
+    /// Owner of the ordered, complete protocol output.
+    writer: CapturedWriter,
+    /// Every attempted input and its native outcome, including successful earlier phases.
+    routes: Vec<RoutedMessage>,
+  }
+
+  /// Complete accepted registry evidence or a failure retaining that same evidence.
+  type RuntimeOutcome = Result<RuntimeObservation, PredicateFailure<RuntimeObservation>>;
+
+  impl RuntimeObservation {
+    /// Append a route before checking its native outcome, preserving every preceding route.
+    fn routed(mut self, routed: RoutedMessage) -> RuntimeOutcome {
+      let context = routed.context;
+      self.routes.push(routed);
+      ensure_that(self, context, |observed| observed.routes.iter().all(|route| route.result.is_ok()))
+    }
+
+    /// Append both sides of an exchange before inspecting either native result.
+    fn exchanged(mut self, routes: [RoutedMessage; 2]) -> RuntimeOutcome {
+      self.routes.extend(routes);
+      ensure_that(self, "both sides of the client configuration exchange must complete", |observed| {
+        observed.routes.iter().all(|route| route.result.is_ok())
+      })
+    }
+  }
+
+  /// Inspect a successful result by reference while its complete response remains in the
+  /// observation.
+  fn successful_result(messages: &[rpc::Message], id: i32) -> Option<&serde_json::Value> {
+    messages
+      .iter()
+      .find(|message| message.method.is_none() && message.id == rpc::MessageId::Value(NumberOrString::Number(id)))
+      .filter(|message| message.error.is_none())
+      .and_then(|message| message.result.as_ref())
+  }
+
+  /// Inspect ordered configuration items while retaining their complete request as the subject.
+  fn configuration_items(message: &rpc::Message) -> Option<&[serde_json::Value]> {
+    message
+      .params
+      .as_ref()
+      .and_then(|params| params.get("items"))
+      .and_then(serde_json::Value::as_array)
+      .map(Vec::as_slice)
   }
 
   /// Serialize the schema installed at [`SCHEMA_URI`] for both execution families.
@@ -748,169 +798,108 @@ mod tests {
     })
   }
 
-  /// Initialize the routed server and complete the initial client-configuration exchange.
+  /// Initialize the routed server and retain the complete initial configuration exchange.
   fn drive_lifecycle_initialization(
-    route: &impl Fn(rpc::Message, &'static str) -> Result<(), TestFailure>,
-    exchange: &impl Fn(rpc::Message, rpc::Message, &'static str, &'static str) -> Result<(), TestFailure>,
-    writer: &CapturedWriter,
-  ) -> Result<(), TestFailure> {
-    route(
+    mut observation: RuntimeObservation,
+    route: &impl Fn(rpc::Message, &'static str) -> RoutedMessage,
+    exchange: &impl Fn(rpc::Message, rpc::Message, &'static str, &'static str) -> [RoutedMessage; 2],
+  ) -> RuntimeOutcome {
+    observation = observation.routed(route(
       request_message(
         0,
         request::Initialize::METHOD,
         Some(serde_json::json!({
-          "processId": null,
-          "rootUri": null,
-          "capabilities": {},
-          "workspaceFolders": []
+          "processId": null, "rootUri": null, "capabilities": {}, "workspaceFolders": []
         })),
       ),
       "the registered server must initialize",
-    )?;
-    let initialization = successful_result(writer, 0)?;
-    ensure(
-      initialization.pointer("/capabilities/textDocumentSync").is_some(),
+    ))?;
+    observation = ensure_that(
+      observation,
       "initialization must advertise full document synchronization",
+      |observed| {
+        successful_result(&observed.writer.messages(), 0).is_some_and(|value| value.pointer("/capabilities/textDocumentSync").is_some())
+      },
     )?;
-    exchange(
+    observation.exchanged(exchange(
       notification_message(notification::Initialized::METHOD, Some(serde_json::json!({}))),
-      response_message(
-        0,
-        serde_json::json!([{
-          "schema": {
-            "catalogs": []
-          }
-        }]),
-      ),
-      "the initialized notification must complete its client-configuration exchange",
-      "the initial client-configuration response must reach its pending request",
-    )
+      response_message(0, serde_json::json!([{ "schema": { "catalogs": [] } }])),
+      "the initialized notification must complete its configuration exchange",
+      "the initial configuration response must reach its pending request",
+    ))
   }
 
-  /// Add one workspace root and complete its scoped client-configuration exchange.
+  /// Add one workspace root and retain both native sides of its scoped configuration exchange.
   fn drive_workspace_scope_addition(
-    exchange: &impl Fn(rpc::Message, rpc::Message, &'static str, &'static str) -> Result<(), TestFailure>,
-  ) -> Result<(), TestFailure> {
-    exchange(
+    observation: RuntimeObservation,
+    exchange: &impl Fn(rpc::Message, rpc::Message, &'static str, &'static str) -> [RoutedMessage; 2],
+  ) -> RuntimeOutcome {
+    observation.exchanged(exchange(
       notification_message(
         notification::DidChangeWorkspaceFolders::METHOD,
         Some(serde_json::json!({
-          "event": {
-            "added": [{
-              "uri": "file:///workspace",
-              "name": "workspace"
-            }],
-            "removed": []
-          }
+          "event": { "added": [{ "uri": "file:///workspace", "name": "workspace" }], "removed": [] }
         })),
       ),
       response_message(
         1,
-        serde_json::json!([
-          {
-            "schema": {
-              "catalogs": []
-            }
-          },
-          {
-            "schema": {
-              "catalogs": []
-            }
-          }
-        ]),
+        serde_json::json!([{ "schema": { "catalogs": [] } }, { "schema": { "catalogs": [] } }]),
       ),
-      "the workspace transition must complete its scoped client-configuration exchange",
-      "the scoped client-configuration response must reach its pending request",
+      "the workspace transition must complete its scoped configuration exchange",
+      "the scoped configuration response must reach its pending request",
+    ))
+  }
+
+  /// Check both lifecycle request shapes without projecting away any protocol messages.
+  fn ensure_configuration_request_shapes(observation: RuntimeObservation) -> RuntimeOutcome {
+    ensure_that(
+      observation,
+      "initialization must request global configuration and workspace mutation must add exactly its root scope",
+      |observed| {
+        let messages = observed.writer.messages();
+        let requests = messages
+          .iter()
+          .filter(|message| message.method.as_deref() == Some(request::WorkspaceConfiguration::METHOD))
+          .collect::<Vec<_>>();
+        let [initial, scoped] = *requests.as_slice() else {
+          return false;
+        };
+        configuration_items(initial).is_some_and(|items| items == [serde_json::json!({ "section": "evenBetterToml" })])
+          && configuration_items(scoped).is_some_and(|items| {
+            items
+              == [
+                serde_json::json!({ "section": "evenBetterToml" }),
+                serde_json::json!({ "section": "evenBetterToml", "scopeUri": "file:///workspace" }),
+              ]
+          })
+      },
     )
   }
 
-  /// Require the two lifecycle transitions to shape their configuration requests exactly.
-  fn ensure_configuration_request_shapes(writer: &CapturedWriter) -> Result<(), TestFailure> {
-    let emitted_messages = writer.messages();
-    let mut configuration_requests = emitted_messages
-      .iter()
-      .filter(|message| message.method.as_deref() == Some(request::WorkspaceConfiguration::METHOD));
-    let initial_configuration = ensure_some(
-      configuration_requests.next(),
-      "initialization must issue one client-configuration request",
-    )?;
-    let scoped_configuration = ensure_some(
-      configuration_requests.next(),
-      "workspace mutation must issue one client-configuration request",
-    )?;
-    ensure(
-      configuration_requests.next().is_none(),
-      "the two lifecycle transitions must issue exactly two client-configuration requests",
-    )?;
-    let initial_items = configuration_items(
-      initial_configuration,
-      "the initial configuration request must carry its ordered item vector",
-    )?;
-    let initial_global = ensure_some(
-      initial_items.first(),
-      "the initial configuration request must carry its global item",
-    )?;
-    let scoped_items = configuration_items(
-      scoped_configuration,
-      "the workspace configuration request must carry its ordered item vector",
-    )?;
-    let scoped_global = ensure_some(
-      scoped_items.first(),
-      "the workspace configuration request must retain its global item",
-    )?;
-    let scoped_root = ensure_some(
-      scoped_items.get(1),
-      "the workspace configuration request must carry the added root item",
-    )?;
-    ensure(
-      (
-        initial_items.len(),
-        initial_global.get("section"),
-        initial_global.get("scopeUri"),
-        scoped_items.len(),
-        scoped_global.get("section"),
-        scoped_global.get("scopeUri"),
-        scoped_root.get("section"),
-        scoped_root.get("scopeUri"),
-      ) == (
-        1,
-        Some(&serde_json::json!("evenBetterToml")),
-        None,
-        2,
-        Some(&serde_json::json!("evenBetterToml")),
-        None,
-        Some(&serde_json::json!("evenBetterToml")),
-        Some(&serde_json::json!("file:///workspace")),
-      ),
-      "initialization must request global configuration and workspace mutation must add only the new root scope",
-    )
-  }
-
-  /// Open the runtime document and require its diagnostics publication.
+  /// Open the document and retain the diagnostics publication with every earlier message.
   fn drive_document_open(
-    route: &impl Fn(rpc::Message, &'static str) -> Result<(), TestFailure>,
-    writer: &CapturedWriter,
-  ) -> Result<(), TestFailure> {
-    route(
+    mut observation: RuntimeObservation,
+    route: &impl Fn(rpc::Message, &'static str) -> RoutedMessage,
+  ) -> RuntimeOutcome {
+    observation = observation.routed(route(
       notification_message(
         notification::DidOpenTextDocument::METHOD,
         Some(serde_json::json!({
-          "textDocument": {
-            "uri": DOCUMENT_URI,
-            "languageId": "toml",
-            "version": 1,
-            "text": "name=\"taplo\"\nvalues = [1, 2]\n"
-          }
+          "textDocument": { "uri": DOCUMENT_URI, "languageId": "toml", "version": 1, "text": "name=\"taplo\"\nvalues = [1, 2]\n" }
         })),
       ),
       "the registered document-open transition must complete",
-    )?;
-    ensure(
-      writer
-        .messages()
-        .iter()
-        .any(|message| message.method.as_deref() == Some(notification::PublishDiagnostics::METHOD)),
-      "opening a document must publish its replacement diagnostics",
+    ))?;
+    ensure_that(
+      observation,
+      "opening the document must publish replacement diagnostics",
+      |observed| {
+        observed
+          .writer
+          .messages()
+          .iter()
+          .any(|message| message.method.as_deref() == Some(notification::PublishDiagnostics::METHOD))
+      },
     )
   }
 
@@ -988,266 +977,192 @@ mod tests {
     ]
   }
 
-  /// Route every registered document, conversion, and schema request to completion.
+  /// Route all requests while preserving each earlier input, response, and native outcome.
   fn drive_registered_requests(
-    route: &impl Fn(rpc::Message, &'static str) -> Result<(), TestFailure>,
-    writer: &CapturedWriter,
+    mut observation: RuntimeObservation,
+    route: &impl Fn(rpc::Message, &'static str) -> RoutedMessage,
     requests: impl IntoIterator<Item = (i32, &'static str, serde_json::Value)>,
-  ) -> Result<(), TestFailure> {
+  ) -> RuntimeOutcome {
     for (id, method, params) in requests {
-      route(
+      observation = observation.routed(route(
         request_message(id, method, Some(params)),
-        "each registered document and conversion request must complete",
+        "each registered request must complete",
+      ))?;
+      observation = ensure_that(
+        observation,
+        "each registered request must emit a correlated successful result",
+        |observed| successful_result(&observed.writer.messages(), id).is_some(),
       )?;
-      drop(successful_result(writer, id)?);
     }
-    Ok(())
+    Ok(observation)
   }
 
-  /// Require the pre-association responses and return the initial schema listing.
-  fn ensure_pre_association_responses(writer: &CapturedWriter) -> Result<serde_json::Value, TestFailure> {
-    let listed_schemas_before = successful_result(writer, 12)?;
-    ensure(
-      listed_schemas_before
-        .get("schemas")
-        .and_then(serde_json::Value::as_array)
-        .is_some(),
-      "schema listing must serialize its catalog collection",
-    )?;
-    ensure(
-      successful_result(writer, 13)?.get("schema") == Some(&serde_json::Value::Null),
-      "associated-schema lookup must report no effective schema before association",
-    )?;
-    ensure(
-      successful_result(writer, 4)?.is_null(),
-      "completion without an effective schema must remain absent",
-    )?;
-    ensure(
-      successful_result(writer, 5)?.is_null(),
-      "hover without an effective schema must remain absent",
-    )?;
-    ensure(
-      successful_result(writer, 6)?.is_null(),
-      "disabled standalone document links must remain absent without an effective schema",
-    )?;
-    ensure(
-      successful_result(writer, 3)?.as_array().is_some_and(|edits| !edits.is_empty()),
-      "formatting must return the edit for the unformatted opened document",
-    )?;
-    ensure(
-      successful_result(writer, 9)?.pointer("/changes").is_some(),
-      "rename must return a workspace edit for the selected identifier",
-    )?;
-    ensure(
-      successful_result(writer, 10)?
-        .get("text")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|text| text.contains("\"name\"")),
-      "TOML-to-JSON conversion must return converted text",
-    )?;
-    ensure(
-      successful_result(writer, 11)?
-        .get("text")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|text| text.contains("name")),
-      "JSON-to-TOML conversion must return converted text",
-    )?;
-    Ok(listed_schemas_before)
+  /// Check pre-association responses while retaining all original wire messages.
+  fn ensure_pre_association_responses(observation: RuntimeObservation) -> RuntimeOutcome {
+    ensure_that(
+      observation,
+      "unassociated document features, formatting, rename, and conversions must retain their expected wire results",
+      |observed| {
+        let messages = observed.writer.messages();
+        successful_result(&messages, 12).is_some_and(|value| value.get("schemas").and_then(serde_json::Value::as_array).is_some())
+          && successful_result(&messages, 13).is_some_and(|value| value.get("schema") == Some(&serde_json::Value::Null))
+          && [4, 5, 6]
+            .into_iter()
+            .all(|id| successful_result(&messages, id).is_some_and(serde_json::Value::is_null))
+          && successful_result(&messages, 3).is_some_and(|value| value.as_array().is_some_and(|edits| !edits.is_empty()))
+          && successful_result(&messages, 9).is_some_and(|value| value.pointer("/changes").is_some())
+          && successful_result(&messages, 10).is_some_and(|value| {
+            value
+              .get("text")
+              .and_then(serde_json::Value::as_str)
+              .is_some_and(|text| text.contains("\"name\""))
+          })
+          && successful_result(&messages, 11).is_some_and(|value| {
+            value
+              .get("text")
+              .and_then(serde_json::Value::as_str)
+              .is_some_and(|text| text.contains("name"))
+          })
+      },
+    )
   }
 
-  /// Commit one manual schema association and require its published, queryable effects.
+  /// Commit a manual association and retain its publication together with both schema listings.
   fn drive_manual_association(
-    route: &impl Fn(rpc::Message, &'static str) -> Result<(), TestFailure>,
-    writer: &CapturedWriter,
-    listed_schemas_before: &serde_json::Value,
-  ) -> Result<(), TestFailure> {
-    let document_url = ensure_ok(Url::parse(DOCUMENT_URI), "the runtime document URL must parse")?;
-    let schema_url = ensure_ok(Url::parse(SCHEMA_URI), "the runtime schema URL must parse")?;
-    let association = extension_notification::AssociateSchemaParams {
-      document_uri: Some(document_url.clone()),
-      schema_uri:   schema_url,
-      rule:         extension_notification::AssociationRule::Url(document_url),
-      priority:     None,
-      meta:         Some(serde_json::json!({
-        "name": "fixture"
-      })),
-    };
-    route(
-      notification_message(
-        extension_notification::AssociateSchema::METHOD,
-        Some(ensure_ok(
-          serde_json::to_value(association),
-          "the schema-association parameters must serialize",
-        )?),
-      ),
-      "the registered manual-schema transition must complete",
-    )?;
-    ensure(
-      writer
-        .messages()
-        .iter()
-        .any(|message| message.method.as_deref() == Some(extension_notification::DidChangeSchemaAssociation::METHOD)),
+    mut observation: RuntimeObservation,
+    route: &impl Fn(rpc::Message, &'static str) -> RoutedMessage,
+  ) -> RuntimeOutcome {
+    observation = observation.routed(route(notification_message(extension_notification::AssociateSchema::METHOD, Some(serde_json::json!({
+      "documentUri": DOCUMENT_URI, "schemaUri": SCHEMA_URI, "rule": { "url": DOCUMENT_URI }, "priority": null, "meta": { "name": "fixture" }
+    }))), "the registered manual-schema transition must complete"))?;
+    observation = ensure_that(
+      observation,
       "manual association must publish its effective-schema notification",
+      |observed| {
+        observed
+          .writer
+          .messages()
+          .iter()
+          .any(|message| message.method.as_deref() == Some(extension_notification::DidChangeSchemaAssociation::METHOD))
+      },
     )?;
-
     for (id, method) in [
       (14, extension_request::ListSchemasRequest::METHOD),
       (15, extension_request::AssociatedSchemaRequest::METHOD),
     ] {
-      route(
-        request_message(
-          id,
-          method,
-          Some(serde_json::json!({
-            "documentUri": DOCUMENT_URI
-          })),
-        ),
-        "schema queries must observe the committed manual association",
-      )?;
+      observation = observation.routed(route(
+        request_message(id, method, Some(serde_json::json!({ "documentUri": DOCUMENT_URI }))),
+        "schema queries must observe the committed association",
+      ))?;
     }
-    ensure(
-      successful_result(writer, 14)? == *listed_schemas_before,
-      "an exact-document association must not alter the catalog schema listing",
-    )?;
-    ensure(
-      successful_result(writer, 15)?.pointer("/schema/url") == Some(&serde_json::json!(SCHEMA_URI)),
-      "associated-schema lookup must select the committed manual association",
+    ensure_that(
+      observation,
+      "exact association must preserve the catalog listing and select its committed schema",
+      |observed| {
+        let messages = observed.writer.messages();
+        successful_result(&messages, 14).is_some_and(|value| Some(value) == successful_result(&messages, 12))
+          && successful_result(&messages, 15).is_some_and(|value| value.pointer("/schema/url") == Some(&serde_json::json!(SCHEMA_URI)))
+      },
     )
   }
 
-  /// Require completion, hover, and links to observe the committed association and link policy.
+  /// Check schema-backed completion, hover, and disabled standalone links against native responses.
   fn ensure_schema_backed_features(
-    route: &impl Fn(rpc::Message, &'static str) -> Result<(), TestFailure>,
-    writer: &CapturedWriter,
-  ) -> Result<(), TestFailure> {
+    mut observation: RuntimeObservation,
+    route: &impl Fn(rpc::Message, &'static str) -> RoutedMessage,
+  ) -> RuntimeOutcome {
     for (id, method, params) in [
       (
         16,
         request::Completion::METHOD,
-        serde_json::json!({
-          "textDocument": {
-            "uri": DOCUMENT_URI
-          },
-          "position": {
-            "line": 2,
-            "character": 0
-          }
-        }),
+        serde_json::json!({ "textDocument": { "uri": DOCUMENT_URI }, "position": { "line": 2, "character": 0 } }),
       ),
       (17, request::HoverRequest::METHOD, positioned_request_params()),
       (18, request::DocumentLinkRequest::METHOD, document_request_params()),
     ] {
-      route(
+      observation = observation.routed(route(
         request_message(id, method, Some(params)),
-        "schema-backed requests must observe the committed manual association",
-      )?;
+        "schema-backed requests must observe the committed association",
+      ))?;
     }
-    ensure(
-      successful_result(writer, 16)?.as_array().is_some_and(|items| {
+    ensure_that(
+      observation,
+      "schema-backed features must expose documented properties and linked hover without standalone links",
+      |observed| {
+        let messages = observed.writer.messages();
+        let Some(items) = successful_result(&messages, 16).and_then(serde_json::Value::as_array) else {
+          return false;
+        };
         items.iter().any(|item| {
           (item.get("label"), item.pointer("/documentation/value"))
             == (
               Some(&serde_json::json!("enabled")),
               Some(&serde_json::json!("Whether the feature is enabled.")),
             )
-        })
-      }),
-      "schema-backed completion must offer the missing property with its documentation",
-    )?;
-    ensure(
-      successful_result(writer, 17)?.pointer("/contents/value")
-        == Some(&serde_json::json!("[Name](https://example.com/name)\n\nThe configured name.")),
-      "schema-backed hover must embed the key link while standalone links are disabled",
-    )?;
-    ensure(
-      successful_result(writer, 18)?.is_null(),
-      "an associated schema must not override the disabled standalone-link policy",
+        }) && successful_result(&messages, 17).is_some_and(|value| {
+          value.pointer("/contents/value") == Some(&serde_json::json!("[Name](https://example.com/name)\n\nThe configured name."))
+        }) && successful_result(&messages, 18).is_some_and(serde_json::Value::is_null)
+      },
     )
   }
 
-  /// Enable standalone links through configuration and require the switched hover and link output.
+  /// Enable standalone links and retain the switched hover and link responses.
   fn drive_link_policy_toggle(
-    route: &impl Fn(rpc::Message, &'static str) -> Result<(), TestFailure>,
-    writer: &CapturedWriter,
-  ) -> Result<(), TestFailure> {
-    route(
+    mut observation: RuntimeObservation,
+    route: &impl Fn(rpc::Message, &'static str) -> RoutedMessage,
+  ) -> RuntimeOutcome {
+    observation = observation.routed(route(
       notification_message(
         notification::DidChangeConfiguration::METHOD,
-        Some(serde_json::json!({
-          "settings": {
-            "schema": {
-              "catalogs": [],
-              "links": true
-            }
-          }
-        })),
+        Some(serde_json::json!({ "settings": { "schema": { "catalogs": [], "links": true } } })),
       ),
-      "standalone schema links must be enabled through the public configuration transition",
-    )?;
+      "standalone links must be enabled through configuration",
+    ))?;
     for (id, method, params) in [
       (19, request::HoverRequest::METHOD, positioned_request_params()),
       (20, request::DocumentLinkRequest::METHOD, document_request_params()),
     ] {
-      route(
+      observation = observation.routed(route(
         request_message(id, method, Some(params)),
         "schema-backed requests must observe the committed link policy",
-      )?;
+      ))?;
     }
-    ensure(
-      successful_result(writer, 19)?.pointer("/contents/value") == Some(&serde_json::json!("The configured name.")),
-      "standalone-link mode must keep the external link out of hover documentation",
-    )?;
-    ensure(
-      successful_result(writer, 20)?.as_array().is_some_and(|links| {
-        links.iter().any(|link| {
-          (link.get("target"), link.pointer("/range/start/line"))
-            == (Some(&serde_json::json!("https://example.com/name")), Some(&serde_json::json!(0)))
-        })
-      }),
-      "schema-backed document links must target the configured key documentation",
+    ensure_that(
+      observation,
+      "standalone-link configuration must move the key link out of hover and into document links",
+      |observed| {
+        let messages = observed.writer.messages();
+        let Some(links) = successful_result(&messages, 20).and_then(serde_json::Value::as_array) else {
+          return false;
+        };
+        successful_result(&messages, 19)
+          .is_some_and(|value| value.pointer("/contents/value") == Some(&serde_json::json!("The configured name.")))
+          && links.iter().any(|link| {
+            (link.get("target"), link.pointer("/range/start/line"))
+              == (Some(&serde_json::json!("https://example.com/name")), Some(&serde_json::json!(0)))
+          })
+      },
     )
   }
 
-  /// Route the remaining ordered mutations and contain missing notification parameters.
+  /// Retain ordered mutations and native containment outcomes for missing notification parameters.
   fn drive_mutation_notifications_and_containment(
-    route: &impl Fn(rpc::Message, &'static str) -> Result<(), TestFailure>,
-  ) -> Result<(), TestFailure> {
-    route(
-      notification_message(
+    mut observation: RuntimeObservation,
+    route: &impl Fn(rpc::Message, &'static str) -> RoutedMessage,
+  ) -> RuntimeOutcome {
+    for (method, params) in [
+      (
         notification::DidChangeTextDocument::METHOD,
-        Some(serde_json::json!({
-          "textDocument": {
-            "uri": DOCUMENT_URI,
-            "version": 2
-          },
-          "contentChanges": [{
-            "text": "name = 7\n"
-          }]
-        })),
+        serde_json::json!({ "textDocument": { "uri": DOCUMENT_URI, "version": 2 }, "contentChanges": [{ "text": "name = 7\n" }] }),
       ),
-      "the registered full-sync document change must complete",
-    )?;
-    route(
-      notification_message(
-        notification::DidSaveTextDocument::METHOD,
-        Some(serde_json::json!({
-          "textDocument": {
-            "uri": DOCUMENT_URI
-          }
-        })),
-      ),
-      "the registered save notification must preserve its ordered no-op",
-    )?;
-    route(
-      notification_message(
-        notification::DidChangeConfiguration::METHOD,
-        Some(serde_json::json!({
-          "settings": {}
-        })),
-      ),
-      "pushed client configuration must apply through the registry",
-    )?;
-
+      (notification::DidSaveTextDocument::METHOD, document_request_params()),
+      (notification::DidChangeConfiguration::METHOD, serde_json::json!({ "settings": {} })),
+    ] {
+      observation = observation.routed(route(
+        notification_message(method, Some(params)),
+        "ordered document and configuration mutations must complete",
+      ))?;
+    }
     for method in [
       notification::DidOpenTextDocument::METHOD,
       notification::DidChangeTextDocument::METHOD,
@@ -1256,108 +1171,141 @@ mod tests {
       notification::DidChangeWorkspaceFolders::METHOD,
       extension_notification::AssociateSchema::METHOD,
     ] {
-      route(
+      observation = observation.routed(route(
         notification_message(method, None),
-        "missing notification parameters must be contained at the notification boundary",
-      )?;
+        "missing notification parameters must be contained",
+      ))?;
     }
-    Ok(())
+    Ok(observation)
   }
 
-  /// Close the runtime document, then complete the shutdown and exit sequence.
+  /// Retain document-close diagnostics, the shutdown response, and the final exit outcome.
   fn drive_close_and_shutdown(
-    route: &impl Fn(rpc::Message, &'static str) -> Result<(), TestFailure>,
-    writer: &CapturedWriter,
-  ) -> Result<(), TestFailure> {
-    route(
-      notification_message(
-        notification::DidCloseTextDocument::METHOD,
-        Some(serde_json::json!({
-          "textDocument": {
-            "uri": DOCUMENT_URI
-          }
-        })),
-      ),
-      "the registered document-close transition must complete",
+    mut observation: RuntimeObservation,
+    route: &impl Fn(rpc::Message, &'static str) -> RoutedMessage,
+  ) -> RuntimeOutcome {
+    observation = observation.routed(route(
+      notification_message(notification::DidCloseTextDocument::METHOD, Some(document_request_params())),
+      "document close must complete",
+    ))?;
+    observation = ensure_that(
+      observation,
+      "closing the document must publish empty replacement diagnostics",
+      |observed| {
+        observed
+          .writer
+          .messages()
+          .iter()
+          .rev()
+          .find(|message| message.method.as_deref() == Some(notification::PublishDiagnostics::METHOD))
+          .and_then(|message| message.params.as_ref())
+          .and_then(|params| params.get("diagnostics"))
+          .and_then(serde_json::Value::as_array)
+          .is_some_and(Vec::is_empty)
+      },
     )?;
-    let cleared_diagnostics = writer
-      .messages()
-      .into_iter()
-      .rev()
-      .find(|message| message.method.as_deref() == Some(notification::PublishDiagnostics::METHOD))
-      .and_then(|message| message.params);
-    ensure(
-      cleared_diagnostics
-        .as_ref()
-        .and_then(|params| params.get("diagnostics"))
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(Vec::is_empty),
-      "closing the document must publish an empty diagnostics replacement",
-    )?;
-
-    route(
+    observation = observation.routed(route(
       request_message(99, request::Shutdown::METHOD, None),
       "the registered server must complete shutdown",
-    )?;
-    ensure(
-      successful_result(writer, 99)?.is_null(),
-      "shutdown must emit the standard null result",
-    )?;
-    route(
+    ))?;
+    observation = ensure_that(observation, "shutdown must emit its standard null result", |observed| {
+      successful_result(&observed.writer.messages(), 99).is_some_and(serde_json::Value::is_null)
+    })?;
+    observation.routed(route(
       notification_message(notification::Exit::METHOD, None),
-      "exit must succeed after the shutdown response",
-    )
+      "exit must succeed after shutdown",
+    ))
   }
 
-  /// Exercise the complete Taplo handler registry through one execution family.
+  /// Exercise the complete Taplo handler registry while retaining resources and every protocol
+  /// observation.
   macro_rules! runtime_registry_behavior {
     ($test:ident,server = $server:path,world = $world:path,clone = $clone:path) => {
       #[test]
-      fn $test() -> Result<(), TestFailure> {
-        let environment = TestEnvironment::default();
-        environment.insert_file("/workspace/schema.json", runtime_schema_bytes());
-        let http = ensure_ok(local_http_client(), "the runtime HTTP client must initialize")?;
-        let world = ensure_ok($world(environment.clone(), http), "the runtime world must initialize")?;
-        let runtime = ensure_ok(
-          tokio::runtime::Builder::new_current_thread().enable_all().build(),
-          "the runtime behavior executor must initialize",
-        )?;
-        let server = $server();
-        let writer = CapturedWriter::default();
-        let route = |message: rpc::Message, context: &'static str| {
-          ensure_ok(
-            runtime.block_on(server.handle_message($clone(&world), message, writer.clone())),
-            context,
-          )
-        };
-        let exchange = |notification: rpc::Message,
-                        response: rpc::Message,
-                        notification_context: &'static str,
-                        response_context: &'static str|
-         -> Result<(), TestFailure> {
-          let (notification_result, response_result) = runtime.block_on(join(
-            server.handle_message($clone(&world), notification, writer.clone()),
-            server.handle_message($clone(&world), response, writer.clone()),
-          ));
-          ensure_ok(notification_result, notification_context)?;
-          ensure_ok(response_result, response_context)
-        };
-
-        drive_lifecycle_initialization(&route, &exchange, &writer)?;
-        drive_workspace_scope_addition(&exchange)?;
-        ensure_configuration_request_shapes(&writer)?;
-        drive_document_open(&route, &writer)?;
-        drive_registered_requests(
-          &route,
-          &writer,
-          standard_document_requests().into_iter().chain(extension_document_requests()),
-        )?;
-        let listed_schemas_before = ensure_pre_association_responses(&writer)?;
-        drive_manual_association(&route, &writer, &listed_schemas_before)?;
-        ensure_schema_backed_features(&route, &writer)?;
-        drive_link_policy_toggle(&route, &writer)?;
-        drive_mutation_notifications_and_containment(&route)?;
-        drive_close_and_shutdown(&route, &writer)
+      fn $test() -> Result<(), impl Debug> {
+        let observations = (|| {
+          let environment = TestEnvironment::default();
+          environment.insert_file("/workspace/schema.json", runtime_schema_bytes());
+          let http = ensure_ok(local_http_client(), "the runtime HTTP client must initialize").map_err(Box::new)?;
+          let world = ensure_ok($world(environment.clone(), http), "the runtime world must initialize").map_err(Box::new)?;
+          let runtime = ensure_ok(
+            tokio::runtime::Builder::new_current_thread().enable_all().build(),
+            "the runtime executor must initialize",
+          )?;
+          let server = $server();
+          let writer = CapturedWriter::default();
+          let outcome = {
+            let route = |message: rpc::Message, context: &'static str| {
+              let result = runtime.block_on(server.handle_message($clone(&world), message.clone(), writer.clone()));
+              RoutedMessage {
+                message,
+                result,
+                context,
+              }
+            };
+            let exchange =
+              |notification: rpc::Message, response: rpc::Message, notification_context: &'static str, response_context: &'static str| {
+                let (notification_result, response_result) = runtime.block_on(join(
+                  server.handle_message($clone(&world), notification.clone(), writer.clone()),
+                  server.handle_message($clone(&world), response.clone(), writer.clone()),
+                ));
+                [
+                  RoutedMessage {
+                    message: notification,
+                    result:  notification_result,
+                    context: notification_context,
+                  },
+                  RoutedMessage {
+                    message: response,
+                    result:  response_result,
+                    context: response_context,
+                  },
+                ]
+              };
+            let observation = RuntimeObservation {
+              writer: writer.clone(),
+              routes: Vec::new(),
+            };
+            drive_lifecycle_initialization(observation, &route, &exchange)
+              .and_then(|observed| drive_workspace_scope_addition(observed, &exchange))
+              .and_then(ensure_configuration_request_shapes)
+              .and_then(|observed| drive_document_open(observed, &route))
+              .and_then(|observed| {
+                drive_registered_requests(
+                  observed,
+                  &route,
+                  standard_document_requests().into_iter().chain(extension_document_requests()),
+                )
+              })
+              .and_then(ensure_pre_association_responses)
+              .and_then(|observed| drive_manual_association(observed, &route))
+              .and_then(|observed| ensure_schema_backed_features(observed, &route))
+              .and_then(|observed| drive_link_policy_toggle(observed, &route))
+              .and_then(|observed| drive_mutation_notifications_and_containment(observed, &route))
+              .and_then(|observed| drive_close_and_shutdown(observed, &route))
+          };
+          Ok::<_, RuntimeFixtureFailure>((world, runtime, outcome))
+        })();
+        ensure_that(
+          observations,
+          "the registry lifecycle must preserve its complete successful protocol history",
+          |result| {
+            result.as_ref().is_ok_and(|observed| {
+              observed.2.as_ref().is_ok_and(|runtime| {
+                runtime
+                  .routes
+                  .first()
+                  .is_some_and(|first| first.message.method.as_deref() == Some(request::Initialize::METHOD))
+                  && runtime
+                    .routes
+                    .last()
+                    .is_some_and(|last| last.message.method.as_deref() == Some(notification::Exit::METHOD))
+              })
+            })
+          },
+        )
+        .map(drop)
+        .map_err(Box::new)
       }
     };
   }

@@ -35,45 +35,46 @@ pub fn add_all(node: &SyntaxNode, builder: &mut GreenNodeBuilder<'_>) -> Result<
 #[cfg(test)]
 /// Syntax-subtree copy contracts.
 mod tests {
+  use core::fmt::Debug;
+
   use rowan::GreenNodeBuilder;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
   use strict_test_support::ensure_ok;
+  use strict_test_support::ensure_that;
 
   use super::add_all;
-  use crate::syntax::SyntaxNode;
-  use crate::test_support::parse_syntax;
+  use crate::parser::parse;
 
   #[test]
-  fn subtree_copy_preserves_nested_tokens_and_the_callers_builder_frame() -> Result<(), TestFailure> {
+  fn subtree_copy_preserves_nested_tokens_and_the_callers_builder_frame() -> Result<(), impl Debug> {
     let source = "alpha = [1, { beta = true }]\n";
-    let syntax = parse_syntax(source, "the copied syntax fixture must parse")?;
+    let observed = ensure_ok(parse(source), "the copied syntax fixture must parse").map(|parsed| {
+      let syntax = parsed.into_syntax();
+      let mut root_builder = GreenNodeBuilder::new();
+      let root_copy = add_all(&syntax, &mut root_builder);
+      let copied = root_builder.finish();
+      let mut nested_builder = GreenNodeBuilder::new();
+      nested_builder.start_node(syntax.kind().into());
+      let nested_copy = add_all(&syntax, &mut nested_builder);
+      let enclosing = nested_builder.finish_node();
+      let nested = nested_builder.finish();
+      (syntax, root_copy, copied, nested_copy, enclosing, nested)
+    });
+    ensure_that(
+      observed,
+      "subtree copies must preserve exact source and caller-owned builder frames",
+      |result| {
+        let Ok(ref value) = *result else {
+          return false;
+        };
 
-    let mut root_builder = GreenNodeBuilder::new();
-    ensure_ok(
-      add_all(&syntax, &mut root_builder),
-      "copying a complete syntax tree into an empty builder must succeed",
-    )?;
-    let copied = ensure_ok(root_builder.finish(), "the copied syntax root must satisfy the builder protocol")?;
-    ensure(
-      SyntaxNode::new_root(copied).to_string() == source,
-      "syntax copying must preserve every nested node and token in source order",
-    )?;
-
-    let mut nested_builder = GreenNodeBuilder::new();
-    nested_builder.start_node(syntax.kind().into());
-    ensure_ok(
-      add_all(&syntax, &mut nested_builder),
-      "copying beneath an existing caller frame must succeed",
-    )?;
-    ensure_ok(
-      nested_builder.finish_node(),
-      "the caller must retain ownership of its enclosing builder frame",
-    )?;
-    let nested = ensure_ok(nested_builder.finish(), "the enclosing copied syntax tree must remain finishable")?;
-    ensure(
-      SyntaxNode::new_root(nested).to_string() == source,
-      "an enclosing caller frame must not duplicate, drop, or reorder copied token text",
+        value.1.is_ok()
+          && value.2.as_ref().is_ok_and(|green| green.to_string() == source)
+          && value.3.is_ok()
+          && value.4.is_ok()
+          && value.5.as_ref().is_ok_and(|green| green.to_string() == source)
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

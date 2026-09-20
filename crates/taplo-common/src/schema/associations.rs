@@ -904,26 +904,24 @@ pub struct SchemaAssociation {
 
 #[cfg(test)]
 mod tests {
-  use std::future::Future;
+  use std::fmt::Debug;
   use std::path::Path;
   use std::path::PathBuf;
   use std::slice::from_ref;
   use std::sync::Arc;
   use std::time::Duration;
 
-  use futures::FutureExt as _;
   use futures::executor::block_on;
-  use futures::future::LocalBoxFuture;
   use serde_json::json;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_eq;
-  use strict_test_support::ensure_ok;
-  use strict_test_support::ensure_some;
+  use strict_test_support::PredicateFailure;
+  use strict_test_support::ensure_that;
   use taplo::dom::Node;
+  use taplo::parser::Parse;
+  use taplo::parser::ParseFailure;
   use taplo::parser::parse;
-  use taplo_test_support::ensure_result;
+  use thiserror::Error;
   use time::OffsetDateTime;
+  use url::ParseError;
   use url::Url;
 
   use super::AssociationError;
@@ -942,23 +940,51 @@ mod tests {
   use crate::config::Rule;
   use crate::config::SchemaOptions;
   use crate::schema::cache::Cache;
+  use crate::schema::cache::CacheError;
   #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
   use crate::schema::transport::ConcurrentSchemaTransport;
   use crate::schema::transport::OfflineSchemaTransport;
   use crate::schema::transport::SchemaTransport;
+  use crate::schema::transport::TransportError;
   #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
   use crate::schema::transport::concurrent_http_client;
   use crate::test_support::TestEnvironment;
+
   /// Offline association service used by behavior tests.
   type TestAssociations = SchemaAssociations<OfflineSchemaTransport<TestEnvironment>>;
-  /// Concurrent association service used to exercise the native `Send` operation family.
-  #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
-  type ConcurrentTestAssociations = SchemaAssociations<ConcurrentSchemaTransport<TestEnvironment>>;
 
-  fn url(input: &str) -> Result<Url, TestFailure> {
-    ensure_ok(Url::parse(input), "the association fixture URL must parse")
+  /// Native failures while constructing association fixtures.
+  #[derive(Debug, Error)]
+  enum FixtureError {
+    /// Fixture URL parsing failed.
+    #[error(transparent)]
+    Url(#[from] ParseError),
+    /// Cache construction failed.
+    #[error(transparent)]
+    Cache(#[from] CacheError),
+    /// Association construction failed.
+    #[error(transparent)]
+    Association(#[from] AssociationError),
+    /// HTTP transport construction failed.
+    #[error(transparent)]
+    Transport(#[from] TransportError),
+    /// Fixture syntax tree construction failed.
+    #[error(transparent)]
+    Parse(#[from] ParseFailure),
+    /// Fixture syntax retained recoverable diagnostics.
+    #[error(transparent)]
+    Syntax(#[from] Box<PredicateFailure<Parse>>),
+    /// Fixture serialization failed.
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
   }
 
+  /// Parse a fixture URL without changing its native error.
+  fn url(input: &str) -> Result<Url, ParseError> {
+    Url::parse(input)
+  }
+
+  /// Construct schema options for a configuration fixture.
   fn schema_options(schema_url: Option<Url>, enabled: Option<bool>) -> Options {
     Options {
       schema:     Some(SchemaOptions {
@@ -982,879 +1008,654 @@ mod tests {
     }
   }
 
-  fn associations(environment: TestEnvironment) -> Result<TestAssociations, TestFailure> {
+  /// Construct the existing offline service through its native initialization boundaries.
+  fn associations(environment: TestEnvironment) -> Result<TestAssociations, FixtureError> {
     let transport = OfflineSchemaTransport::new(environment);
-    let cache = ensure_result(Cache::new(transport.clone()), "the association cache must initialize")?;
-    ensure_result(SchemaAssociations::new(transport, cache), "the association service must initialize")
+    let cache = Cache::new(transport.clone())?;
+    Ok(SchemaAssociations::new(transport, cache)?)
   }
 
-  /// Construct one native concurrent association service with the real HTTP-capable transport.
-  #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
-  #[allow(
-    clippy::single_call_fn,
-    reason = "the concurrent fixture names the HTTP client, transport, and cache construction that make the native operation family real \
-              rather than simulated"
-  )]
-  fn concurrent_associations(environment: TestEnvironment) -> Result<ConcurrentTestAssociations, TestFailure> {
-    let http = ensure_result(
-      concurrent_http_client(&environment, Duration::from_secs(2)),
-      "the concurrent association HTTP client must construct",
-    )?;
-    let transport = ConcurrentSchemaTransport::new(environment, http);
-    let cache = ensure_result(Cache::new(transport.clone()), "the concurrent association cache must initialize")?;
-    ensure_result(
-      SchemaAssociations::new(transport, cache),
-      "the concurrent association service must initialize",
+  /// Parse a clean document while retaining the complete parser on a syntax rejection.
+  fn document(source_text: &str) -> Result<Node, FixtureError> {
+    Ok(
+      ensure_that(
+        parse(source_text)?,
+        "document association fixtures must have no syntax diagnostics",
+        |parsed| parsed.diagnostics().is_empty(),
+      )
+      .map_err(Box::new)?
+      .into_dom(),
     )
   }
 
-  /// Parse one source-backed DOM root for document-association behavior.
-  fn document(source_text: &str) -> Result<Node, TestFailure> {
-    let parsed = ensure_ok(parse(source_text), "the document-association fixture tree must build")?;
-    ensure(
-      parsed.diagnostics().is_empty(),
-      "the document-association fixture must parse cleanly",
-    )?;
-    Ok(parsed.into_dom())
+  /// Clone the complete association state at an observable transaction boundary.
+  fn snapshot<T: SchemaTransport>(associations: &SchemaAssociations<T>) -> Vec<(AssociationRule, SchemaAssociation)> {
+    associations.read().clone()
   }
 
-  #[allow(
-    clippy::single_call_fn,
-    reason = "source counting names the metadata-ownership projection that every source-scoped replacement assertion compares against"
-  )]
-  fn source_count<T: SchemaTransport>(associations: &SchemaAssociations<T>, expected_source: &str) -> usize {
-    associations
-      .read()
+  /// Count one owner in an already retained association snapshot.
+  fn source_count(entries: &[(AssociationRule, SchemaAssociation)], owner: &str) -> usize {
+    entries
       .iter()
-      .filter(|entry| association_metadata(&entry.1, "source") == Some(expected_source))
+      .filter(|entry| association_metadata(&entry.1, "source") == Some(owner))
       .count()
   }
 
-  /// Require one association source to own exactly the expected number of entries.
-  fn ensure_source_count<T: SchemaTransport>(
-    associations: &SchemaAssociations<T>,
-    source_name: &str,
-    expected: usize,
-    context: &'static str,
-  ) -> Result<(), TestFailure> {
-    ensure_eq(&source_count(associations, source_name), &expected, context)
-  }
-
-  /// Parse one document fixture and install its document-owned schema association.
-  fn add_document_association(associations: &TestAssociations, document_url: &Url, source_text: &str) -> Result<(), TestFailure> {
-    let parsed = ensure_ok(parse(source_text), "the document-association fixture tree must build")?;
-    ensure(
-      parsed.diagnostics().is_empty(),
-      "the document-association fixture must parse cleanly",
-    )?;
-    ensure_result(
-      associations.add_from_document(document_url, &parsed.into_dom()),
-      "the document-owned association must be accepted",
-    )
-  }
-
-  /// Return the owning catalog URLs of every current catalog association.
-  fn catalog_sources<T: SchemaTransport>(associations: &SchemaAssociations<T>) -> Vec<String> {
-    associations
-      .read()
+  /// Inspect catalog ownership without replacing the retained association subjects.
+  fn catalog_sources(entries: &[(AssociationRule, SchemaAssociation)]) -> Vec<&str> {
+    entries
       .iter()
       .filter(|entry| association_metadata(&entry.1, "source") == Some(source::CATALOG))
-      .filter_map(|entry| association_metadata(&entry.1, "catalog_url").map(ToOwned::to_owned))
+      .filter_map(|entry| association_metadata(&entry.1, "catalog_url"))
       .collect()
-  }
-
-  /// Require catalog ownership to match the supplied URLs in deterministic order.
-  fn ensure_catalog_sources<T: SchemaTransport, const N: usize>(
-    associations: &SchemaAssociations<T>,
-    expected: [&Url; N],
-    context: &'static str,
-  ) -> Result<(), TestFailure> {
-    let expected_sources = expected.into_iter().map(ToString::to_string).collect::<Vec<_>>();
-    ensure(catalog_sources(associations) == expected_sources, context)
-  }
-
-  /// Require one catalog operation family to replace and then clear ownership.
-  fn ensure_catalog_replacement_and_clear<'operations, T, Replacement, Clearing>(
-    associations: &'operations SchemaAssociations<T>,
-    expected: &'operations Url,
-    replacement: Replacement,
-    clearing: Clearing,
-    contexts: &[&'static str; 4],
-  ) -> LocalBoxFuture<'operations, Result<(), TestFailure>>
-  where
-    T: SchemaTransport,
-    Replacement: Future<Output = Result<(), AssociationError>> + 'operations,
-    Clearing: Future<Output = Result<(), AssociationError>> + 'operations,
-  {
-    let [replacement_context, expected_context, clearing_context, empty_context] = *contexts;
-    async move {
-      ensure_result(replacement.await, replacement_context)?;
-      ensure_catalog_sources(associations, [expected], expected_context)?;
-      ensure_result(clearing.await, clearing_context)?;
-      ensure_catalog_sources(associations, [], empty_context)
-    }
-    .boxed_local()
   }
 
   /// Construct one Taplo catalog containing a single pattern association.
   fn catalog(schema_url: &Url, title: &str, pattern: &str) -> serde_json::Value {
-    json!({
-      "schemas": [{
-        "title": title,
-        "description": "",
-        "url": schema_url,
-        "urlHash": "",
-        "authors": [],
-        "version": null,
-        "patterns": [pattern]
-      }]
-    })
+    json!({"schemas": [{"title": title, "description": "", "url": schema_url,
+      "urlHash": "", "authors": [], "version": null, "patterns": [pattern]}]})
   }
 
   #[test]
-  fn association_rules_match_each_family_and_reject_invalid_patterns() -> Result<(), TestFailure> {
-    let toml = url("file:///workspace/nested/example.toml")?;
-    let json = url("file:///workspace/nested/example.json")?;
-    let other = url("file:///workspace/nested/other.toml")?;
-
-    let glob = ensure_result(AssociationRule::glob("**/*.toml"), "a valid association glob must compile")?;
-    ensure(
-      [glob.is_match(&toml), glob.is_match(&other), glob.is_match(&json)] == [true, true, false],
-      "glob rules must match normalized document paths and reject different extensions",
-    )?;
-    ensure(
-      AssociationRule::glob("[").is_err(),
-      "an invalid association glob must retain its typed compilation failure",
-    )?;
-
-    let regex = ensure_result(
-      AssociationRule::regex(r"example\.toml$"),
-      "a valid association regular expression must compile",
-    )?;
-    ensure(
-      [regex.is_match(&toml), regex.is_match(&other), regex.is_match(&json)] == [true, false, false],
-      "regular-expression rules must evaluate the normalized complete URL",
-    )?;
-    ensure(
-      AssociationRule::regex("[").is_err(),
-      "an invalid association regular expression must retain its typed compilation failure",
-    )?;
-
-    let exact = AssociationRule::Url(toml.clone());
-    ensure(
-      [exact.is_match(&toml), exact.is_match(&other)] == [true, false],
-      "URL association rules must match exactly one document identity",
+  fn association_rules_match_each_family_and_reject_invalid_patterns() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let documents = [
+        url("file:///workspace/nested/example.toml")?,
+        url("file:///workspace/nested/other.toml")?,
+        url("file:///workspace/nested/example.json")?,
+      ];
+      let exact = AssociationRule::Url(documents[0].clone());
+      Ok::<_, FixtureError>((
+        documents,
+        AssociationRule::glob("**/*.toml"),
+        AssociationRule::glob("["),
+        AssociationRule::regex(r"example\.toml$"),
+        AssociationRule::regex("["),
+        exact,
+      ))
+    })();
+    ensure_that(
+      observed,
+      "glob, regex, and exact URL rules must preserve match polarities and native invalid-pattern failures",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        actual
+          .1
+          .as_ref()
+          .is_ok_and(|glob| actual.0.each_ref().map(|document| glob.is_match(document)) == [true, true, false])
+          && actual.2.is_err()
+          && actual
+            .3
+            .as_ref()
+            .is_ok_and(|regex| actual.0.each_ref().map(|document| regex.is_match(document)) == [true, false, false])
+          && actual.4.is_err()
+          && actual.0.each_ref().map(|document| actual.5.is_match(document)) == [true, false, false]
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn association_priority_ties_and_mutations_have_deterministic_ownership() -> Result<(), TestFailure> {
-    let associations = associations(TestEnvironment::default())?;
-    associations.clear();
-    ensure(associations.read().is_empty(), "clearing associations must remove every rule")?;
-
-    let document_url = url("file:///workspace/document.toml")?;
-    for (name, schema_url, rank) in [
-      ("lower", "https://example.com/lower.json", priority::CONFIG),
-      ("first-high", "https://example.com/first-high.json", priority::MAX),
-      ("last-high", "https://example.com/last-high.json", priority::MAX),
-    ] {
-      associations.add(AssociationRule::Url(document_url.clone()), SchemaAssociation {
-        meta:     json!({ "name": name, "source": source::MANUAL }),
-        url:      url(schema_url)?,
-        priority: rank,
+  fn association_priority_ties_and_mutations_have_deterministic_ownership() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let service = associations(TestEnvironment::default())?;
+      let document = url("file:///workspace/document.toml")?;
+      let missing = url("file:///workspace/missing.toml")?;
+      let built_in_url = url("file:///workspace/taplo.toml")?;
+      let unrelated = url("file:///workspace/unrelated.toml")?;
+      let entries = [
+        ("lower", url("https://example.com/lower.json")?, priority::CONFIG),
+        ("first-high", url("https://example.com/first-high.json")?, priority::MAX),
+        ("last-high", url("https://example.com/last-high.json")?, priority::MAX),
+      ];
+      let unrelated_schema = url("https://example.com/unrelated.json")?;
+      service.clear();
+      let cleared = snapshot(&service);
+      for (name, target, rank) in entries {
+        service.add(AssociationRule::Url(document.clone()), SchemaAssociation {
+          meta:     json!({"name": name, "source": source::MANUAL}),
+          url:      target,
+          priority: rank,
+        });
+      }
+      service.add(AssociationRule::Url(unrelated), SchemaAssociation {
+        meta:     json!({"name": "unrelated", "source": source::CONFIG}),
+        url:      unrelated_schema,
+        priority: priority::MAX,
       });
-    }
-    associations.add(AssociationRule::Url(url("file:///workspace/unrelated.toml")?), SchemaAssociation {
-      meta:     json!({ "name": "unrelated", "source": source::CONFIG }),
-      url:      url("https://example.com/unrelated.json")?,
-      priority: priority::MAX,
-    });
-    let selected = ensure_some(
-      associations.association_for(&document_url),
-      "the exact document must select one association",
-    )?;
-    ensure(
-      association_metadata(&selected, "name") == Some("last-high"),
-      "the highest priority must win and the later rule must break an equal-priority tie",
-    )?;
-    ensure(
-      associations.association_for(&url("file:///workspace/missing.toml")?).is_none(),
-      "a document with no matching rule must not fabricate an association",
-    )?;
-
-    let shared = associations.clone();
-    shared.retain(|entry| association_metadata(&entry.1, "source") == Some(source::MANUAL));
-    ensure_eq(
-      &associations.read().len(),
-      &3,
-      "retaining through a clone must mutate the shared association set",
-    )?;
-    shared.clear();
-    ensure(
-      associations.read().is_empty(),
-      "clearing through a clone must be visible to every shared holder",
-    )?;
-    ensure_result(
-      associations.add_builtins(),
-      "the built-in association must be reinstallable after a clear",
-    )?;
-    let built_in = ensure_some(
-      associations.association_for(&url("file:///workspace/taplo.toml")?),
-      "the Taplo configuration filename must match the built-in rule",
-    )?;
-    ensure(
-      (association_metadata(&built_in, "source"), built_in.priority) == (Some(source::BUILTIN), priority::BUILTIN),
-      "the rebuilt rule must retain its built-in ownership and priority",
+      let selected = service.association_for(&document);
+      let absent = service.association_for(&missing);
+      let shared = service.clone();
+      shared.retain(|entry| association_metadata(&entry.1, "source") == Some(source::MANUAL));
+      let retained = snapshot(&service);
+      shared.clear();
+      let shared_clear = snapshot(&service);
+      let reinstalled = service.add_builtins();
+      let builtin = service.association_for(&built_in_url);
+      Ok::<_, FixtureError>((service, cleared, selected, absent, retained, shared_clear, reinstalled, builtin))
+    })();
+    ensure_that(
+      observed,
+      "priority ties and shared mutations must preserve deterministic association ownership",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        actual.1.is_empty()
+          && actual
+            .2
+            .as_ref()
+            .is_some_and(|selected| association_metadata(selected, "name") == Some("last-high"))
+          && actual.3.is_none()
+          && actual.4.len() == 3
+          && actual.5.is_empty()
+          && actual.6.is_ok()
+          && actual.7.as_ref().is_some_and(|builtin| {
+            association_metadata(builtin, "source") == Some(source::BUILTIN) && builtin.priority == priority::BUILTIN
+          })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn document_schema_locations_resolve_by_source_and_fail_atomically() -> Result<(), TestFailure> {
-    let environment = TestEnvironment::default();
-    let associations = associations(environment)?;
-    let document_url = url("file:///workspace/document.toml")?;
-    let both = document("#:schema ./directive.json\n\"$schema\" = \"./field.json\"\n")?;
-    ensure_result(
-      associations.add_from_document(&document_url, &both),
-      "relative directive and schema-field locations must resolve",
-    )?;
-    ensure_source_count(
-      &associations,
-      source::DIRECTIVE,
-      1,
-      "the document directive must own one exact URL rule",
-    )?;
-    ensure_source_count(
-      &associations,
-      source::SCHEMA_FIELD,
-      1,
-      "the document schema field must own one exact URL rule",
-    )?;
-    let selected = ensure_some(
-      associations.association_for(&document_url),
-      "the document must select one of its explicit schema locations",
-    )?;
-    ensure_eq(
-      &selected.url.as_str(),
-      &"file:///workspace/directive.json",
-      "the higher-priority directive must win after document-relative resolution",
-    )?;
-
-    let absolute = document("#:schema /schemas/absolute.json\nvalue = 1\n")?;
-    ensure_result(
-      associations.add_from_document(&document_url, &absolute),
-      "an absolute host path directive must resolve through the environment",
-    )?;
-    let absolute_selected = ensure_some(
-      associations.association_for(&document_url),
-      "the absolute directive must remain associated with its document",
-    )?;
-    ensure_eq(
-      &absolute_selected.url.as_str(),
-      &"file:///schemas/absolute.json",
-      "an absolute host path directive must become a file URL",
-    )?;
-
-    let empty = document("#:schema \nvalue = 1\n")?;
-    ensure(
-      matches!(
-        associations.add_from_document(&document_url, &empty),
-        Err(AssociationError::EmptyDirective)
-      ),
-      "an empty directive must retain its typed failure",
-    )?;
-    let after_failure = ensure_some(
-      associations.association_for(&document_url),
-      "a rejected refresh must retain the prior document association",
-    )?;
-    ensure_eq(
-      &after_failure.url.as_str(),
-      &"file:///schemas/absolute.json",
-      "a rejected document refresh must not partially replace prior ownership",
-    )?;
-
-    let non_relative_field = document("\"$schema\" = \"schema.json\"\n")?;
-    ensure(
-      matches!(
-        associations.add_from_document(&document_url, &non_relative_field),
-        Err(AssociationError::InvalidSchemaLocation {
-          source_name: "`$schema` field",
-          ..
+  fn document_schema_locations_resolve_by_source_and_fail_atomically() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let service = associations(TestEnvironment::default())?;
+      let document_url = url("file:///workspace/document.toml")?;
+      let sources = [
+        "#:schema ./directive.json\n\"$schema\" = \"./field.json\"\n",
+        "#:schema /schemas/absolute.json\nvalue = 1\n",
+        "#:schema \nvalue = 1\n",
+        "\"$schema\" = \"schema.json\"\n",
+        "\"$schema\" = 1\n",
+        "value = 1\n#:schema https://example.com/body.json\n",
+      ];
+      let documents = sources.into_iter().map(document).collect::<Result<Vec<_>, _>>()?;
+      let states = documents
+        .into_iter()
+        .map(|root| {
+          let added = service.add_from_document(&document_url, &root);
+          (root, added, snapshot(&service), service.association_for(&document_url))
         })
-      ),
-      "a non-URL schema field without an explicit relative prefix must be rejected",
-    )?;
-    let non_string = document("\"$schema\" = 1\n")?;
-    ensure_result(
-      associations.add_from_document(&document_url, &non_string),
-      "a non-string schema field must be ignored",
-    )?;
-    ensure(
-      associations.association_for(&document_url).is_none(),
-      "a document without a supported directive or string schema field must clear stale document ownership",
-    )?;
-
-    let body_directive = document("value = 1\n#:schema https://example.com/body.json\n")?;
-    ensure_result(
-      associations.add_from_document(&document_url, &body_directive),
-      "a body comment that resembles a directive must remain valid TOML",
-    )?;
-    ensure(
-      associations.association_for(&document_url).is_none(),
-      "only header comments may establish schema directives",
+        .collect::<Vec<_>>();
+      Ok::<_, FixtureError>((service, states))
+    })();
+    ensure_that(
+      observed,
+      "document schema locations must preserve precedence, resolution, atomic rejection, and header-only ownership",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        actual.1.as_slice().first_chunk::<6>().is_some_and(|states| {
+          let [ref both, ref absolute, ref empty, ref non_relative, ref non_string, ref body] = *states;
+          both.1.is_ok()
+            && source_count(&both.2, source::DIRECTIVE) == 1
+            && source_count(&both.2, source::SCHEMA_FIELD) == 1
+            && both
+              .3
+              .as_ref()
+              .is_some_and(|selected| selected.url.as_str() == "file:///workspace/directive.json")
+            && absolute.1.is_ok()
+            && absolute
+              .3
+              .as_ref()
+              .is_some_and(|selected| selected.url.as_str() == "file:///schemas/absolute.json")
+            && matches!(&empty.1, Err(AssociationError::EmptyDirective))
+            && empty
+              .3
+              .as_ref()
+              .is_some_and(|selected| selected.url.as_str() == "file:///schemas/absolute.json")
+            && matches!(
+              &non_relative.1,
+              Err(AssociationError::InvalidSchemaLocation {
+                source_name: "`$schema` field",
+                ..
+              })
+            )
+            && non_string.1.is_ok()
+            && non_string.3.is_none()
+            && body.1.is_ok()
+            && body.3.is_none()
+        })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn catalog_shapes_transform_match_and_reject_invalid_metadata() -> Result<(), TestFailure> {
-    let catalog_url = url("https://example.com/catalog.json")?;
-    let schema_url = url("https://example.com/schema.json")?;
-    let mut schema_store = ensure_ok(
-      serde_json::from_value::<SchemaCatalog>(json!({
-        "$schema": SCHEMA_STORE_CATALOG_SCHEMA_URL,
-        "schemas": [{
-          "name": "Schema Store",
-          "description": "store entry",
-          "url": schema_url,
-          "fileMatch": ["*.json", "**/*.toml"],
-          "versions": {}
-        }]
-      })),
-      "a schema-store catalog must decode from its marker",
-    )?;
-    schema_store.transform_paths();
-    let schema_store_replacements = ensure_result(
-      catalog_replacements(&catalog_url, &schema_store),
-      "a normalized schema-store catalog must compile its glob rule",
-    )?;
-    let schema_store_entry = ensure_some(
-      schema_store_replacements.first(),
-      "the schema-store catalog must produce one association",
-    )?;
-    ensure(
-      (
-        schema_store_replacements.len(),
-        schema_store_entry.0.is_match(&url("file:///workspace/deep/value.json")?),
-        schema_store_entry.0.is_match(&url("file:///workspace/deep/value.toml")?),
-        association_metadata(&schema_store_entry.1, "name"),
-        association_metadata(&schema_store_entry.1, "catalog_url"),
-      ) == (1, true, true, Some("Schema Store"), Some(catalog_url.as_str())),
-      "schema-store normalization must match original shallow globs at every directory depth and retain catalog metadata",
-    )?;
-
-    let taplo_catalog = ensure_ok(
-      serde_json::from_value::<SchemaCatalog>(json!({
-        "schemas": [{
-          "title": "Taplo",
-          "description": "taplo entry",
-          "url": schema_url,
-          "urlHash": "",
-          "authors": [],
-          "version": null,
-          "patterns": [r".*\\.toml$", r".*\\.tml$"]
-        }]
-      })),
-      "a Taplo catalog must decode without the schema-store marker",
-    )?;
-    let taplo_before_transform = ensure_ok(
-      serde_json::to_value(&taplo_catalog),
-      "the Taplo catalog must serialize before path normalization",
-    )?;
-    let mut transformed_taplo = taplo_catalog.clone();
-    transformed_taplo.transform_paths();
-    let taplo_after_transform = ensure_ok(
-      serde_json::to_value(&transformed_taplo),
-      "the Taplo catalog must serialize after path normalization",
-    )?;
-    ensure_eq(
-      &taplo_after_transform,
-      &taplo_before_transform,
-      "schema-store path normalization must leave Taplo regular expressions unchanged",
-    )?;
-    let taplo_replacements = ensure_result(
-      catalog_replacements(&catalog_url, &taplo_catalog),
-      "a Taplo catalog must compile every regular expression",
-    )?;
-    ensure_eq(
-      &taplo_replacements.len(),
-      &2,
-      "each Taplo catalog regular expression must produce an independently matchable association",
-    )?;
-
-    let invalid_store = ensure_ok(
-      serde_json::from_value::<SchemaCatalog>(json!({
-        "$schema": SCHEMA_STORE_CATALOG_SCHEMA_URL,
-        "schemas": [{
-          "name": "invalid glob",
-          "description": "",
-          "url": schema_url,
-          "fileMatch": ["["],
-          "versions": {}
-        }]
-      })),
-      "an invalid schema-store glob remains catalog data until rule compilation",
-    )?;
-    ensure(
-      matches!(
+  fn catalog_shapes_transform_match_and_reject_invalid_metadata() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let catalog_url = url("https://example.com/catalog.json")?;
+      let schema_url = url("https://example.com/schema.json")?;
+      let documents = [
+        url("file:///workspace/deep/value.json")?,
+        url("file:///workspace/deep/value.toml")?,
+      ];
+      let mut store: SchemaCatalog = serde_json::from_value(json!({"$schema": SCHEMA_STORE_CATALOG_SCHEMA_URL,
+        "schemas": [{"name": "Schema Store", "description": "store entry", "url": schema_url, "fileMatch": ["*.json", "**/*.toml"], "versions": {}}]}))?;
+      store.transform_paths();
+      let store_rules = catalog_replacements(&catalog_url, &store);
+      let taplo: SchemaCatalog = serde_json::from_value(
+        json!({"schemas": [{"title": "Taplo", "description": "taplo entry", "url": schema_url,
+        "urlHash": "", "authors": [], "version": null, "patterns": [r".*\\.toml$", r".*\\.tml$"]}]}),
+      )?;
+      let before = serde_json::to_value(&taplo);
+      let mut transformed = taplo.clone();
+      transformed.transform_paths();
+      let after = serde_json::to_value(&transformed);
+      let taplo_rules = catalog_replacements(&catalog_url, &taplo);
+      let invalid_store: SchemaCatalog = serde_json::from_value(json!({"$schema": SCHEMA_STORE_CATALOG_SCHEMA_URL,
+        "schemas": [{"name": "invalid glob", "description": "", "url": schema_url, "fileMatch": ["["], "versions": {}}]}))?;
+      let invalid_taplo: SchemaCatalog = serde_json::from_value(catalog(&schema_url, "invalid regex", "["))?;
+      let rejected = [
         catalog_replacements(&catalog_url, &invalid_store),
-        Err(AssociationError::Glob { .. })
-      ),
-      "an invalid schema-store glob must retain its typed catalog context",
-    )?;
-    let invalid_taplo = ensure_ok(
-      serde_json::from_value::<SchemaCatalog>(catalog(&schema_url, "invalid regex", "[")),
-      "an invalid Taplo regular expression remains catalog data until rule compilation",
-    )?;
-    ensure(
-      matches!(
         catalog_replacements(&catalog_url, &invalid_taplo),
-        Err(AssociationError::Regex { .. })
-      ),
-      "an invalid Taplo regular expression must retain its typed catalog context",
-    )?;
-
-    let marker = ensure_ok(
-      serde_json::to_value(SchemaStoreCatalogSchema),
-      "the schema-store marker must serialize",
-    )?;
-    ensure_eq(
-      &marker,
-      &json!(SCHEMA_STORE_CATALOG_SCHEMA_URL),
-      "the schema-store marker must serialize to its exact identifying URL",
-    )?;
-    ensure(
-      serde_json::from_value::<SchemaStoreCatalogSchema>(json!("https://example.com/other.json")).is_err(),
-      "a different schema URL must not decode as a schema-store catalog marker",
+      ];
+      let marker = serde_json::to_value(SchemaStoreCatalogSchema);
+      let wrong_marker = serde_json::from_value::<SchemaStoreCatalogSchema>(json!("https://example.com/other.json"));
+      Ok::<_, FixtureError>((
+        catalog_url,
+        documents,
+        (store, taplo, transformed, invalid_store, invalid_taplo),
+        store_rules,
+        before,
+        after,
+        taplo_rules,
+        rejected,
+        marker,
+        wrong_marker,
+      ))
+    })();
+    ensure_that(
+      observed,
+      "both catalog formats must preserve matching and metadata while rejecting invalid patterns and marker identities",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        let Ok(ref rules) = actual.3 else {
+          return false;
+        };
+        let [ref entry] = *rules.as_slice() else {
+          return false;
+        };
+        actual.1.iter().all(|document| entry.0.is_match(document))
+          && association_metadata(&entry.1, "name") == Some("Schema Store")
+          && association_metadata(&entry.1, "catalog_url") == Some(actual.0.as_str())
+          && actual
+            .4
+            .as_ref()
+            .is_ok_and(|before| actual.5.as_ref().is_ok_and(|after| before == after))
+          && actual.6.as_ref().is_ok_and(|taplo_rules| taplo_rules.len() == 2)
+          && matches!(actual.7.first(), Some(Err(AssociationError::Glob { .. })))
+          && matches!(actual.7.get(1), Some(Err(AssociationError::Regex { .. })))
+          && actual
+            .8
+            .as_ref()
+            .is_ok_and(|marker| marker == &json!(SCHEMA_STORE_CATALOG_SCHEMA_URL))
+          && actual.9.is_err()
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn config_associations_replace_transactionally_and_preserve_other_sources() -> Result<(), TestFailure> {
-    let environment = TestEnvironment::default();
-    let associations = associations(environment.clone())?;
-    let global_url = url("https://example.com/global.json")?;
-    let rule_url = url("https://example.com/rule.json")?;
-    let document_url = url("file:///workspace/match.toml")?;
-    let manual_url = url("https://example.com/manual.json")?;
-    associations.add(AssociationRule::Url(document_url.clone()), SchemaAssociation {
-      meta:     json!({ "source": source::MANUAL }),
-      url:      manual_url.clone(),
-      priority: priority::MAX,
-    });
-
-    let mut first = Config {
-      global_options: schema_options(Some(global_url), Some(true)),
-      rule: Vec::from([
-        schema_rule("**/match.toml", None, Some(rule_url), Some(true)),
-        schema_rule(
-          "**/match.toml",
-          Some(Vec::from(["nested".into()])),
-          Some(url("https://example.com/key-scoped.json")?),
-          Some(true),
-        ),
-        schema_rule("**/match.toml", None, None, Some(true)),
-      ]),
-      ..Config::default()
-    };
-    associations.add_from_config(&first);
-    ensure_source_count(
-      &associations,
-      source::CONFIG,
-      0,
-      "an unprepared configuration must not fabricate file matchers or document associations",
-    )?;
-    ensure_result(
-      first.prepare(&environment, Path::new("/workspace")),
-      "the first association config must prepare",
-    )?;
-    associations.add_from_config(&first);
-    ensure_source_count(
-      &associations,
-      source::CONFIG,
-      2,
-      "only enabled URL-bearing global and file rules may create associations",
-    )?;
-    let selected = ensure_some(associations.association_for(&document_url), "the document must have an association")?;
-    ensure_eq(
-      &selected.url.as_str(),
-      &manual_url.as_str(),
-      "a preserved higher-priority manual association must remain selected",
-    )?;
-
-    let mut disabled = Config {
-      global_options: schema_options(Some(url("https://example.com/disabled.json")?), Some(false)),
-      ..Config::default()
-    };
-    ensure_result(
-      disabled.prepare(&environment, Path::new("/workspace")),
-      "the disabling config must prepare",
-    )?;
-    associations.add_from_config(&disabled);
-    ensure_source_count(
-      &associations,
-      source::CONFIG,
-      0,
-      "disabling config must remove stale config-derived associations",
-    )?;
-    ensure_source_count(
-      &associations,
-      source::MANUAL,
-      1,
-      "transactional config replacement must preserve manual associations",
-    )
-  }
-
-  #[test]
-  fn document_refresh_replaces_only_document_owned_sources() -> Result<(), TestFailure> {
-    let environment = TestEnvironment::default();
-    let associations = associations(environment)?;
-    let document_url = url("file:///workspace/document.toml")?;
-    associations.add(AssociationRule::Url(document_url.clone()), SchemaAssociation {
-      meta:     json!({ "source": source::MANUAL }),
-      url:      url("https://example.com/manual.json")?,
-      priority: priority::MAX,
-    });
-
-    add_document_association(
-      &associations,
-      &document_url,
-      "#:schema https://example.com/directive.json\nvalue = 1\n",
-    )?;
-    ensure_source_count(
-      &associations,
-      source::DIRECTIVE,
-      1,
-      "a schema directive must create one document-owned association",
-    )?;
-    ensure_source_count(
-      &associations,
-      source::MANUAL,
-      1,
-      "adding a directive must preserve a manual URL association",
-    )?;
-
-    add_document_association(&associations, &document_url, "\"$schema\" = \"https://example.com/field.json\"\n")?;
-    ensure_source_count(
-      &associations,
-      source::DIRECTIVE,
-      0,
-      "refreshing the document must remove its previous directive",
-    )?;
-    ensure_source_count(
-      &associations,
-      source::SCHEMA_FIELD,
-      1,
-      "refreshing the document must install its current schema field",
-    )?;
-
-    associations.remove_from_document(&document_url);
-    ensure_source_count(
-      &associations,
-      source::SCHEMA_FIELD,
-      0,
-      "removing document ownership must remove its schema field",
-    )?;
-    ensure_source_count(
-      &associations,
-      source::MANUAL,
-      1,
-      "removing document ownership must preserve the manual association",
-    )
-  }
-
-  #[test]
-  fn catalog_replacement_validates_the_complete_plan_before_commit() -> Result<(), TestFailure> {
-    block_on(async {
+  fn config_associations_replace_transactionally_and_preserve_other_sources() -> Result<(), impl Debug> {
+    let observed = (|| {
       let environment = TestEnvironment::default();
-      let associations = associations(environment)?;
-      associations.cache.set_cache_path(Some(PathBuf::from("/cache")));
-      let first_catalog = url("https://example.com/first-catalog.json")?;
-      let second_catalog = url("https://example.com/second-catalog.json")?;
-      let invalid_catalog = url("https://example.com/invalid-catalog.json")?;
-      let first_schema = url("https://example.com/first-schema.json")?;
-      let second_schema = url("https://example.com/second-schema.json")?;
-      let invalid_schema = url("https://example.com/invalid-schema.json")?;
+      let service = associations(environment.clone())?;
+      let document_url = url("file:///workspace/match.toml")?;
+      let manual_url = url("https://example.com/manual.json")?;
+      let mut first = Config {
+        global_options: schema_options(Some(url("https://example.com/global.json")?), Some(true)),
+        rule: Vec::from([
+          schema_rule("**/match.toml", None, Some(url("https://example.com/rule.json")?), Some(true)),
+          schema_rule(
+            "**/match.toml",
+            Some(Vec::from(["nested".into()])),
+            Some(url("https://example.com/key-scoped.json")?),
+            Some(true),
+          ),
+          schema_rule("**/match.toml", None, None, Some(true)),
+        ]),
+        ..Config::default()
+      };
+      let mut disabled = Config {
+        global_options: schema_options(Some(url("https://example.com/disabled.json")?), Some(false)),
+        ..Config::default()
+      };
+      service.add(AssociationRule::Url(document_url.clone()), SchemaAssociation {
+        meta:     json!({"source": source::MANUAL}),
+        url:      manual_url.clone(),
+        priority: priority::MAX,
+      });
+      service.add_from_config(&first);
+      let unprepared = snapshot(&service);
+      let prepared = first.prepare(&environment, Path::new("/workspace"));
+      service.add_from_config(&first);
+      let installed = snapshot(&service);
+      let selected = service.association_for(&document_url);
+      let disabled_prepared = disabled.prepare(&environment, Path::new("/workspace"));
+      service.add_from_config(&disabled);
+      let final_state = snapshot(&service);
+      Ok::<_, FixtureError>((
+        service, first, disabled, manual_url, unprepared, prepared, installed, selected, disabled_prepared, final_state,
+      ))
+    })();
+    ensure_that(
+      observed,
+      "configuration replacement must require prepared matchers, ignore key scopes, and preserve manual ownership",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        source_count(&actual.4, source::CONFIG) == 0
+          && actual.5.is_ok()
+          && source_count(&actual.6, source::CONFIG) == 2
+          && actual.7.as_ref().is_some_and(|selected| selected.url == actual.3)
+          && actual.8.is_ok()
+          && source_count(&actual.9, source::CONFIG) == 0
+          && source_count(&actual.9, source::MANUAL) == 1
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
+  }
 
-      ensure_result(
-        associations
-          .cache
-          .save(first_catalog.clone(), Arc::new(catalog(&first_schema, "first", r".*\.toml$")))
-          .await,
-        "the first catalog fixture must persist",
-      )?;
-      ensure_result(
-        associations
-          .cache
-          .save(second_catalog.clone(), Arc::new(catalog(&second_schema, "second", r".*\.toml$")))
-          .await,
-        "the second catalog fixture must persist",
-      )?;
-      ensure_result(
-        associations
-          .cache
-          .save(invalid_catalog.clone(), Arc::new(catalog(&invalid_schema, "invalid", "[")))
-          .await,
-        "the invalid catalog fixture must persist as transport data",
-      )?;
+  #[test]
+  fn document_refresh_replaces_only_document_owned_sources() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let service = associations(TestEnvironment::default())?;
+      let document_url = url("file:///workspace/document.toml")?;
+      let manual = url("https://example.com/manual.json")?;
+      let directive = document("#:schema https://example.com/directive.json\nvalue = 1\n")?;
+      let field = document("\"$schema\" = \"https://example.com/field.json\"\n")?;
+      service.add(AssociationRule::Url(document_url.clone()), SchemaAssociation {
+        meta:     json!({"source": source::MANUAL}),
+        url:      manual,
+        priority: priority::MAX,
+      });
+      let first = service.add_from_document(&document_url, &directive);
+      let first_state = snapshot(&service);
+      let second = service.add_from_document(&document_url, &field);
+      let second_state = snapshot(&service);
+      service.remove_from_document(&document_url);
+      let removed = snapshot(&service);
+      Ok::<_, FixtureError>((service, directive, field, first, first_state, second, second_state, removed))
+    })();
+    ensure_that(
+      observed,
+      "document refresh and removal must replace only the document-owned directive and schema field",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        actual.3.is_ok()
+          && source_count(&actual.4, source::DIRECTIVE) == 1
+          && source_count(&actual.4, source::MANUAL) == 1
+          && actual.5.is_ok()
+          && source_count(&actual.6, source::DIRECTIVE) == 0
+          && source_count(&actual.6, source::SCHEMA_FIELD) == 1
+          && source_count(&actual.7, source::SCHEMA_FIELD) == 0
+          && source_count(&actual.7, source::MANUAL) == 1
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
+  }
 
-      ensure_result(
-        associations.replace_catalogs(from_ref(&first_catalog)).await,
-        "the first catalog must install",
-      )?;
-      ensure_catalog_sources(
-        &associations,
-        [&first_catalog],
-        "the first replacement must own the complete catalog association set",
-      )?;
-
-      let rejected = associations.replace_catalogs(&[second_catalog.clone(), invalid_catalog]).await;
-      ensure(rejected.is_err(), "an invalid later catalog must reject the complete replacement")?;
-      ensure_catalog_sources(
-        &associations,
-        [&first_catalog],
-        "a rejected replacement must preserve the previously committed catalog set",
-      )?;
-
-      ensure_catalog_replacement_and_clear(
-        &associations,
-        &second_catalog,
-        associations.replace_catalogs(from_ref(&second_catalog)),
-        associations.replace_catalogs(&[]),
-        &[
-          "the valid second catalog must replace the first",
-          "a successful replacement must remove stale catalog ownership",
-          "an empty catalog configuration must clear catalog ownership",
-          "clearing catalogs must preserve no stale catalog association",
-        ],
-      )
-      .await?;
-
-      ensure_result(
-        associations.add_from_catalog(&first_catalog).await,
-        "the local single-catalog operation must install its owned entries",
-      )?;
-      ensure_catalog_sources(
-        &associations,
-        [&first_catalog],
-        "single-catalog installation must own only its catalog URL",
-      )
-    })
+  #[test]
+  fn catalog_replacement_validates_the_complete_plan_before_commit() -> Result<(), impl Debug> {
+    let observed = block_on(async {
+      let service = associations(TestEnvironment::default())?;
+      service.cache.set_cache_path(Some(PathBuf::from("/cache")));
+      let catalogs = [
+        url("https://example.com/first-catalog.json")?,
+        url("https://example.com/second-catalog.json")?,
+        url("https://example.com/invalid-catalog.json")?,
+      ];
+      let schemas = [
+        url("https://example.com/first-schema.json")?,
+        url("https://example.com/second-schema.json")?,
+        url("https://example.com/invalid-schema.json")?,
+      ];
+      let [ref first, ref second, ref invalid] = catalogs;
+      let mut saved = Vec::new();
+      for (address, target, name, pattern) in [
+        (&catalogs[0], &schemas[0], "first", r".*\.toml$"),
+        (&catalogs[1], &schemas[1], "second", r".*\.toml$"),
+        (&catalogs[2], &schemas[2], "invalid", "["),
+      ] {
+        saved.push(
+          service
+            .cache
+            .save(address.clone(), Arc::new(catalog(target, name, pattern)))
+            .await,
+        );
+      }
+      let first_result = service.replace_catalogs(from_ref(first)).await;
+      let first_state = snapshot(&service);
+      let rejected = service.replace_catalogs(&[second.clone(), invalid.clone()]).await;
+      let rejected_state = snapshot(&service);
+      let replaced = service.replace_catalogs(from_ref(second)).await;
+      let replaced_state = snapshot(&service);
+      let cleared = service.replace_catalogs(&[]).await;
+      let cleared_state = snapshot(&service);
+      let single = service.add_from_catalog(first).await;
+      let single_state = snapshot(&service);
+      Ok::<_, FixtureError>((service, catalogs, schemas, saved, [
+        (first_result, first_state),
+        (rejected, rejected_state),
+        (replaced, replaced_state),
+        (cleared, cleared_state),
+        (single, single_state),
+      ]))
+    });
+    ensure_that(
+      observed,
+      "catalog replacement must validate the complete plan, preserve failed transactions, and support clearing and single-catalog \
+       installation",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        let [ref installed, ref rejected, ref replaced, ref cleared, ref single] = actual.4;
+        let [ref first, ref second, _] = actual.1;
+        actual.3.iter().all(Result::is_ok)
+          && installed.0.is_ok()
+          && catalog_sources(&installed.1) == [first.as_str()]
+          && rejected.0.is_err()
+          && catalog_sources(&rejected.1) == [first.as_str()]
+          && replaced.0.is_ok()
+          && catalog_sources(&replaced.1) == [second.as_str()]
+          && cleared.0.is_ok()
+          && catalog_sources(&cleared.1).is_empty()
+          && single.0.is_ok()
+          && catalog_sources(&single.1) == [first.as_str()]
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Preserve catalog transaction semantics through the native concurrent operation family.
   #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
   #[test]
-  fn concurrent_catalog_operations_validate_before_replacing_owned_entries() -> Result<(), TestFailure> {
-    block_on(async {
-      let first_catalog = url("https://example.com/first-concurrent-catalog.json")?;
-      let second_catalog = url("https://example.com/second-concurrent-catalog.json")?;
-      let invalid_catalog = url("https://example.com/invalid-concurrent-catalog.json")?;
-      let first_schema = url("https://example.com/first-concurrent-schema.json")?;
-      let second_schema = url("https://example.com/second-concurrent-schema.json")?;
-      let invalid_schema = url("https://example.com/invalid-concurrent-schema.json")?;
-      let concurrent = concurrent_associations(TestEnvironment::default())?;
-      concurrent.cache.set_cache_path(Some(PathBuf::from("/concurrent-cache")));
-      ensure_result(
-        concurrent
-          .cache
-          .save(first_catalog.clone(), Arc::new(catalog(&first_schema, "first", r".*\.toml$")))
-          .await,
-        "the first concurrent catalog fixture must persist",
-      )?;
-      ensure_result(
-        concurrent
-          .cache
-          .save(second_catalog.clone(), Arc::new(catalog(&second_schema, "second", r".*\.toml$")))
-          .await,
-        "the second concurrent catalog fixture must persist",
-      )?;
-      ensure_result(
-        concurrent
-          .cache
-          .save(invalid_catalog.clone(), Arc::new(catalog(&invalid_schema, "invalid", "[")))
-          .await,
-        "the invalid concurrent catalog fixture must persist as transport data",
-      )?;
-      ensure_result(
-        concurrent.add_from_catalog_concurrent(&first_catalog).await,
-        "the first concurrent single-catalog operation must install its owned entries",
-      )?;
-      ensure_result(
-        concurrent.add_from_catalog_concurrent(&second_catalog).await,
-        "the second concurrent single-catalog operation must install its owned entries",
-      )?;
-      ensure_catalog_sources(
-        &concurrent,
-        [&first_catalog, &second_catalog],
-        "single-catalog replacement must preserve entries owned by other catalogs",
-      )?;
-
-      let rejected = concurrent
-        .replace_catalogs_concurrent(&[second_catalog.clone(), invalid_catalog])
-        .await;
-      ensure(
-        rejected.is_err(),
-        "an invalid concurrent catalog must reject the complete replacement",
-      )?;
-      ensure_catalog_sources(
-        &concurrent,
-        [&first_catalog, &second_catalog],
-        "a rejected concurrent replacement must preserve every previously committed catalog",
-      )?;
-
-      ensure_catalog_replacement_and_clear(
-        &concurrent,
-        &second_catalog,
-        concurrent.replace_catalogs_concurrent(from_ref(&second_catalog)),
-        concurrent.replace_catalogs_concurrent(&[]),
-        &[
-          "the concurrent complete-catalog operation must replace all catalog ownership",
-          "concurrent complete-catalog replacement must remove stale catalog ownership",
-          "the concurrent empty catalog set must clear catalog ownership",
-          "the concurrent empty catalog set must preserve no stale entries",
-        ],
-      )
-      .await
-    })
+  fn concurrent_catalog_operations_validate_before_replacing_owned_entries() -> Result<(), impl Debug> {
+    let observed = block_on(async {
+      let environment = TestEnvironment::default();
+      let transport = ConcurrentSchemaTransport::new(environment.clone(), concurrent_http_client(&environment, Duration::from_secs(2))?);
+      let cache = Cache::new(transport.clone())?;
+      let service = SchemaAssociations::new(transport, cache)?;
+      service.cache.set_cache_path(Some(PathBuf::from("/concurrent-cache")));
+      let catalogs = [
+        url("https://example.com/first-concurrent-catalog.json")?,
+        url("https://example.com/second-concurrent-catalog.json")?,
+        url("https://example.com/invalid-concurrent-catalog.json")?,
+      ];
+      let schemas = [
+        url("https://example.com/first-concurrent-schema.json")?,
+        url("https://example.com/second-concurrent-schema.json")?,
+        url("https://example.com/invalid-concurrent-schema.json")?,
+      ];
+      let [ref first, ref second, ref invalid] = catalogs;
+      let mut saved = Vec::new();
+      for (address, target, name, pattern) in [
+        (&catalogs[0], &schemas[0], "first", r".*\.toml$"),
+        (&catalogs[1], &schemas[1], "second", r".*\.toml$"),
+        (&catalogs[2], &schemas[2], "invalid", "["),
+      ] {
+        saved.push(
+          service
+            .cache
+            .save(address.clone(), Arc::new(catalog(target, name, pattern)))
+            .await,
+        );
+      }
+      let installed = [
+        service.add_from_catalog_concurrent(first).await,
+        service.add_from_catalog_concurrent(second).await,
+      ];
+      let installed_state = snapshot(&service);
+      let rejected = service.replace_catalogs_concurrent(&[second.clone(), invalid.clone()]).await;
+      let rejected_state = snapshot(&service);
+      let replaced = service.replace_catalogs_concurrent(from_ref(second)).await;
+      let replaced_state = snapshot(&service);
+      let cleared = service.replace_catalogs_concurrent(&[]).await;
+      let cleared_state = snapshot(&service);
+      Ok::<_, FixtureError>((
+        service, catalogs, schemas, saved, installed, installed_state, rejected, rejected_state, replaced, replaced_state, cleared,
+        cleared_state,
+      ))
+    });
+    ensure_that(
+      observed,
+      "concurrent catalog operations must validate before replacing ownership and preserve prior catalogs after rejection",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        actual.3.iter().all(Result::is_ok)
+          && actual.4.iter().all(Result::is_ok)
+          && catalog_sources(&actual.5) == [actual.1[0].as_str(), actual.1[1].as_str()]
+          && actual.6.is_err()
+          && catalog_sources(&actual.7) == [actual.1[0].as_str(), actual.1[1].as_str()]
+          && actual.8.is_ok()
+          && catalog_sources(&actual.9) == [actual.1[1].as_str()]
+          && actual.10.is_ok()
+          && catalog_sources(&actual.11).is_empty()
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
-  /// Prefer current cached catalogs over host drift and retain typed malformed-data failures.
   #[test]
-  fn current_catalog_cache_precedes_host_drift_and_rejects_malformed_data() -> Result<(), TestFailure> {
-    block_on(async {
+  fn current_catalog_cache_precedes_host_drift_and_rejects_malformed_data() -> Result<(), impl Debug> {
+    let observed = block_on(async {
       let environment = TestEnvironment::default();
-      let current_associations = associations(environment.clone())?;
-      current_associations.cache.set_cache_path(Some(PathBuf::from("/current-cache")));
-      ensure(
-        format!("{current_associations:?}").contains("rules: Some(1)"),
-        "association debug output must expose rule cardinality without rendering rule contents",
-      )?;
-
+      let service = associations(environment.clone())?;
+      service.cache.set_cache_path(Some(PathBuf::from("/current-cache")));
       let catalog_url = url("file:///workspace/catalog.json")?;
       let schema_url = url("https://example.com/schema.json")?;
-      let first_catalog = catalog(&schema_url, "first", r".*\.toml$");
-      let first_bytes = ensure_ok(serde_json::to_vec(&first_catalog), "the fresh catalog fixture must serialize")?;
-      environment.insert_file("/workspace/catalog.json", first_bytes);
-      ensure_result(
-        current_associations.add_from_catalog(&catalog_url).await,
-        "a fresh file catalog must load through the schema transport",
-      )?;
-      ensure(
-        catalog_sources(&current_associations) == [catalog_url.to_string()],
-        "a fresh transport load must install only the requested catalog ownership",
-      )?;
-
-      let replacement_schema = url("https://example.com/replacement.json")?;
-      let replacement_bytes = ensure_ok(
-        serde_json::to_vec(&catalog(&replacement_schema, "replacement", r".*\.json$")),
-        "the replacement catalog fixture must serialize",
-      )?;
-      environment.insert_file("/workspace/catalog.json", replacement_bytes);
-      ensure_result(
-        current_associations.add_from_catalog(&catalog_url).await,
-        "a current process-local catalog must remain loadable after host data changes",
-      )?;
-      let cached_selection = ensure_some(
-        current_associations.association_for(&url("file:///workspace/value.toml")?),
-        "the cached first catalog must still match its TOML document",
-      )?;
-      ensure_eq(
-        &cached_selection.url.as_str(),
-        &schema_url.as_str(),
-        "a current process-local catalog must take precedence over later host drift",
-      )?;
-      ensure(
-        current_associations
-          .association_for(&url("file:///workspace/value.json")?)
-          .is_none(),
-        "host drift must not partially replace a current cached catalog",
-      )?;
-
-      let malformed_cached_url = url("https://example.com/malformed-cached.json")?;
-      current_associations
+      let replacement_url = url("https://example.com/replacement.json")?;
+      let malformed_url = url("https://example.com/malformed-cached.json")?;
+      let documents = [url("file:///workspace/value.toml")?, url("file:///workspace/value.json")?];
+      let first_bytes = serde_json::to_vec(&catalog(&schema_url, "first", r".*\.toml$"))?;
+      let replacement_bytes = serde_json::to_vec(&catalog(&replacement_url, "replacement", r".*\.json$"))?;
+      let debug = format!("{service:?}");
+      environment.insert_file("/workspace/catalog.json", first_bytes.clone());
+      let loaded = service.add_from_catalog(&catalog_url).await;
+      let loaded_state = snapshot(&service);
+      environment.insert_file("/workspace/catalog.json", replacement_bytes.clone());
+      let reloaded = service.add_from_catalog(&catalog_url).await;
+      let selections = documents.each_ref().map(|document| service.association_for(document));
+      service
         .cache
-        .insert_memory(malformed_cached_url.clone(), Arc::new(json!({ "unexpected": true })));
-      ensure(
-        matches!(
-          current_associations.add_from_catalog(&malformed_cached_url).await,
-          Err(AssociationError::Catalog {
-            ref url,
-            ..
-          }) if url == &malformed_cached_url
-        ),
-        "malformed process-local catalog data must retain its catalog URL and typed decoder failure",
-      )
-    })
+        .insert_memory(malformed_url.clone(), Arc::new(json!({"unexpected": true})));
+      let malformed = service.add_from_catalog(&malformed_url).await;
+      Ok::<_, FixtureError>((
+        service, catalog_url, schema_url, malformed_url, debug, first_bytes, replacement_bytes, loaded, loaded_state, reloaded, selections,
+        malformed,
+      ))
+    });
+    ensure_that(
+      observed,
+      "current catalog cache must outrank host drift and malformed cached data must retain its URL and decoder failure",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        actual.4.contains("rules: Some(1)")
+          && actual.7.is_ok()
+          && catalog_sources(&actual.8) == [actual.1.as_str()]
+          && actual.9.is_ok()
+          && actual.10[0].as_ref().is_some_and(|selected| selected.url == actual.2)
+          && actual.10[1].is_none()
+          && matches!(&actual.11, Err(AssociationError::Catalog { url, .. }) if url == &actual.3)
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
-  /// Recover remote transport failure through stale disk state without erasing typed failures.
   #[test]
-  fn stale_catalog_cache_recovers_transport_and_preserves_failures() -> Result<(), TestFailure> {
-    block_on(async {
+  fn stale_catalog_cache_recovers_transport_and_preserves_failures() -> Result<(), impl Debug> {
+    let observed = block_on(async {
+      let environment = TestEnvironment::default();
+      let service = associations(environment.clone())?;
+      service.cache.set_cache_path(Some(PathBuf::from("/cache")));
       let schema_url = url("https://example.com/schema.json")?;
-      let stale_environment = TestEnvironment::default();
-      let stale_associations = associations(stale_environment.clone())?;
-      stale_associations.cache.set_cache_path(Some(PathBuf::from("/cache")));
-      ensure_result(
-        stale_associations.cache.set_expiration_times(Duration::ZERO, Duration::ZERO),
-        "the stale-catalog fixture must configure immediate expiration",
-      )?;
-      let stale_catalog_url = url("https://example.com/stale-catalog.json")?;
-      ensure_result(
-        stale_associations
-          .cache
-          .save(stale_catalog_url.clone(), Arc::new(catalog(&schema_url, "stale", r".*\.toml$")))
-          .await,
-        "the stale catalog fixture must persist before expiration",
-      )?;
-      stale_environment.set_now(OffsetDateTime::UNIX_EPOCH.saturating_add(time::Duration::seconds(1)));
-      ensure_result(
-        stale_associations.add_from_catalog(&stale_catalog_url).await,
-        "an unavailable remote catalog must fall back to its expired disk entry",
-      )?;
-      let stale_selection = ensure_some(
-        stale_associations.association_for(&url("file:///workspace/stale.toml")?),
-        "the stale fallback catalog must install its association",
-      )?;
-      ensure_eq(
-        &stale_selection.url.as_str(),
-        &schema_url.as_str(),
-        "stale recovery must preserve the catalog's original schema target",
-      )?;
-
-      let malformed_stale_url = url("https://example.com/malformed-stale.json")?;
-      ensure_result(
-        stale_associations
-          .cache
-          .save(malformed_stale_url.clone(), Arc::new(json!({ "unexpected": true })))
-          .await,
-        "the malformed stale fixture must persist as cache data",
-      )?;
-      stale_environment.set_now(OffsetDateTime::UNIX_EPOCH.saturating_add(time::Duration::seconds(2)));
-      ensure(
-        matches!(
-          stale_associations.add_from_catalog(&malformed_stale_url).await,
-          Err(AssociationError::Catalog {
-            ref url,
-            ..
-          }) if url == &malformed_stale_url
-        ),
-        "malformed stale catalog data must retain its URL and typed decoder failure",
-      )?;
-
+      let stale_url = url("https://example.com/stale-catalog.json")?;
+      let malformed_url = url("https://example.com/malformed-stale.json")?;
       let missing_url = url("https://example.com/missing-catalog.json")?;
-      ensure(
-        matches!(
-          stale_associations.add_from_catalog(&missing_url).await,
-          Err(AssociationError::Transport(_))
-        ),
-        "a transport failure without current or stale cache state must remain a typed transport error",
-      )?;
-      ensure(
-        catalog_sources(&stale_associations) == [stale_catalog_url.to_string()],
-        "failed catalog loads must preserve the last successfully committed catalog ownership",
-      )
-    })
+      let document_url = url("file:///workspace/stale.toml")?;
+      let policy = service.cache.set_expiration_times(Duration::ZERO, Duration::ZERO);
+      let saved = service
+        .cache
+        .save(stale_url.clone(), Arc::new(catalog(&schema_url, "stale", r".*\.toml$")))
+        .await;
+      environment.set_now(OffsetDateTime::UNIX_EPOCH.saturating_add(time::Duration::seconds(1)));
+      let recovered = service.add_from_catalog(&stale_url).await;
+      let selected = service.association_for(&document_url);
+      let saved_malformed = service
+        .cache
+        .save(malformed_url.clone(), Arc::new(json!({"unexpected": true})))
+        .await;
+      environment.set_now(OffsetDateTime::UNIX_EPOCH.saturating_add(time::Duration::seconds(2)));
+      let malformed = service.add_from_catalog(&malformed_url).await;
+      let missing = service.add_from_catalog(&missing_url).await;
+      let final_state = snapshot(&service);
+      Ok::<_, FixtureError>((
+        service, schema_url, stale_url, malformed_url, policy, saved, recovered, selected, saved_malformed, malformed, missing, final_state,
+      ))
+    });
+    ensure_that(
+      observed,
+      "stale recovery must retain its target while malformed and missing catalogs preserve typed failures and committed ownership",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        actual.4.is_ok()
+          && actual.5.is_ok()
+          && actual.6.is_ok()
+          && actual.7.as_ref().is_some_and(|selected| selected.url == actual.1)
+          && actual.8.is_ok()
+          && matches!(&actual.9, Err(AssociationError::Catalog { url, .. }) if url == &actual.3)
+          && matches!(&actual.10, Err(AssociationError::Transport(_)))
+          && catalog_sources(&actual.11) == [actual.2.as_str()]
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

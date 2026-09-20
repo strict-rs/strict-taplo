@@ -277,53 +277,94 @@ impl<'b> SemanticTokensBuilder<'b> {
 
 #[cfg(test)]
 mod tests {
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_ok;
+  use std::fmt::Debug;
+
+  use strict_test_support::ensure_that;
   use taplo::parser;
 
   use super::Mapper;
+  use super::MappingError;
   use super::SemanticToken;
+  use super::SemanticTokenError;
   use super::create_tokens;
 
-  /// Parse one semantic-token fixture and project its custom tokens.
-  fn fixture_tokens(source: &str) -> Result<Vec<SemanticToken>, TestFailure> {
-    let syntax = ensure_ok(parser::parse(source), "the semantic-token fixture must parse")?.into_syntax();
-    let mapper = ensure_ok(Mapper::new_utf16(source), "the semantic-token mapper must build")?;
-    ensure_ok(create_tokens(&syntax, &mapper), "semantic-token construction must succeed")
+  /// Complete native inputs and token projection for one fixture.
+  #[derive(Debug)]
+  struct TokenObservation {
+    /// Lossless syntax and recoverable diagnostics or native construction failure.
+    parsed: Result<parser::Parse, parser::ParseFailure>,
+    /// Coordinate model or its native construction failure.
+    mapper: Result<Mapper, MappingError>,
+    /// Token projection when both input owners were constructed.
+    tokens: Option<Result<Vec<SemanticToken>, SemanticTokenError>>,
+  }
+
+  /// Parse one semantic-token fixture while retaining its inputs and projection.
+  fn fixture_tokens(source: &str) -> TokenObservation {
+    let parsed = parser::parse(source);
+    let mapper = Mapper::new_utf16(source);
+    let tokens = parsed
+      .as_ref()
+      .ok()
+      .zip(mapper.as_ref().ok())
+      .map(|(syntax, coordinates)| create_tokens(&syntax.clone().into_syntax(), coordinates));
+    TokenObservation {
+      parsed,
+      mapper,
+      tokens,
+    }
   }
 
   #[test]
-  fn semantic_tokens_follow_the_advertised_legend_and_checked_deltas() -> Result<(), TestFailure> {
-    let tokens = fixture_tokens("array = [1]\ntable = { value = 2 }\n")?;
-    ensure(
-      tokens
-        == vec![
-          SemanticToken {
-            delta_line:             0,
-            delta_start:            0,
-            length:                 5,
-            token_type:             0,
-            token_modifiers_bitset: 0,
-          },
-          SemanticToken {
-            delta_line:             1,
-            delta_start:            0,
-            length:                 5,
-            token_type:             1,
-            token_modifiers_bitset: 0,
-          },
-        ],
+  fn semantic_tokens_follow_the_advertised_legend_and_checked_deltas() -> Result<(), impl Debug> {
+    ensure_that(
+      fixture_tokens("array = [1]\ntable = { value = 2 }\n"),
       "token types, widths, and relative starts must derive from the advertised wire legend",
+      |observed| {
+        observed.parsed.as_ref().is_ok_and(|parsed| parsed.diagnostics().is_empty())
+          && observed.mapper.is_ok()
+          && observed
+            .tokens
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .is_some_and(|tokens| {
+              *tokens
+                == vec![
+                  SemanticToken {
+                    delta_line:             0,
+                    delta_start:            0,
+                    length:                 5,
+                    token_type:             0,
+                    token_modifiers_bitset: 0,
+                  },
+                  SemanticToken {
+                    delta_line:             1,
+                    delta_start:            0,
+                    length:                 5,
+                    token_type:             1,
+                    token_modifiers_bitset: 0,
+                  },
+                ]
+            })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn ordinary_scalar_keys_do_not_receive_custom_semantic_tokens() -> Result<(), TestFailure> {
-    let tokens = fixture_tokens("plain = 1\n")?;
-    ensure(
-      tokens.is_empty(),
+  fn ordinary_scalar_keys_do_not_receive_custom_semantic_tokens() -> Result<(), impl Debug> {
+    ensure_that(
+      fixture_tokens("plain = 1\n"),
       "ordinary scalar keys must not be classified as custom array or table semantic tokens",
+      |observed| {
+        observed
+          .tokens
+          .as_ref()
+          .is_some_and(|result| result.as_ref().is_ok_and(Vec::is_empty))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

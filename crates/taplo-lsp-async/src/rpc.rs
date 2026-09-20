@@ -187,23 +187,22 @@ impl<T> Request<T> {
   ///
   /// ```
   /// use lsp_types::NumberOrString;
-  /// use strict_test_support::{TestFailure, ensure, ensure_ok};
-  /// use taplo_lsp_async::rpc::{MessageId, Request};
+  /// use strict_test_support::{PredicateFailure, ensure_that};
+  /// use taplo_lsp_async::rpc::{Message, MessageId, Request};
   ///
-  /// fn main() -> Result<(), TestFailure> {
-  ///   let message = ensure_ok(
+  /// fn main() -> Result<(), PredicateFailure<Result<Message, serde_json::Error>>> {
+  ///   ensure_that(
   ///     Request::new()
   ///       .with_method("workspace/example")
   ///       .with_id(Some(NumberOrString::Number(7)))
   ///       .with_params(Some(serde_json::json!({ "enabled": true })))
   ///       .try_into_message(),
-  ///     "the typed request must serialize",
-  ///   )?;
-  ///   ensure(
-  ///     message.id == MessageId::Value(NumberOrString::Number(7))
-  ///       && message.method.as_deref() == Some("workspace/example"),
   ///     "the wire request must retain its method and identifier",
-  ///   )
+  ///     |outcome| outcome.as_ref().is_ok_and(|message| {
+  ///       message.id == MessageId::Value(NumberOrString::Number(7))
+  ///         && message.method.as_deref() == Some("workspace/example")
+  ///     }),
+  ///   ).map(drop)
   /// }
   /// ```
   ///
@@ -643,12 +642,13 @@ mod tests {
   use std::error::Error as StdError;
 
   use lsp_types::NumberOrString;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
+  use strict_test_support::ComparisonFailure;
+  use strict_test_support::PredicateFailure;
   use strict_test_support::ensure_eq;
-  use strict_test_support::ensure_ok;
-  use strict_test_support::ensure_some;
+  use strict_test_support::ensure_that;
 
+  use super::InvalidResponseDecode;
+  use super::InvalidServerCode;
   use super::Message;
   use super::MessageDecodeError;
   use super::MessageId;
@@ -659,110 +659,73 @@ mod tests {
   use super::decode_value;
   use crate::SerializationFailureFixture;
 
-  /// Require one parsed JSON value to fail the supported wire-message contract.
-  fn decode_failure(wire_message: serde_json::Value, context: &'static str) -> Result<MessageDecodeError, TestFailure> {
-    ensure_some(decode_value(wire_message).err(), context)
-  }
-
-  /// Construct a malformed request with one recoverable string identifier.
-  #[allow(
-    clippy::single_call_fn,
-    reason = "the malformed-request fixture names the recoverable-ID decoding contract exercised by the protocol-error test"
-  )]
-  fn malformed_request() -> serde_json::Value {
-    serde_json::json!({
-      "jsonrpc": "2.0",
-      "id": "recoverable",
-      "method": 17
-    })
-  }
-
-  /// Construct a malformed response with one recoverable numeric identifier.
-  #[allow(
-    clippy::single_call_fn,
-    reason = "the malformed-response fixture names the response-classification contract exercised by the no-reply test"
-  )]
-  fn malformed_response() -> serde_json::Value {
-    serde_json::json!({
-      "jsonrpc": "2.0",
-      "id": 11,
-      "error": "not an error object"
-    })
+  /// Full wire-family decoding results, including both typed presence states.
+  #[derive(Debug)]
+  struct WireFamilies {
+    /// Requests, notifications, successful responses, and failed responses.
+    messages: [Result<Message, MessageDecodeError>; 4],
+    /// Explicit null and missing successful-response fields.
+    typed:    [Result<Response<serde_json::Value>, serde_json::Error>; 2],
   }
 
   #[test]
-  fn decodes_each_supported_wire_family() -> Result<(), TestFailure> {
-    let request = ensure_ok(
-      decode_slice(br#"{"jsonrpc":"2.0","id":7,"method":"fixture","params":{"value":1}}"#),
-      "a valid request must decode",
-    )?;
-    ensure(
-      (request.method.as_deref(), request.id) == (Some("fixture"), MessageId::Value(NumberOrString::Number(7))),
-      "a request must retain its method and concrete ID",
-    )?;
-
-    let notification = ensure_ok(
-      decode_slice(br#"{"jsonrpc":"2.0","method":"fixture"}"#),
-      "a valid notification must decode",
-    )?;
-    ensure(
-      (notification.method.as_deref(), notification.id) == (Some("fixture"), MessageId::Missing),
-      "a notification must preserve an absent ID",
-    )?;
-
-    let response = ensure_ok(
-      decode_slice(br#"{"jsonrpc":"2.0","id":"fixture","result":null}"#),
-      "a valid response must decode",
-    )?;
-    ensure(
-      (response.method, response.id, response.result)
-        == (
-          None,
-          MessageId::Value(NumberOrString::String("fixture".into())),
-          Some(serde_json::Value::Null),
-        ),
-      "a response must retain its ID and explicit null result",
-    )?;
-
-    let error_response = ensure_ok(
-      decode_slice(br#"{"jsonrpc":"2.0","id":8,"error":{"code":-32601,"message":"missing","data":null}}"#),
-      "a valid error response must decode",
-    )?;
-    ensure(
-      (error_response.result.is_some(), error_response.error.is_some()) == (false, true),
-      "an absent result field must remain distinct from an explicit null result",
-    )?;
-
-    let typed_null = ensure_ok(
-      serde_json::from_slice::<Response<serde_json::Value>>(br#"{"jsonrpc":"2.0","id":9,"result":null}"#),
-      "a typed response with an explicit null result must deserialize",
-    )?;
-    let typed_absent = ensure_ok(
-      serde_json::from_slice::<Response<serde_json::Value>>(br#"{"jsonrpc":"2.0","id":9}"#),
-      "a typed response with an absent result must deserialize",
-    )?;
-    ensure(
-      (typed_null.result, typed_absent.result) == (Some(serde_json::Value::Null), None),
-      "typed responses must preserve the wire distinction between explicit null and absence",
+  fn decodes_each_supported_wire_family() -> Result<(), Box<PredicateFailure<WireFamilies>>> {
+    let observed = WireFamilies {
+      messages: [
+        decode_slice(br#"{"jsonrpc":"2.0","id":7,"method":"fixture","params":{"value":1}}"#),
+        decode_slice(br#"{"jsonrpc":"2.0","method":"fixture"}"#),
+        decode_slice(br#"{"jsonrpc":"2.0","id":"fixture","result":null}"#),
+        decode_slice(br#"{"jsonrpc":"2.0","id":8,"error":{"code":-32601,"message":"missing","data":null}}"#),
+      ],
+      typed:    [
+        serde_json::from_slice(br#"{"jsonrpc":"2.0","id":9,"result":null}"#),
+        serde_json::from_slice(br#"{"jsonrpc":"2.0","id":9}"#),
+      ],
+    };
+    ensure_that(
+      observed,
+      "wire decoding must retain every message family and distinguish null from absent results",
+      |observations| {
+        let [ref request, ref notification, ref response, ref error] = observations.messages;
+        let [ref typed_null, ref typed_absent] = observations.typed;
+        request
+          .as_ref()
+          .is_ok_and(|message| message.method.as_deref() == Some("fixture") && message.id == MessageId::Value(NumberOrString::Number(7)))
+          && notification
+            .as_ref()
+            .is_ok_and(|message| message.method.as_deref() == Some("fixture") && message.id == MessageId::Missing)
+          && response.as_ref().is_ok_and(|message| {
+            message.method.is_none()
+              && message.id == MessageId::Value(NumberOrString::String("fixture".into()))
+              && message.result == Some(serde_json::Value::Null)
+          })
+          && error
+            .as_ref()
+            .is_ok_and(|message| message.result.is_none() && message.error.is_some())
+          && typed_null
+            .as_ref()
+            .is_ok_and(|message| message.result == Some(serde_json::Value::Null))
+          && typed_absent.as_ref().is_ok_and(|message| message.result.is_none())
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
+  }
+
+  /// Original wire messages and their presence-aware serialized forms.
+  #[derive(Debug)]
+  struct PresenceObservations {
+    /// Direct and optional identifier conversions.
+    identifiers: [MessageId; 3],
+    /// Notification, request, response, and null-ID message subjects.
+    messages:    [Message; 4],
+    /// Serialized notification and null-ID object.
+    serialized:  [Result<serde_json::Value, serde_json::Error>; 2],
   }
 
   #[test]
-  fn message_identifiers_preserve_presence_and_classification_contracts() -> Result<(), TestFailure> {
+  fn message_identifiers_preserve_presence_and_classification_contracts() -> Result<(), Box<PredicateFailure<PresenceObservations>>> {
     let request_id = NumberOrString::String("request".into());
-    ensure(
-      (
-        MessageId::from(request_id.clone()),
-        MessageId::from_optional(Some(request_id.clone())),
-        MessageId::from_optional(None),
-      ) == (
-        MessageId::Value(request_id.clone()),
-        MessageId::Value(request_id.clone()),
-        MessageId::Missing,
-      ),
-      "direct and optional request identifiers must preserve concrete and absent presence states",
-    )?;
-
     let notification = Message {
       jsonrpc: "2.0".into(),
       method: Some("fixture/notify".into()),
@@ -774,7 +737,7 @@ mod tests {
     };
     let response = Message {
       jsonrpc: "2.0".into(),
-      id: MessageId::Value(request_id),
+      id: MessageId::Value(request_id.clone()),
       ..Message::default()
     };
     let null_id = Message {
@@ -782,371 +745,437 @@ mod tests {
       id: MessageId::Null,
       ..Message::default()
     };
-    ensure(
-      (
-        notification.is_notification(),
-        notification.is_response(),
-        request.is_notification(),
-        request.is_response(),
-        response.is_notification(),
-        response.is_response(),
-        null_id.is_notification(),
-        null_id.is_response(),
-      ) == (true, false, false, false, false, true, false, false),
-      "message classification must distinguish notifications, requests, responses, and null protocol identifiers",
-    )?;
-
-    let notification_wire = ensure_ok(
-      serde_json::to_value(notification),
-      "a notification with a missing identifier must serialize",
-    )?;
-    let null_wire = ensure_ok(
-      serde_json::to_value(null_id),
-      "a protocol message with a null identifier must serialize",
-    )?;
-    ensure(
-      (notification_wire.get("id"), null_wire.get("id")) == (None, Some(&serde_json::Value::Null)),
-      "missing identifiers must be omitted while null identifiers remain explicit on the wire",
+    let observed = PresenceObservations {
+      identifiers: [
+        MessageId::from(request_id.clone()),
+        MessageId::from_optional(Some(request_id.clone())),
+        MessageId::from_optional(None),
+      ],
+      serialized:  [serde_json::to_value(&notification), serde_json::to_value(&null_id)],
+      messages:    [notification, request, response, null_id],
+    };
+    ensure_that(
+      observed,
+      "wire identifiers must retain presence, classification, and serialized absence",
+      |observations| {
+        let [
+          ref observed_notification,
+          ref observed_request,
+          ref observed_response,
+          ref observed_null,
+        ] = observations.messages;
+        let [ref notification_wire, ref null_wire] = observations.serialized;
+        observations.identifiers
+          == [
+            MessageId::Value(request_id.clone()),
+            MessageId::Value(request_id.clone()),
+            MessageId::Missing,
+          ]
+          && (
+            observed_notification.is_notification(),
+            observed_notification.is_response(),
+            observed_request.is_notification(),
+            observed_request.is_response(),
+            observed_response.is_notification(),
+            observed_response.is_response(),
+            observed_null.is_notification(),
+            observed_null.is_response(),
+          ) == (true, false, false, false, false, true, false, false)
+          && notification_wire.as_ref().is_ok_and(|wire| wire.get("id").is_none())
+          && null_wire
+            .as_ref()
+            .is_ok_and(|wire| wire.get("id") == Some(&serde_json::Value::Null))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
+  }
+
+  /// Native decoding failure and its consumed protocol conversion boundary.
+  #[derive(Debug, thiserror::Error)]
+  enum DecodeResponseFailure {
+    /// Decoding unexpectedly succeeded or used a different failure category.
+    #[error(transparent)]
+    Decode(#[from] PredicateFailure<Result<Message, MessageDecodeError>>),
+    /// The expected decoding category produced an incorrect protocol response.
+    #[error(transparent)]
+    Response(#[from] PredicateFailure<Result<Message, InvalidResponseDecode>>),
+    /// A successful message has no decoder error to convert.
+    #[error("a successfully decoded message cannot produce a decoder-error response: {message:?}")]
+    UnexpectedMessage {
+      /// Original successful message.
+      message: Message,
+    },
+  }
+
+  /// Check the decoder category before the protocol owner consumes its native error.
+  fn decoded_error_response(
+    outcome: Result<Message, MessageDecodeError>,
+    context: &'static str,
+    predicate: impl FnOnce(&Result<Message, MessageDecodeError>) -> bool,
+  ) -> Result<Result<Message, InvalidResponseDecode>, Box<DecodeResponseFailure>> {
+    let checked = ensure_that(outcome, context, predicate)
+      .map_err(DecodeResponseFailure::from)
+      .map_err(Box::new)?;
+    match checked {
+      Err(error) => Ok(error.into_response()),
+      Ok(message) => Err(Box::new(DecodeResponseFailure::UnexpectedMessage {
+        message,
+      })),
+    }
   }
 
   #[test]
-  fn syntax_errors_return_null_id_parse_responses() -> Result<(), TestFailure> {
-    let error = ensure_some(decode_slice(br#"{"jsonrpc":"2.0""#).err(), "invalid JSON must fail decoding")?;
-    ensure(
-      matches!(&error, MessageDecodeError::Parse { .. }),
-      "invalid JSON must retain the parse-error category",
+  fn syntax_errors_return_null_id_parse_responses() -> Result<(), Box<DecodeResponseFailure>> {
+    let response = decoded_error_response(
+      decode_slice(br#"{"jsonrpc":"2.0""#),
+      "invalid JSON must retain its native parser category",
+      |outcome| matches!(*outcome, Err(MessageDecodeError::Parse { .. })),
     )?;
-    let response = ensure_ok(error.into_response(), "a parse failure must produce an error response")?;
-    ensure(response.id == MessageId::Null, "a parse response must use a JSON null ID")?;
-    let rpc_error = ensure_some(response.error.as_ref(), "the parse response must contain an error")?;
-    ensure_eq(&rpc_error.code, &-32700, "the parse response must use the standard code")
-  }
-
-  #[test]
-  fn malformed_messages_preserve_request_response_direction() -> Result<(), TestFailure> {
-    let request_error = decode_failure(malformed_request(), "a non-string method must fail decoding")?;
-    ensure(
-      matches!(&request_error, MessageDecodeError::InvalidRequest { .. }),
-      "a malformed request must retain the request-side category",
-    )?;
-    let response = ensure_ok(request_error.into_response(), "a malformed request must produce an error response")?;
-    ensure(
-      response.id == MessageId::Value(NumberOrString::String("recoverable".into())),
-      "a valid request ID must be echoed in the error response",
-    )?;
-    let rpc_error = ensure_some(response.error.as_ref(), "the invalid-request response must contain an error")?;
-    ensure_eq(&rpc_error.code, &-32600, "the invalid-request response must use the standard code")?;
-
-    let response_error = decode_failure(malformed_response(), "a malformed response must fail decoding")?;
-    ensure(
-      matches!(&response_error, MessageDecodeError::InvalidResponse { .. }),
-      "a malformed client response must retain the response-side category",
-    )?;
-    let invalid_response = ensure_some(
-      response_error.into_response().err(),
-      "JSON-RPC must not create a response to a malformed response",
-    )?;
-    ensure(
-      invalid_response.id == NumberOrString::Number(11),
-      "the malformed response must retain its concrete ID for diagnostics",
-    )?;
-
-    let invalid_id_error = decode_failure(
-      serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": [],
-        "method": 17
-      }),
-      "a malformed request with an invalid ID must fail decoding",
-    )?;
-    let invalid_id_response = ensure_ok(
-      invalid_id_error.into_response(),
-      "a malformed request with no recoverable ID must produce an error response",
-    )?;
-    ensure(
-      invalid_id_response.id == MessageId::Null,
-      "an invalid request ID must recover as JSON null rather than an invented concrete ID",
+    ensure_that(
+      response,
+      "a parse failure must become a null-ID response with the standard parse code",
+      |outcome| {
+        outcome
+          .as_ref()
+          .is_ok_and(|message| message.id == MessageId::Null && message.error.as_ref().is_some_and(|error| error.code == -32700))
+      },
     )
+    .map(drop)
+    .map_err(DecodeResponseFailure::from)
+    .map_err(Box::new)
+  }
+
+  /// All request-side and response-side conversion outcomes retained together.
+  type DirectionObservations = [Result<Result<Message, InvalidResponseDecode>, Box<DecodeResponseFailure>>; 3];
+
+  #[test]
+  fn malformed_messages_preserve_request_response_direction() -> Result<(), Box<PredicateFailure<DirectionObservations>>> {
+    let observations = [
+      decoded_error_response(
+        decode_value(serde_json::json!({ "jsonrpc": "2.0", "id": "recoverable", "method": 17 })),
+        "a malformed request must retain the request-side category",
+        |outcome| matches!(*outcome, Err(MessageDecodeError::InvalidRequest { .. })),
+      ),
+      decoded_error_response(
+        decode_value(serde_json::json!({ "jsonrpc": "2.0", "id": 11, "error": "not an error object" })),
+        "a malformed response must retain the response-side category",
+        |outcome| matches!(*outcome, Err(MessageDecodeError::InvalidResponse { .. })),
+      ),
+      decoded_error_response(
+        decode_value(serde_json::json!({ "jsonrpc": "2.0", "id": [], "method": 17 })),
+        "an invalid request ID must remain a request-side failure",
+        |outcome| matches!(*outcome, Err(MessageDecodeError::InvalidRequest { .. })),
+      ),
+    ];
+    ensure_that(observations, "request failures must reply with recovered IDs while malformed responses retain their no-reply direction", |observed| {
+      let [ref request, ref response, ref invalid_id] = *observed;
+      matches!(*request, Ok(Ok(ref message)) if message.id == MessageId::Value(NumberOrString::String("recoverable".into())) && message.error.as_ref().is_some_and(|error| error.code == -32600))
+        && matches!(*response, Ok(Err(ref error)) if error.id == NumberOrString::Number(11))
+        && matches!(*invalid_id, Ok(Ok(ref message)) if message.id == MessageId::Null)
+    }).map(drop).map_err(Box::new)
+  }
+
+  /// Owned request payload conversion preserving serde failures.
+  type ConvertedRequest = Result<Request<Vec<u32>>, serde_json::Error>;
+
+  /// Owned response payload conversion preserving serde failures.
+  type ConvertedResponse = Result<Response<Vec<u32>>, serde_json::Error>;
+
+  /// All typed builder and parameter-conversion results.
+  #[derive(Debug)]
+  struct BuilderObservations {
+    /// Complete serialized request.
+    request:         Result<Message, serde_json::Error>,
+    /// Compatible and incompatible request payload conversions.
+    request_params:  [ConvertedRequest; 2],
+    /// Compatible and incompatible response payload conversions.
+    response_params: [ConvertedResponse; 2],
   }
 
   #[test]
-  fn request_and_response_builders_preserve_typed_wire_contracts() -> Result<(), TestFailure> {
-    let request = ensure_ok(
-      Request::new()
+  fn request_and_response_builders_preserve_typed_wire_contracts() -> Result<(), Box<PredicateFailure<BuilderObservations>>> {
+    let observations = BuilderObservations {
+      request:         Request::new()
         .with_method("fixture")
         .with_id(Some(NumberOrString::Number(7)))
-        .with_params(Some(serde_json::json!({
-          "enabled": true
-        })))
+        .with_params(Some(serde_json::json!({"enabled": true})))
         .try_into_message(),
-      "a serializable typed request must become a wire message",
-    )?;
-    ensure(
-      (request.method.as_deref(), request.id, request.params)
-        == (
-          Some("fixture"),
-          MessageId::Value(NumberOrString::Number(7)),
-          Some(serde_json::json!({
-            "enabled": true
-          })),
-        ),
-      "the request builder must preserve its method, ID, and structured parameters",
-    )?;
-
-    let request_params = ensure_ok(
-      Request::new()
-        .with_method("fixture/owned")
-        .with_params(Some(serde_json::json!([1, 2])))
-        .try_into_params::<Vec<u32>>(),
-      "request parameters must convert into an independently owned typed payload",
-    )?;
-    ensure(
-      request_params.params == Some(vec![1, 2]),
-      "request parameter conversion must preserve the complete owned payload",
-    )?;
-
-    let response_params = ensure_ok(
-      Response::success(serde_json::json!([3, 4])).try_into_params::<Vec<u32>>(),
-      "response results must convert into an independently owned typed payload",
-    )?;
-    ensure(
-      response_params.result == Some(vec![3, 4]),
-      "response result conversion must preserve the complete owned payload",
-    )?;
-
-    ensure(
-      Request::new()
-        .with_method("fixture/invalid")
-        .with_params(Some(serde_json::json!({
-          "value": 1
-        })))
-        .try_into_params::<Vec<u32>>()
-        .is_err(),
-      "request parameter conversion must reject an incompatible owned payload",
-    )?;
-    ensure(
-      Response::success(serde_json::json!({
-        "value": 1
-      }))
-      .try_into_params::<Vec<u32>>()
-      .is_err(),
-      "response result conversion must reject an incompatible owned payload",
-    )
-  }
-
-  #[test]
-  fn typed_builders_preserve_notification_and_response_wire_shapes() -> Result<(), TestFailure> {
-    let notification = ensure_ok(
-      serde_json::to_value(
-        Request::<serde_json::Value>::new()
-          .with_method("fixture/notify")
-          .with_params(None),
-      ),
-      "a typed notification must serialize",
-    )?;
-    ensure(
-      notification
-        == serde_json::json!({
-          "jsonrpc": "2.0",
-          "method": "fixture/notify"
-        }),
-      "a typed notification must omit both the request ID and absent parameters",
-    )?;
-
-    let success = ensure_ok(
-      Response::success(17)
-        .with_request_id(NumberOrString::String("request".into()))
-        .try_into_message(),
-      "a successful response builder must serialize",
-    )?;
-    ensure(
-      (success.id, success.result, success.error)
-        == (
-          MessageId::Value(NumberOrString::String("request".into())),
-          Some(serde_json::json!(17)),
-          None,
-        ),
-      "a successful response builder must preserve its ID and sole result channel",
-    )?;
-
-    let error = ensure_ok(
-      Response::<()>::error(RpcError::method_not_found())
-        .with_request_id(NumberOrString::Number(8))
-        .try_into_message(),
-      "an error response builder must serialize",
-    )?;
-    let error_code = error.error.as_ref().map(|rpc_error| rpc_error.code);
-    ensure(
-      (error.id, error.result, error_code) == (MessageId::Value(NumberOrString::Number(8)), None, Some(-32601)),
-      "an error response builder must preserve its ID and sole error channel",
-    )
-  }
-
-  #[test]
-  fn builders_reject_serialization_and_invalid_response_channels() -> Result<(), TestFailure> {
-    ensure(
-      Request::new()
-        .with_method("fixture")
-        .with_params(Some(SerializationFailureFixture))
-        .try_into_message()
-        .is_err(),
-      "a request builder must propagate parameter serialization failure",
-    )?;
-    ensure(
-      Response::success(SerializationFailureFixture).try_into_message().is_err(),
-      "a response builder must propagate result serialization failure",
-    )?;
-
-    let empty = Response::<u32> {
-      jsonrpc: "2.0".into(),
-      id:      NumberOrString::Number(1),
-      result:  None,
-      error:   None,
+      request_params:  [
+        Request::new()
+          .with_method("fixture/owned")
+          .with_params(Some(serde_json::json!([1, 2])))
+          .try_into_params(),
+        Request::new()
+          .with_method("fixture/invalid")
+          .with_params(Some(serde_json::json!({"value": 1})))
+          .try_into_params(),
+      ],
+      response_params: [
+        Response::success(serde_json::json!([3, 4])).try_into_params(),
+        Response::success(serde_json::json!({"value": 1})).try_into_params(),
+      ],
     };
-    let empty_error = ensure_some(empty.into_result().err(), "a response without success or error data must fail")?;
-    ensure_eq(
-      &empty_error.code,
-      &RpcError::internal_error().code,
-      "an empty response must use the internal-error category",
-    )?;
-
-    let ambiguous = Response {
-      jsonrpc: "2.0".into(),
-      id:      NumberOrString::Number(2),
-      result:  Some(17_u32),
-      error:   Some(RpcError::internal_error()),
-    };
-    let ambiguous_error = ensure_some(
-      ambiguous.into_result().err(),
-      "a response containing both success and error channels must fail",
-    )?;
-    ensure(
-      (ambiguous_error.code, ambiguous_error.details)
-        == (
-          RpcError::internal_error().code,
-          Some(serde_json::Value::String("response contains both result and error".into())),
-        ),
-      "an ambiguous response must identify the invalid dual-channel shape",
-    )?;
-
-    let expected_error = RpcError::method_not_found().with_details("missing fixture");
-    let propagated = ensure_some(
-      Response::<u32>::error(expected_error.clone())
-        .with_request_id(NumberOrString::Number(3))
-        .into_result()
-        .err(),
-      "a sole response error channel must propagate",
-    )?;
-    ensure(
-      propagated == expected_error,
-      "single-channel extraction must preserve the complete JSON-RPC error body",
+    ensure_that(
+      observations,
+      "typed builders must preserve complete compatible payloads and native conversion failures",
+      |observed| {
+        let [ref accepted_request, ref rejected_request] = observed.request_params;
+        let [ref accepted_response, ref rejected_response] = observed.response_params;
+        observed.request.as_ref().is_ok_and(|message| {
+          message.method.as_deref() == Some("fixture")
+            && message.id == MessageId::Value(NumberOrString::Number(7))
+            && message.params == Some(serde_json::json!({"enabled": true}))
+        }) && accepted_request
+          .as_ref()
+          .is_ok_and(|request| request.params == Some(vec![1, 2]))
+          && accepted_response
+            .as_ref()
+            .is_ok_and(|response| response.result == Some(vec![3, 4]))
+          && rejected_request.is_err()
+          && rejected_response.is_err()
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
+  /// Serialized notification and both response channel shapes.
+  type WireShapes = (
+    Result<serde_json::Value, serde_json::Error>,
+    [Result<Message, serde_json::Error>; 2],
+  );
+
   #[test]
-  fn result_conversion_and_error_constructors_preserve_typed_protocol_contracts() -> Result<(), TestFailure> {
-    let success: Response<u32> = Result::<u32, RpcError>::Ok(17).into();
-    let failure: Response<u32> = Result::<u32, RpcError>::Err(RpcError::request_cancelled()).into();
-    ensure(
-      (success.result, success.error, failure.result, failure.error) == (Some(17), None, None, Some(RpcError::request_cancelled())),
-      "result conversion must map success and failure into exactly one response channel",
-    )?;
-
-    let custom = RpcError::new("Custom failure");
-    ensure(
-      (custom.code, custom.message.as_str(), custom.details.as_ref()) == (0, "Custom failure", None),
-      "a custom RPC error must begin with code zero and no structured details",
-    )?;
-    let customized = custom.with_code(73).with_details(serde_json::json!({
-      "reason": "fixture"
-    }));
-    ensure(
-      (customized.code, customized.message.as_str(), customized.details.as_ref())
-        == (
-          73,
-          "Custom failure",
-          Some(&serde_json::json!({
-            "reason": "fixture"
-          })),
+  fn typed_builders_preserve_notification_and_response_wire_shapes() -> Result<(), Box<PredicateFailure<WireShapes>>> {
+    ensure_that(
+      (
+        serde_json::to_value(
+          Request::<serde_json::Value>::new()
+            .with_method("fixture/notify")
+            .with_params(None),
         ),
-      "custom RPC error builders must preserve the message while replacing code and attaching structured details",
-    )?;
-
-    let standard_errors = [
-      RpcError::parse(),
-      RpcError::invalid_request(),
-      RpcError::method_not_found(),
-      RpcError::invalid_params(),
-      RpcError::internal_error(),
-      RpcError::server_not_initialized(),
-      RpcError::request_cancelled(),
-      RpcError::content_modified(),
-    ];
-    let standard_contracts = standard_errors
-      .iter()
-      .map(|error| (error.code, error.message.as_str(), error.details.is_none()))
-      .collect::<Vec<_>>();
-    ensure(
-      standard_contracts
-        == vec![
-          (-32700, "Parse error", true),
-          (-32600, "Invalid request", true),
-          (-32601, "Method not found", true),
-          (-32602, "Invalid params", true),
-          (-32603, "Internal error", true),
-          (-32002, "Server not initialized", true),
-          (-32800, "Request cancelled", true),
-          (-32801, "Content modified", true),
+        [
+          Response::success(17)
+            .with_request_id(NumberOrString::String("request".into()))
+            .try_into_message(),
+          Response::<()>::error(RpcError::method_not_found())
+            .with_request_id(NumberOrString::Number(8))
+            .try_into_message(),
         ],
-      "every named protocol constructor must preserve its standard code, message, and detail-free shape",
+      ),
+      "typed builders must preserve notification omission and the sole response channel",
+      |observed| {
+        let (ref notification, [ref success, ref error]) = *observed;
+        notification
+          .as_ref()
+          .is_ok_and(|value| *value == serde_json::json!({"jsonrpc": "2.0", "method": "fixture/notify"}))
+          && success.as_ref().is_ok_and(|message| {
+            message.id == MessageId::Value(NumberOrString::String("request".into()))
+              && message.result == Some(serde_json::json!(17))
+              && message.error.is_none()
+          })
+          && error.as_ref().is_ok_and(|message| {
+            message.id == MessageId::Value(NumberOrString::Number(8))
+              && message.result.is_none()
+              && message.error == Some(RpcError::method_not_found())
+          })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
-  #[test]
-  fn server_error_codes_accept_only_the_reserved_range() -> Result<(), TestFailure> {
-    for code in [-32099, -32000] {
-      let error = ensure_ok(
-        RpcError::server(code),
-        "each inclusive JSON-RPC server-code boundary must be accepted",
-      )?;
-      ensure_eq(&error.code, &code, "the server-error constructor must preserve an accepted code")?;
-    }
-    for code in [-32100, -31999] {
-      let error = ensure_some(
-        RpcError::server(code).err(),
-        "a code outside the JSON-RPC server range must be rejected",
-      )?;
-      ensure_eq(&error.code, &code, "the invalid-code error must preserve the rejected value")?;
-    }
-    Ok(())
-  }
+  /// Serialization and response-channel extraction outcomes.
+  type RejectedBuilders = ([Result<Message, serde_json::Error>; 2], [Result<u32, RpcError>; 3]);
 
   #[test]
-  fn rpc_errors_implement_the_standard_error_contract_without_fabricated_sources() -> Result<(), TestFailure> {
+  fn builders_reject_serialization_and_invalid_response_channels() -> Result<(), Box<PredicateFailure<RejectedBuilders>>> {
+    let expected_error = RpcError::method_not_found().with_details("missing fixture");
+    let observed = (
+      [
+        Request::new()
+          .with_method("fixture")
+          .with_params(Some(SerializationFailureFixture))
+          .try_into_message(),
+        Response::success(SerializationFailureFixture).try_into_message(),
+      ],
+      [
+        Response::<u32> {
+          jsonrpc: "2.0".into(),
+          id:      NumberOrString::Number(1),
+          result:  None,
+          error:   None,
+        }
+        .into_result(),
+        Response {
+          jsonrpc: "2.0".into(),
+          id:      NumberOrString::Number(2),
+          result:  Some(17_u32),
+          error:   Some(RpcError::internal_error()),
+        }
+        .into_result(),
+        Response::<u32>::error(expected_error.clone())
+          .with_request_id(NumberOrString::Number(3))
+          .into_result(),
+      ],
+    );
+    ensure_that(
+      observed,
+      "builders must retain serialization failures, reject missing or dual channels, and propagate sole RPC errors",
+      |observations| {
+        let (ref serialization, [ref empty, ref ambiguous, ref propagated]) = *observations;
+        serialization.iter().all(Result::is_err)
+          && empty.as_ref().is_err_and(|error| error.code == -32603)
+          && *ambiguous == Err(RpcError::internal_error().with_details("response contains both result and error"))
+          && *propagated == Err(expected_error.clone())
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
+  }
+
+  /// Complete typed response conversions and error-constructor outputs.
+  type ConstructorObservations = ([Response<u32>; 2], [RpcError; 2], [RpcError; 8]);
+
+  #[test]
+  fn result_conversion_and_error_constructors_preserve_typed_protocol_contracts()
+  -> Result<(), Box<ComparisonFailure<ConstructorObservations, ConstructorObservations>>> {
+    let custom = RpcError::new("Custom failure");
+    let customized = custom
+      .clone()
+      .with_code(73)
+      .with_details(serde_json::json!({"reason": "fixture"}));
+    let observed = (
+      [
+        Response::from(Ok::<u32, RpcError>(17)),
+        Response::from(Err::<u32, RpcError>(RpcError::request_cancelled())),
+      ],
+      [custom, customized],
+      [
+        RpcError::parse(),
+        RpcError::invalid_request(),
+        RpcError::method_not_found(),
+        RpcError::invalid_params(),
+        RpcError::internal_error(),
+        RpcError::server_not_initialized(),
+        RpcError::request_cancelled(),
+        RpcError::content_modified(),
+      ],
+    );
+    let expected = (
+      [
+        Response {
+          jsonrpc: "2.0".into(),
+          id:      NumberOrString::Number(0),
+          result:  Some(17),
+          error:   None,
+        },
+        Response {
+          jsonrpc: "2.0".into(),
+          id:      NumberOrString::Number(0),
+          result:  None,
+          error:   Some(RpcError {
+            code:    -32800,
+            message: "Request cancelled".into(),
+            details: None,
+          }),
+        },
+      ],
+      [
+        RpcError {
+          code:    0,
+          message: "Custom failure".into(),
+          details: None,
+        },
+        RpcError {
+          code:    73,
+          message: "Custom failure".into(),
+          details: Some(serde_json::json!({"reason": "fixture"})),
+        },
+      ],
+      [
+        (-32700, "Parse error"),
+        (-32600, "Invalid request"),
+        (-32601, "Method not found"),
+        (-32602, "Invalid params"),
+        (-32603, "Internal error"),
+        (-32002, "Server not initialized"),
+        (-32800, "Request cancelled"),
+        (-32801, "Content modified"),
+      ]
+      .map(|(code, message)| RpcError {
+        code,
+        message: message.into(),
+        details: None,
+      }),
+    );
+    ensure_eq(
+      observed,
+      expected,
+      "constructors must preserve complete response channels and standard or customized RPC errors",
+    )
+    .map(drop)
+    .map_err(Box::new)
+  }
+
+  /// Native reserved-range constructor results at both boundary polarities.
+  type ServerCodes = [Result<RpcError, InvalidServerCode>; 4];
+
+  #[test]
+  fn server_error_codes_accept_only_the_reserved_range() -> Result<(), Box<ComparisonFailure<ServerCodes, ServerCodes>>> {
+    ensure_eq(
+      [
+        RpcError::server(-32099),
+        RpcError::server(-32000),
+        RpcError::server(-32100),
+        RpcError::server(-31999),
+      ],
+      [
+        Ok(RpcError {
+          code:    -32099,
+          message: "Server error".into(),
+          details: None,
+        }),
+        Ok(RpcError {
+          code:    -32000,
+          message: "Server error".into(),
+          details: None,
+        }),
+        Err(InvalidServerCode {
+          code: -32100
+        }),
+        Err(InvalidServerCode {
+          code: -31999
+        }),
+      ],
+      "server-code constructors must preserve accepted and rejected range boundaries",
+    )
+    .map(drop)
+    .map_err(Box::new)
+  }
+
+  /// Original RPC error, rendered description, and native wire serialization.
+  type ErrorContract = (RpcError, String, Result<serde_json::Value, serde_json::Error>);
+
+  #[test]
+  fn rpc_errors_implement_the_standard_error_contract_without_fabricated_sources() -> Result<(), Box<PredicateFailure<ErrorContract>>> {
     let error = RpcError::internal_error().with_details("diagnostic detail");
-    ensure_eq(
-      &error.to_string(),
-      &String::from("RPC error (-32603): Internal error"),
-      "the standard error contract must preserve the stable reader-facing RPC description",
-    )?;
-    let serialized = ensure_ok(serde_json::to_value(&error), "an RPC error with structured details must serialize")?;
-    let wire_details = ensure_some(
-      serialized.get("data"),
-      "structured RPC details must use the JSON-RPC data member on the wire",
-    )?;
-    ensure_eq(
-      wire_details,
-      &serde_json::json!("diagnostic detail"),
-      "the JSON-RPC data member must preserve the structured detail",
-    )?;
-    ensure(
-      serialized.get("details").is_none(),
-      "the contextual Rust field name must not leak into the JSON-RPC wire object",
-    )?;
-    ensure(
-      StdError::source(&error).is_none(),
-      "structured RPC details must remain protocol metadata rather than a fabricated causal error",
+    let rendered = error.to_string();
+    let serialized = serde_json::to_value(&error);
+    ensure_that(
+      (error, rendered, serialized),
+      "RPC errors must preserve their description and data member without inventing a causal source",
+      |observed| {
+        let (ref native, ref description, ref wire) = *observed;
+        description == "RPC error (-32603): Internal error"
+          && wire
+            .as_ref()
+            .is_ok_and(|value| value.get("data") == Some(&serde_json::json!("diagnostic detail")) && value.get("details").is_none())
+          && StdError::source(native).is_none()
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

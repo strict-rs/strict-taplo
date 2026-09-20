@@ -281,158 +281,157 @@ fn decode_unicode(token: &str, offset: usize) -> Result<char, EscapeError> {
 #[cfg(test)]
 /// Escape round-trip, continuation, offset, and failure-ordering contracts.
 mod tests {
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_eq;
-  use strict_test_support::ensure_ok;
-  use strict_test_support::ensure_some;
+  use core::fmt::Debug;
 
+  use strict_test_support::ComparisonFailure;
+  use strict_test_support::PredicateFailure;
+  use strict_test_support::ensure_eq;
+  use strict_test_support::ensure_that;
+
+  use super::EscapeError;
   use super::EscapeErrorKind;
   use super::check_escape;
   use super::decode_unicode;
   use super::escape;
   use super::unescape;
 
+  /// A native string-decoding outcome.
+  type Decoded = Result<String, EscapeError>;
+  /// Exact decoding comparisons, including every result in a scenario.
+  type DecodeComparison<const N: usize> = ComparisonFailure<[Decoded; N], [Decoded; N]>;
+
   /// Round-trip every supported control escape and preserve ordinary source text.
   #[test]
-  fn escapes_and_decodes_supported_characters() -> Result<(), TestFailure> {
+  fn escapes_and_decodes_supported_characters() -> Result<(), PredicateFailure<(String, Decoded)>> {
     let original = "\u{0000}\u{0007}\u{0008}\t\n\u{000b}\u{000c}\r\u{001f}\"\\plain\u{007f}";
     let encoded = escape(original);
-    let decoded = ensure_ok(unescape(&encoded), "every emitted escape must decode")?;
-    ensure_eq(&decoded.as_str(), &original, "escaping and unescaping must preserve the value")?;
-    ensure_eq(
-      &encoded.as_str(),
-      &r#"\u0000\u0007\b\t\n\u000B\f\r\u001F\"\\plain\u007F"#,
-      "every TOML-forbidden control character must use a valid basic-string escape",
+    let decoded = unescape(&encoded);
+    ensure_that(
+      (encoded, decoded),
+      "escaping must preserve the exact value and encode every forbidden control",
+      |observed| {
+        observed.0 == r#"\u0000\u0007\b\t\n\u000B\f\r\u001F\"\\plain\u007F"# && observed.1.as_ref().is_ok_and(|value| value == original)
+      },
     )
+    .map(drop)
   }
 
   /// Decode Unicode escapes together with a whitespace-trimming CRLF continuation.
   #[test]
-  fn decodes_unicode_and_line_continuations() -> Result<(), TestFailure> {
-    let decoded = ensure_ok(
-      unescape("caf\\u00E9\\\r\n  au\\U00000020lait"),
-      "valid Unicode escapes and a CRLF continuation must decode",
-    )?;
+  fn decodes_unicode_and_line_continuations() -> Result<(), DecodeComparison<1>> {
     ensure_eq(
-      &decoded.as_str(),
-      &"caf\u{e9}au lait",
-      "the decoded value must use Unicode scalar values",
+      [unescape("caf\\u00E9\\\r\n  au\\U00000020lait")],
+      [Ok(String::from("caf\u{e9}au lait"))],
+      "Unicode escapes and CRLF continuation must retain Unicode scalar values",
     )
+    .map(drop)
   }
 
   /// Elide physical LF and CRLF continuations without consuming ordinary whitespace.
   #[test]
-  fn line_continuations_elide_following_indentation_only() -> Result<(), TestFailure> {
-    let lf = ensure_ok(
-      unescape("left\\\n \t right"),
-      "an LF continuation followed by TOML indentation must decode",
-    )?;
-    let crlf = ensure_ok(
-      unescape("left\\\r\n\t  right"),
-      "a CRLF continuation followed by TOML indentation must decode",
-    )?;
-    let ordinary = ensure_ok(unescape("left  right"), "ordinary spaces without a continuation must remain valid")?;
-    let escaped_newline = ensure_ok(
-      unescape(r"left\n  right"),
-      "an explicit line-feed escape must remain distinct from a physical continuation",
-    )?;
-
+  fn line_continuations_elide_following_indentation_only() -> Result<(), impl Debug> {
     ensure_eq(
-      &lf.as_str(),
-      &"leftright",
-      "an LF continuation must elide its following indentation",
-    )?;
-    ensure_eq(
-      &crlf.as_str(),
-      &"leftright",
-      "a CRLF continuation must elide its following indentation",
-    )?;
-    ensure_eq(
-      &ordinary.as_str(),
-      &"left  right",
-      "spaces without a physical continuation must be retained",
-    )?;
-    ensure_eq(
-      &escaped_newline.as_str(),
-      &"left\n  right",
-      "an explicit line-feed escape must decode to a newline and retain following spaces",
+      [
+        unescape("left\\\n \t right"),
+        unescape("left\\\r\n\t  right"),
+        unescape("left  right"),
+        unescape(r"left\n  right"),
+      ],
+      [
+        Ok(String::from("leftright")),
+        Ok(String::from("leftright")),
+        Ok(String::from("left  right")),
+        Ok(String::from("left\n  right")),
+      ],
+      "physical continuations must elide indentation while ordinary spaces and escaped newlines remain",
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Locate an unsupported escape by its UTF-8 byte offset.
   #[test]
-  fn reports_unknown_escape_at_byte_offset() -> Result<(), TestFailure> {
-    let error = ensure_some(unescape("\u{e9}\\q").err(), "an unsupported escape must fail")?;
-    ensure_eq(&error.offset(), &2, "the offset must count UTF-8 bytes")?;
+  fn reports_unknown_escape_at_byte_offset() -> Result<(), DecodeComparison<1>> {
     ensure_eq(
-      &error.kind(),
-      &EscapeErrorKind::UnknownSequence,
-      "the failure kind must identify the unsupported sequence",
+      [unescape("\u{e9}\\q")],
+      [Err(EscapeError {
+        offset: 2,
+        kind:   EscapeErrorKind::UnknownSequence,
+      })],
+      "unknown escapes must retain their UTF-8 byte offset and native category",
     )
+    .map(drop)
   }
 
   /// Classify and locate a terminal backslash consistently in decoding and validation.
   #[test]
-  fn reports_a_trailing_backslash_in_decode_and_validation() -> Result<(), TestFailure> {
-    let decoded = ensure_some(
-      unescape("value\\").err(),
-      "a final backslash without an escape name must fail decoding",
-    )?;
-    ensure(
-      (decoded.offset(), decoded.kind()) == (5, EscapeErrorKind::TrailingBackslash),
-      "decoding must retain the trailing backslash byte offset and category",
-    )?;
-
-    let validated = ensure_some(
-      check_escape("value\\").err(),
-      "escape validation must reject the same final backslash",
-    )?;
-    ensure(
-      validated.iter().map(|error| (error.offset(), error.kind())).collect::<Vec<_>>() == vec![(5, EscapeErrorKind::TrailingBackslash)],
-      "validation must report the trailing backslash exactly once",
+  fn reports_a_trailing_backslash_in_decode_and_validation() -> Result<(), impl Debug> {
+    ensure_that(
+      (unescape("value\\"), check_escape("value\\")),
+      "decoding and validation must reject the same final backslash exactly once",
+      |observed| {
+        let expected = EscapeError {
+          offset: 5,
+          kind:   EscapeErrorKind::TrailingBackslash,
+        };
+        observed.0 == Err(expected) && observed.1 == Err(vec![expected])
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Keep malformed digits, non-scalar Unicode, and token-boundary failures distinct.
   #[test]
-  fn distinguishes_invalid_unicode_failures() -> Result<(), TestFailure> {
-    let digits = ensure_some(unescape("\\u____").err(), "underscore digits must not decode")?;
-    ensure_eq(
-      &digits.kind(),
-      &EscapeErrorKind::InvalidUnicodeDigits,
-      "invalid digits must retain their typed category",
-    )?;
-
-    let scalar = ensure_some(unescape("\\uD800").err(), "a surrogate must not decode as a scalar")?;
-    ensure_eq(
-      &scalar.kind(),
-      &EscapeErrorKind::InvalidUnicodeScalar,
-      "a surrogate must retain the scalar failure category",
-    )?;
-
-    let boundary = ensure_some(decode_unicode("00E9", 7).err(), "a missing escape prefix must fail")?;
-    ensure_eq(&boundary.offset(), &7, "the supplied token offset must be retained")?;
-    ensure_eq(
-      &boundary.kind(),
-      &EscapeErrorKind::InvalidTokenBoundary,
-      "a malformed token boundary must retain its typed category",
+  fn distinguishes_invalid_unicode_failures() -> Result<(), impl Debug> {
+    ensure_that(
+      ([unescape("\\u____"), unescape("\\uD800")], decode_unicode("00E9", 7)),
+      "Unicode failures must distinguish invalid digits, scalars, and supplied token boundaries",
+      |observed| {
+        observed.0
+          == [
+            Err(EscapeError {
+              offset: 0,
+              kind:   EscapeErrorKind::InvalidUnicodeDigits,
+            }),
+            Err(EscapeError {
+              offset: 0,
+              kind:   EscapeErrorKind::InvalidUnicodeScalar,
+            }),
+          ]
+          && observed.1
+            == Err(EscapeError {
+              offset: 7,
+              kind:   EscapeErrorKind::InvalidTokenBoundary,
+            })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Return every escape failure in source order with its original byte coordinate.
   #[test]
-  fn collects_escape_failures_in_source_order() -> Result<(), TestFailure> {
-    let errors = ensure_some(check_escape("\\q ok \\u____ \\z").err(), "every invalid escape must be returned")?;
-    let observed = errors.iter().map(|error| (error.offset(), error.kind())).collect::<Vec<_>>();
-    ensure(
-      observed
-        == vec![
-          (0, EscapeErrorKind::UnknownSequence),
-          (6, EscapeErrorKind::InvalidUnicodeDigits),
-          (13, EscapeErrorKind::UnknownSequence),
-        ],
-      "escape failures must remain ordered and precisely located",
+  fn collects_escape_failures_in_source_order() -> Result<(), impl Debug> {
+    ensure_eq(
+      check_escape("\\q ok \\u____ \\z"),
+      Err(vec![
+        EscapeError {
+          offset: 0,
+          kind:   EscapeErrorKind::UnknownSequence,
+        },
+        EscapeError {
+          offset: 6,
+          kind:   EscapeErrorKind::InvalidUnicodeDigits,
+        },
+        EscapeError {
+          offset: 13,
+          kind:   EscapeErrorKind::UnknownSequence,
+        },
+      ]),
+      "all escape failures must remain ordered and precisely located",
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

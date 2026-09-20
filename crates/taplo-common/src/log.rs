@@ -224,15 +224,11 @@ where
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod tests {
-  use std::io::Error as IoError;
+  use std::fmt::Debug;
   use std::io::ErrorKind;
   use std::io::Write as _;
 
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_contains;
-  use strict_test_support::ensure_eq;
-  use strict_test_support::ensure_ok;
+  use strict_test_support::ensure_that;
   use tokio::runtime::Builder;
 
   use super::BlockingWrite;
@@ -243,99 +239,81 @@ mod tests {
   use crate::test_support::TestEnvironment;
 
   #[test]
-  fn blocking_writer_preserves_order_failure_kind_and_recovery() -> Result<(), TestFailure> {
+  fn blocking_writer_preserves_order_failure_kind_and_recovery() -> Result<(), impl Debug> {
     let environment = taplo_test_support::TestEnvironment::default();
     let mut writer = BlockingWrite(environment.stdout_writer());
-    ensure_eq(
-      &ensure_ok(writer.write(b"first"), "the blocking writer must accept the first byte segment")?,
-      &5_usize,
-      "the blocking writer must report the complete accepted length",
-    )?;
-    ensure_ok(writer.flush(), "the blocking writer must flush its asynchronous output")?;
-    ensure(
-      environment.stdout() == b"first",
-      "the blocking writer must capture the complete first byte segment",
-    )?;
-
+    let first = writer.write(b"first");
+    let flush = writer.flush();
+    let initial = environment.stdout();
     environment.set_stdout_failure(true);
-    ensure(
-      writer.write(b"blocked").as_ref().err().map(IoError::kind) == Some(ErrorKind::PermissionDenied),
-      "the blocking writer must preserve the asynchronous stream failure kind",
-    )?;
-    ensure(
-      writer.flush().as_ref().err().map(IoError::kind) == Some(ErrorKind::PermissionDenied),
-      "the blocking writer must preserve flush failures independently",
-    )?;
-
+    let rejected_write = writer.write(b"blocked");
+    let rejected_flush = writer.flush();
     environment.set_stdout_failure(false);
-    ensure_eq(
-      &ensure_ok(writer.write(b"-second"), "the blocking writer must recover after failure removal")?,
-      &7_usize,
-      "the recovered writer must report the complete accepted length",
-    )?;
-    ensure(
-      environment.stdout() == b"first-second",
-      "the recovered writer must append bytes in call order without partial failure output",
+    let recovery = writer.write(b"-second");
+    let output = environment.stdout();
+    ensure_that(
+      (first, flush, initial, rejected_write, rejected_flush, recovery, output),
+      "blocking output must preserve byte counts, ordered bytes, native write and flush failures, and recovery",
+      |actual| {
+        actual.0.as_ref().is_ok_and(|count| *count == 5)
+          && actual.1.is_ok()
+          && actual.2 == b"first"
+          && actual
+            .3
+            .as_ref()
+            .is_err_and(|error| error.kind() == ErrorKind::PermissionDenied)
+          && actual
+            .4
+            .as_ref()
+            .is_err_and(|error| error.kind() == ErrorKind::PermissionDenied)
+          && actual.5.as_ref().is_ok_and(|count| *count == 7)
+          && actual.6 == b"first-second"
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn subscriber_installation_emits_configured_events_and_rejects_reinstallation() -> Result<(), TestFailure> {
+  fn subscriber_installation_emits_configured_events_and_rejects_reinstallation() -> Result<(), impl Debug> {
     let environment = TestEnvironment::default();
     environment.set_env_var("RUST_LOG", "taplo_common::log::tests=trace");
     let writer_environment = environment.clone();
-    ensure_ok(
-      install_stderr_logging(
-        &environment,
-        move || BlockingWrite(writer_environment.stdout_writer()),
-        true,
-        true,
-        Some(false),
-      ),
-      "the first process-wide subscriber installation must succeed",
-    )?;
+    let installed = install_stderr_logging(
+      &environment,
+      move || BlockingWrite(writer_environment.stdout_writer()),
+      true,
+      true,
+      Some(false),
+    );
     tracing::info!(target: "taplo_common::log::tests", "configured subscriber event");
-    let output = ensure_ok(
-      String::from_utf8(environment.stdout()),
-      "captured tracing output must be valid UTF-8",
-    )?;
-    ensure_contains(
-      &output,
-      "configured subscriber event",
-      "the configured subscriber must write an enabled event",
-    )?;
-
+    let output = String::from_utf8(environment.stdout());
     let default_environment = TestEnvironment::default();
     let repeated_writer_environment = default_environment.clone();
-    ensure(
-      matches!(
-        install_stderr_logging(
-          &default_environment,
-          move || BlockingWrite(repeated_writer_environment.stderr_writer()),
-          false,
-          false,
-          None,
-        ),
-        Err(EnvironmentError::LoggingInitialization {
-          message
-        }) if !message.is_empty()
-      ),
-      "a second subscriber must exercise default filtering and terminal policy before returning a typed installation failure",
-    )?;
-
-    let runtime = ensure_ok(
-      Builder::new_current_thread().enable_all().build(),
-      "the native logging test runtime must initialize",
-    )?;
-    let native_environment = NativeEnvironment::from_handle(runtime.handle().clone());
-    ensure(
-      matches!(
-        setup_stderr_logging(&native_environment, false, false, Some(false)),
-        Err(EnvironmentError::LoggingInitialization {
-          message
-        }) if !message.is_empty()
-      ),
-      "the public native logging adapter must preserve process-wide installation failures",
+    let repeated = install_stderr_logging(
+      &default_environment,
+      move || BlockingWrite(repeated_writer_environment.stderr_writer()),
+      false,
+      false,
+      None,
+    );
+    let runtime = Builder::new_current_thread().enable_all().build();
+    let native = runtime.as_ref().ok().map(|executor| {
+      let native_environment = NativeEnvironment::from_handle(executor.handle().clone());
+      setup_stderr_logging(&native_environment, false, false, Some(false))
+    });
+    ensure_that(
+      (installed, output, repeated, runtime, native),
+      "the first subscriber must emit enabled events and both reinstall paths must retain typed initialization failures",
+      |actual| {
+        actual.0.is_ok()
+          && actual.1.as_ref().is_ok_and(|text| text.contains("configured subscriber event"))
+          && matches!(&actual.2, Err(EnvironmentError::LoggingInitialization { message }) if !message.is_empty())
+          && actual.3.is_ok()
+          && matches!(&actual.4, Some(Err(EnvironmentError::LoggingInitialization { message })) if !message.is_empty())
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

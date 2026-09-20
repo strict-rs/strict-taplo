@@ -1509,6 +1509,7 @@ mod formats {
 
 #[cfg(test)]
 mod tests {
+  use std::fmt::Debug;
   use std::path::PathBuf;
   use std::sync::Arc;
   use std::time::Duration;
@@ -1519,31 +1520,29 @@ mod tests {
   use parking_lot::Mutex;
   use serde_json::Value;
   use serde_json::json;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_contains;
-  use strict_test_support::ensure_ok;
-  use strict_test_support::ensure_some;
+  use strict_test_support::PredicateFailure;
+  use strict_test_support::ensure_that;
   use taplo::dom::Keys;
   use taplo::dom::Node;
+  use taplo::dom::QueryError;
+  use taplo::parser::Parse;
+  use taplo::parser::ParseFailure;
   use taplo::parser::parse;
-  use taplo_test_support::ensure_result;
+  use thiserror::Error;
+  use url::ParseError;
   use url::Url;
 
+  use super::CacheRetrieveError;
   use super::CacheRetriever;
   use super::NodeValidationError;
   use super::PathSegment;
-  use super::PossibleSchema;
   use super::SchemaError;
   use super::SchemaValidationError;
   use super::Schemas;
   use super::ValueExt as _;
   use super::builtins;
-  #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
-  use super::transport::ConcurrentSchemaTransport;
-  #[cfg(feature = "reqwest")]
-  use super::transport::LocalSchemaTransport;
   use super::transport::OfflineSchemaTransport;
+  use super::transport::TransportError;
   #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
   use super::transport::concurrent_http_client;
   #[cfg(feature = "reqwest")]
@@ -1551,71 +1550,71 @@ mod tests {
   use crate::test_support::TestEnvironment;
   /// Offline schema service used by behavior tests.
   type TestSchemas = Schemas<OfflineSchemaTransport<TestEnvironment>>;
-  /// Current-thread HTTP-capable schema service used by behavior tests.
-  #[cfg(feature = "reqwest")]
-  type LocalTestSchemas = Schemas<LocalSchemaTransport<TestEnvironment>>;
-  /// Native concurrent schema service used by behavior tests.
-  #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
-  type ConcurrentTestSchemas = Schemas<ConcurrentSchemaTransport<TestEnvironment>>;
 
-  fn url(input: &str) -> Result<Url, TestFailure> {
-    ensure_ok(Url::parse(input), "the schema fixture URL must parse")
+  /// Native failures while constructing schema fixtures.
+  #[derive(Debug, Error)]
+  enum FixtureError {
+    /// A fixture URL failed to parse.
+    #[error(transparent)]
+    Url(#[from] ParseError),
+    /// A fixture key path failed to parse.
+    #[error(transparent)]
+    Keys(#[from] QueryError),
+    /// A fixture syntax tree could not be built.
+    #[error(transparent)]
+    Parse(#[from] ParseFailure),
+    /// A source fixture retained recoverable syntax diagnostics.
+    #[error(transparent)]
+    Syntax(#[from] Box<PredicateFailure<Parse>>),
+    /// Schema initialization failed with its native context.
+    #[error(transparent)]
+    Schema(Box<SchemaError>),
+    /// Fixture serialization failed.
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
   }
 
-  fn keys(input: &str) -> Result<Keys, TestFailure> {
-    ensure_ok(input.parse(), "the schema fixture path must parse")
+  impl From<SchemaError> for FixtureError {
+    fn from(source: SchemaError) -> Self {
+      Self::Schema(Box::new(source))
+    }
+  }
+
+  impl From<TransportError> for FixtureError {
+    fn from(source: TransportError) -> Self {
+      Self::from(SchemaError::from(source))
+    }
+  }
+
+  /// Parse a fixture URL, preserving its native parser error.
+  fn url(input: &str) -> Result<Url, FixtureError> {
+    Ok(Url::parse(input)?)
+  }
+
+  /// Parse a fixture key path, preserving its native query error.
+  fn keys(input: &str) -> Result<Keys, FixtureError> {
+    Ok(input.parse()?)
   }
 
   /// Construct one typed object-property and array-index path.
-  fn indexed_keys(property: &str, index: usize) -> Result<Keys, TestFailure> {
+  fn indexed_keys(property: &str, index: usize) -> Result<Keys, FixtureError> {
     keys(property).map(|path| path.join(index))
   }
 
+  /// Install one complete JSON schema into the native in-memory cache.
   fn seed(schemas: &TestSchemas, schema_url: &Url, schema: Value) {
     schemas.add_schema(schema_url, Arc::new(schema));
   }
 
   /// Construct offline schema services for one behavior fixture.
-  fn offline_schemas() -> Result<TestSchemas, TestFailure> {
-    ensure_result(
-      Schemas::new_offline(TestEnvironment::default()),
-      "offline schema services must initialize",
-    )
+  fn offline_schemas() -> Result<TestSchemas, FixtureError> {
+    Ok(Schemas::new_offline(TestEnvironment::default())?)
   }
 
-  /// Construct current-thread HTTP-capable schema services.
-  #[cfg(feature = "reqwest")]
-  #[allow(
-    clippy::single_call_fn,
-    reason = "the local fixture names HTTP client construction and service initialization for the current-thread family under test"
-  )]
-  fn local_schemas(environment: TestEnvironment) -> Result<LocalTestSchemas, TestFailure> {
-    let http = ensure_result(local_http_client(), "the local schema HTTP client must initialize")?;
-    ensure_result(Schemas::new_local(environment, http), "local schema services must initialize")
-  }
-
-  /// Construct native concurrent schema services.
-  #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
-  #[allow(
-    clippy::single_call_fn,
-    reason = "the concurrent fixture names the timeout-bearing HTTP client and service initialization that distinguish the native Send \
-              family"
-  )]
-  fn concurrent_schemas(environment: TestEnvironment) -> Result<ConcurrentTestSchemas, TestFailure> {
-    let http = ensure_result(
-      concurrent_http_client(&environment, Duration::from_secs(2)),
-      "the concurrent schema HTTP client must initialize",
-    )?;
-    ensure_result(
-      Schemas::new_concurrent(environment, http),
-      "concurrent schema services must initialize",
-    )
-  }
-
-  /// Construct offline services with one schema already seeded.
-  fn seeded_schemas(schema_url: &str, schema: Value) -> Result<(TestSchemas, Url), TestFailure> {
-    let schemas = offline_schemas()?;
+  /// Construct offline services retaining the URL of their seeded native schema.
+  fn seeded_schemas(schema_url: &str, schema: Value) -> Result<(TestSchemas, Url), FixtureError> {
     let parsed_url = url(schema_url)?;
+    let schemas = offline_schemas()?;
     seed(&schemas, &parsed_url, schema);
     Ok((schemas, parsed_url))
   }
@@ -1626,12 +1625,12 @@ mod tests {
     property: &str,
     property_schema: &Value,
     additional_properties: &Value,
-  ) -> Result<(TestSchemas, Url), TestFailure> {
+  ) -> Result<(TestSchemas, Url), FixtureError> {
     seeded_schemas(schema_url, object_property_schema(property, property_schema, additional_properties))
   }
 
   /// Seed the array-of-integers object schema shared by the validation-behavior tests.
-  fn validation_schemas() -> Result<(TestSchemas, Url), TestFailure> {
+  fn validation_schemas() -> Result<(TestSchemas, Url), FixtureError> {
     seeded_object_property_schemas(
       "https://example.com/validation.json",
       "values",
@@ -1646,14 +1645,6 @@ mod tests {
   /// Read one textual property from a schema fixture.
   fn schema_text<'a>(schema: &'a Value, name: &str) -> Option<&'a str> {
     schema.get(name).and_then(Value::as_str)
-  }
-
-  /// Project descendant paths and one textual metadata field for exact assertions.
-  fn child_text_facts(children: &[PossibleSchema], name: &str) -> Vec<(String, Option<String>)> {
-    children
-      .iter()
-      .map(|child| (child.1.dotted().to_owned(), schema_text(&child.2, name).map(str::to_owned)))
-      .collect()
   }
 
   /// Project a single-property validation path into its stable property name.
@@ -1715,999 +1706,799 @@ mod tests {
     kind: &str,
     first: &(&str, &str),
     second: &(&str, &str),
-  ) -> Result<Url, TestFailure> {
+  ) -> Result<Url, FixtureError> {
     let parsed_url = url(schema_url)?;
     seed(schemas, &parsed_url, paired_composition(kind, first, second));
     Ok(parsed_url)
   }
 
   /// Parse one syntax-clean schema-validation DOM fixture.
-  fn parse_valid_dom(source: &str, context: &'static str) -> Result<Node, TestFailure> {
-    let parsed = ensure_ok(parse(source), context)?;
-    ensure(parsed.diagnostics().is_empty(), context)?;
-    Ok(parsed.into_dom())
-  }
-
-  #[test]
-  fn builtins_references_and_validator_retrieval_keep_their_public_contracts() -> Result<(), TestFailure> {
-    let generated = ensure_result(
-      builtins::taplo_config_schema(),
-      "the generated Taplo configuration schema must serialize",
-    )?;
-    ensure(generated.is_object(), "the generated configuration schema must be an object")?;
-
-    let builtin_url = url(builtins::TAPLO_CONFIG_URL)?;
-    let resolved_builtin = ensure_some(
-      ensure_result(builtins::builtin_schema(&builtin_url), "the built-in URL must resolve")?,
-      "the Taplo configuration URL must have a built-in schema",
-    )?;
-    ensure(
-      *resolved_builtin == *generated,
-      "direct generation and URL-based built-in resolution must agree",
-    )?;
-    let external_url = url("https://example.com/not-built-in.json")?;
-    ensure(
-      ensure_result(
-        builtins::builtin_schema(&external_url),
-        "an external URL must be classified normally",
-      )?
-      .is_none(),
-      "an external URL must not be misclassified as a built-in",
-    )?;
-
-    let reference = json!({ "$ref": "definitions.json#/$defs/value" });
-    ensure(reference.is_schema_ref(), "a string `$ref` must be recognized")?;
-    ensure(
-      reference.schema_ref() == Some("definitions.json#/$defs/value"),
-      "the exact string `$ref` must be exposed",
-    )?;
-    ensure(
-      (json!({ "$ref": 7 }).is_schema_ref(), json!({ "type": "string" }).schema_ref()) == (false, None),
-      "non-string and absent `$ref` members must not become references",
-    )?;
-
-    let schemas = offline_schemas()?;
-    ensure_contains(
-      &format!("{schemas:?}"),
-      "cached_validators",
-      "schema-service debug output must expose stable cache state",
-    )?;
-    let missing = Arc::new(Mutex::new(Vec::new()));
-    let retriever = CacheRetriever {
-      store:   schemas.cache().memory_store(),
-      missing: Arc::clone(&missing),
-    };
-    let relative_uri = ensure_some(
-      Uri::<String>::parse(String::from("http://[v1.fe80]")).ok(),
-      "an RFC URI using an IPvFuture host must parse for validator retrieval",
-    )?;
-    let relative_error = ensure_some(
-      retriever.retrieve(&relative_uri).err(),
-      "a URI outside the URL parser's host model cannot identify a cache entry",
-    )?;
-    ensure_contains(
-      &relative_error.to_string(),
-      "invalid schema URI",
-      "a non-URL validator request must retain its typed URI failure",
-    )?;
-
-    let missing_url = url("https://example.com/missing-schema.json")?;
-    let requested_uri = ensure_some(
-      Uri::<String>::parse(missing_url.to_string()).ok(),
-      "an absolute schema URI must parse for validator retrieval",
-    )?;
-    let missing_error = ensure_some(
-      retriever.retrieve(&requested_uri).err(),
-      "an uncached absolute schema must be reported missing",
-    )?;
-    ensure_contains(
-      &missing_error.to_string(),
-      "is not cached yet",
-      "an uncached validator request must retain the requested URL",
-    )?;
-    ensure(
-      *missing.lock() == [missing_url.clone()],
-      "validator retrieval must record exactly the absolute schema it needs prefetched",
-    )?;
-
-    seed(&schemas, &missing_url, json!({ "title": "cached" }));
-    let prefetched = ensure_result(
-      retriever.retrieve(&requested_uri),
-      "validator retrieval must read a schema after it is prefetched",
-    )?;
-    ensure(
-      schema_text(&prefetched, "title") == Some("cached"),
-      "validator retrieval must preserve the cached schema value",
+  fn parse_valid_dom(source: &str, context: &'static str) -> Result<Node, FixtureError> {
+    Ok(
+      ensure_that(parse(source)?, context, |parsed| parsed.diagnostics().is_empty())
+        .map_err(Box::new)?
+        .into_dom(),
     )
   }
 
   #[test]
-  fn validation_caches_compiled_validators_and_clears_them_on_expiration() -> Result<(), TestFailure> {
-    block_on(async {
-      let (schemas, schema_url) = validation_schemas()?;
-      let valid = ensure_result(
-        schemas.validate(&schema_url, &json!({ "values": [1, 2] })).await,
-        "a valid JSON instance must complete validation",
-      )?;
-      ensure(valid.is_empty(), "a valid JSON instance must produce no errors")?;
-
-      let first_validator = ensure_some(
-        ensure_result(
-          schemas.get_validator(&schema_url),
-          "the compiled validator cache must remain readable",
-        )?,
-        "successful validation must install a compiled validator",
-      )?;
-      let repeated = ensure_result(
-        schemas.validate(&schema_url, &json!({ "values": [] })).await,
-        "repeated validation must use the installed validator",
-      )?;
-      ensure(repeated.is_empty(), "the reused validator must preserve successful behavior")?;
-      let second_validator = ensure_some(
-        ensure_result(
-          schemas.get_validator(&schema_url),
-          "the reused validator cache must remain readable",
-        )?,
-        "repeated validation must leave a compiled validator installed",
-      )?;
-      ensure(
-        Arc::ptr_eq(&first_validator, &second_validator),
-        "repeated validation must reuse the same compiled validator",
-      )?;
-
-      ensure_result(
-        schemas.cache().set_expiration_times(Duration::ZERO, Duration::from_secs(60)),
-        "the validator expiration policy must install",
-      )?;
-      ensure(
-        ensure_result(schemas.get_validator(&schema_url), "expired validator state must be evaluated")?.is_none(),
-        "an expired schema generation must clear compiled validators",
-      )
-    })
+  fn builtins_references_and_validator_retrieval_keep_their_public_contracts() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let builtin_url = url(builtins::TAPLO_CONFIG_URL)?;
+      let external_url = url("https://example.com/not-built-in.json")?;
+      let missing_url = url("https://example.com/missing-schema.json")?;
+      let schemas = offline_schemas()?;
+      let generated = builtins::taplo_config_schema();
+      let resolved = builtins::builtin_schema(&builtin_url);
+      let external = builtins::builtin_schema(&external_url);
+      let references = [
+        json!({"$ref": "definitions.json#/$defs/value"}),
+        json!({"$ref": 7}),
+        json!({"type": "string"}),
+      ];
+      let debug = format!("{schemas:?}");
+      let missing = Arc::new(Mutex::new(Vec::new()));
+      let retriever = CacheRetriever {
+        store:   schemas.cache().memory_store(),
+        missing: Arc::clone(&missing),
+      };
+      let relative_uri = Uri::<String>::parse(String::from("http://[v1.fe80]"));
+      let relative = relative_uri.as_ref().ok().map(|uri| retriever.retrieve(uri));
+      let requested_uri = Uri::<String>::parse(missing_url.to_string());
+      let absent = requested_uri.as_ref().ok().map(|uri| retriever.retrieve(uri));
+      let requested = missing.lock().clone();
+      seed(&schemas, &missing_url, json!({"title": "cached"}));
+      let prefetched = requested_uri.as_ref().ok().map(|uri| retriever.retrieve(uri));
+      Ok::<_, FixtureError>((
+        schemas,
+        (generated, resolved, external),
+        references,
+        debug,
+        (relative_uri, relative, requested_uri, absent, requested, prefetched),
+        missing_url,
+      ))
+    })();
+    ensure_that(
+      observed,
+      "builtins and validator retrieval must preserve reference classification, native retrieval errors, requested URLs, and cached values",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        let (ref generated, ref resolved, ref external) = actual.1;
+        let [ref reference, ref non_string, ref absent_reference] = actual.2;
+        let Some(Err(ref invalid_uri)) = actual.4.1 else {
+          return false;
+        };
+        let Some(Err(ref missing_schema)) = actual.4.3 else {
+          return false;
+        };
+        generated.as_ref().is_ok_and(|schema| {
+          schema.is_object()
+            && resolved
+              .as_ref()
+              .is_ok_and(|builtin| builtin.as_ref().is_some_and(|value| value == schema))
+        }) && matches!(external, Ok(None))
+          && reference.is_schema_ref()
+          && reference.schema_ref() == Some("definitions.json#/$defs/value")
+          && !non_string.is_schema_ref()
+          && absent_reference.schema_ref().is_none()
+          && actual.3.contains("cached_validators")
+          && matches!(
+            invalid_uri.downcast_ref::<CacheRetrieveError>(),
+            Some(CacheRetrieveError::InvalidUri { .. })
+          )
+          && invalid_uri.to_string().contains("invalid schema URI")
+          && matches!(missing_schema.downcast_ref::<CacheRetrieveError>(), Some(CacheRetrieveError::Missing { url }) if url == &actual.5)
+          && missing_schema.to_string().contains("is not cached yet")
+          && actual.4.4 == [actual.5.clone()]
+          && actual.4.5.as_ref().is_some_and(|retrieved| {
+            retrieved
+              .as_ref()
+              .is_ok_and(|value| schema_text(value, "title") == Some("cached"))
+          })
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn validation_projects_object_and_array_failures_onto_json_and_dom() -> Result<(), TestFailure> {
-    block_on(async {
+  fn validation_caches_compiled_validators_and_clears_them_on_expiration() -> Result<(), impl Debug> {
+    let observed = block_on(async {
       let (schemas, schema_url) = validation_schemas()?;
-      let invalid = ensure_result(
-        schemas
-          .validate(&schema_url, &json!({ "values": [1, "wrong"], "unexpected": true }))
-          .await,
-        "an invalid JSON instance must return owned validation errors",
-      )?;
-      ensure(
-        invalid.iter().any(|error| {
-          matches!(
-            error.instance_path.as_slice(),
-            [PathSegment::Property(property), PathSegment::Index(1)] if property == "values"
-          )
-        }),
-        "an array-item failure must retain its object property and array index",
-      )?;
-      ensure(
-        invalid.iter().any(|error| {
-          error
-            .additional_properties
+      let valid = schemas.validate(&schema_url, &json!({"values": [1, 2]})).await;
+      let first = schemas.get_validator(&schema_url);
+      let repeated = schemas.validate(&schema_url, &json!({"values": []})).await;
+      let second = schemas.get_validator(&schema_url);
+      let policy = schemas.cache().set_expiration_times(Duration::ZERO, Duration::from_secs(60));
+      let expired = schemas.get_validator(&schema_url);
+      Ok::<_, FixtureError>((schemas, schema_url, valid, first, repeated, second, policy, expired))
+    });
+    ensure_that(
+      observed,
+      "validations must reuse the same compiled validator until schema expiration clears it",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        actual.2.as_ref().is_ok_and(Vec::is_empty)
+          && actual.4.as_ref().is_ok_and(Vec::is_empty)
+          && actual
+            .3
             .as_ref()
-            .is_some_and(|properties| properties == &["unexpected"])
-        }),
-        "an unexpected property failure must retain the rejected property",
-      )?;
+            .ok()
+            .and_then(Option::as_ref)
+            .zip(actual.5.as_ref().ok().and_then(Option::as_ref))
+            .is_some_and(|(initial, reused)| Arc::ptr_eq(initial, reused))
+          && actual.6.is_ok()
+          && matches!(&actual.7, Ok(None))
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
+  }
 
+  #[test]
+  fn validation_projects_object_and_array_failures_onto_json_and_dom() -> Result<(), impl Debug> {
+    let observed = block_on(async {
+      let (schemas, schema_url) = validation_schemas()?;
       let root = parse_valid_dom(
         "values = [1, \"wrong\"]\nunexpected = true\n",
-        "the DOM validation fixture must parse without syntax diagnostics",
-      )?;
-      let projected = ensure_result(
-        schemas.validate_root(&schema_url, &root).await,
-        "DOM validation must project JSON errors back to source nodes",
+        "the DOM validation fixture must parse cleanly",
       )?;
       let array_path = indexed_keys("values", 1)?;
-      let array_error = ensure_some(
-        projected.iter().find(|error| error.keys == array_path),
-        "the array-item error must resolve to the indexed TOML node",
-      )?;
-      ensure(
-        !array_error.text_ranges().is_empty(),
-        "the indexed TOML error must retain a concrete source range",
-      )?;
-      let additional_error = ensure_some(
-        projected.iter().find(|error| error.additional_properties),
-        "the unexpected TOML key must resolve as an additional-property error",
-      )?;
-      ensure(
-        !additional_error.text_ranges().is_empty(),
-        "the unexpected TOML key must retain a concrete source range",
-      )?;
-
-      let malformed = ensure_ok(
-        parse("values = 999999999999999999999999999999\n"),
-        "the malformed scalar validation fixture must still produce a parse result",
-      )?
-      .into_dom();
-      ensure(
-        matches!(
-          schemas.validate_root(&schema_url, &malformed).await,
-          Err(SchemaError::DomSerialization { .. })
-        ),
-        "a semantic DOM that cannot become JSON must fail with the typed serialization error",
-      )
-    })
+      let malformed = parse("values = 999999999999999999999999999999\n")?.into_dom();
+      let invalid = schemas
+        .validate(&schema_url, &json!({"values": [1, "wrong"], "unexpected": true}))
+        .await;
+      let projected = schemas.validate_root(&schema_url, &root).await;
+      let serialization = schemas.validate_root(&schema_url, &malformed).await;
+      Ok::<_, FixtureError>((schemas, root, array_path, malformed, invalid, projected, serialization))
+    });
+    ensure_that(observed, "validation must retain object and indexed failures, project both to concrete DOM ranges, and reject unserializable DOM", |result| {
+      result.as_ref().is_ok_and(|actual| actual.4.as_ref().is_ok_and(|errors| {
+        errors.iter().any(|error| matches!(error.instance_path.as_slice(), [PathSegment::Property(property), PathSegment::Index(1)] if property == "values"))
+          && errors.iter().any(|error| error.additional_properties.as_ref().is_some_and(|properties| properties == &["unexpected"]))
+      }) && actual.5.as_ref().is_ok_and(|errors| errors.iter().any(|error| error.keys == actual.2 && !error.text_ranges().is_empty())
+        && errors.iter().any(|error| error.additional_properties && !error.text_ranges().is_empty()))
+        && matches!(&actual.6, Err(SchemaError::DomSerialization { .. })))
+    }).map(drop).map_err(Box::new)
   }
 
   #[test]
-  fn schema_paths_distinguish_tuple_indices_and_additional_property_fallbacks() -> Result<(), TestFailure> {
-    block_on(async {
-      let (schemas, indexed_url) = seeded_object_property_schemas(
+  fn schema_paths_distinguish_tuple_indices_and_additional_property_fallbacks() -> Result<(), impl Debug> {
+    let observed = block_on(async {
+      let (schemas, schema_url) = seeded_object_property_schemas(
         "https://example.com/indexed.json",
         "values",
-        &json!({
-          "items": [
-            { "title": "first" },
-            { "title": "second" }
-          ]
-        }),
-        &json!({ "title": "fallback" }),
+        &json!({"items": [{"title": "first"}, {"title": "second"}]}),
+        &json!({"title": "fallback"}),
       )?;
-      let instance = json!({ "values": [true, 7], "other": "text" });
-      let second = ensure_result(
-        schemas
-          .schemas_at_path(&indexed_url, &instance, &indexed_keys("values", 1)?)
-          .await,
-        "an in-range tuple index must resolve",
-      )?;
-      ensure(
-        second
-          .iter()
-          .any(|resolved| schema_text(&resolved.1, "title") == Some("second")),
-        "an in-range tuple index must select its positional schema",
-      )?;
-      ensure(
-        !second.iter().any(|resolved| schema_text(&resolved.1, "title") == Some("first")),
-        "an in-range tuple index must not select a sibling positional schema",
-      )?;
-      let out_of_range = ensure_result(
-        schemas
-          .schemas_at_path(&indexed_url, &instance, &indexed_keys("values", 4)?)
-          .await,
-        "an out-of-range tuple index must terminate normally",
-      )?;
-      ensure(
-        out_of_range.is_empty(),
-        "an out-of-range tuple index must not invent a positional schema",
-      )?;
-      let fallback = ensure_result(
-        schemas.schemas_at_path(&indexed_url, &instance, &keys("other")?).await,
-        "an undeclared object property must resolve through `additionalProperties`",
-      )?;
-      ensure(
-        fallback
-          .iter()
-          .any(|resolved| schema_text(&resolved.1, "title") == Some("fallback")),
-        "an undeclared object property must retain the fallback schema",
-      )
-    })
+      let paths = [indexed_keys("values", 1)?, indexed_keys("values", 4)?, keys("other")?];
+      let instance = json!({"values": [true, 7], "other": "text"});
+      let [ref second, ref outside, ref other] = paths;
+      let results = [
+        schemas.schemas_at_path(&schema_url, &instance, second).await,
+        schemas.schemas_at_path(&schema_url, &instance, outside).await,
+        schemas.schemas_at_path(&schema_url, &instance, other).await,
+      ];
+      Ok::<_, FixtureError>((schemas, instance, paths, results))
+    });
+    ensure_that(
+      observed,
+      "tuple indices must select only their own schema and undeclared properties must use the fallback",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        let [ref second, ref outside, ref other] = actual.3;
+        second.as_ref().is_ok_and(|schemas| {
+          schemas
+            .iter()
+            .any(|resolved| schema_text(&resolved.1, "title") == Some("second"))
+            && !schemas
+              .iter()
+              .any(|resolved| schema_text(&resolved.1, "title") == Some("first"))
+        }) && outside.as_ref().is_ok_and(Vec::is_empty)
+          && other.as_ref().is_ok_and(|schemas| {
+            schemas
+              .iter()
+              .any(|resolved| schema_text(&resolved.1, "title") == Some("fallback"))
+          })
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn composition_only_wrappers_expose_alternative_branches_and_descendants() -> Result<(), TestFailure> {
-    block_on(async {
+  fn composition_only_wrappers_expose_alternative_branches_and_descendants() -> Result<(), impl Debug> {
+    let observed = block_on(async {
       let schemas = offline_schemas()?;
-      let composition_url = seed_composition(
+      let one = seed_composition(
         &schemas,
         "https://example.com/composition.json",
         "oneOf",
         &("choice", "one-of text"),
         &("choice", "one-of number"),
       )?;
-      let choices = ensure_result(
-        schemas
-          .schemas_at_path(&composition_url, &json!({ "choice": null }), &keys("choice")?)
-          .await,
-        "a composition-only `oneOf` wrapper must expose each viable branch",
-      )?;
-      let choice_titles = choices
-        .iter()
-        .filter_map(|resolved| schema_text(&resolved.1, "title"))
-        .collect::<Vec<_>>();
-      ensure(
-        (choice_titles.contains(&"one-of text"), choice_titles.contains(&"one-of number")) == (true, true),
-        "both `oneOf` property schemas must survive path resolution",
-      )?;
-
-      let alternatives_url = seed_composition(
+      let any = seed_composition(
         &schemas,
         "https://example.com/alternatives.json",
         "anyOf",
         &("left", "left alternative"),
         &("right", "right alternative"),
       )?;
-      let descendants = ensure_result(
-        schemas
-          .possible_schemas_from(&alternatives_url, &json!({}), &Keys::empty(), 2)
-          .await,
-        "a composition-only `anyOf` wrapper must expose descendant properties",
-      )?;
-      let descendant_titles = child_text_facts(&descendants, "title");
-      ensure(
-        (
-          descendant_titles.contains(&(String::from("left"), Some(String::from("left alternative")))),
-          descendant_titles.contains(&(String::from("right"), Some(String::from("right alternative")))),
-        ) == (true, true),
-        "both `anyOf` descendants must remain independently discoverable",
-      )
-    })
+      let path = keys("choice")?;
+      let choices = schemas.schemas_at_path(&one, &json!({"choice": null}), &path).await;
+      let descendants = schemas.possible_schemas_from(&any, &json!({}), &Keys::empty(), 2).await;
+      Ok::<_, FixtureError>((schemas, choices, descendants))
+    });
+    ensure_that(
+      observed,
+      "composition-only oneOf and anyOf wrappers must preserve both independent branches and their descendants",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        let Ok(ref children) = actual.2 else {
+          return false;
+        };
+        actual.1.as_ref().is_ok_and(|choices| {
+          ["one-of text", "one-of number"]
+            .iter()
+            .all(|title| choices.iter().any(|resolved| schema_text(&resolved.1, "title") == Some(*title)))
+        }) && [("left", "left alternative"), ("right", "right alternative")]
+          .iter()
+          .all(|&(path, title)| {
+            children
+              .iter()
+              .any(|child| child.1.dotted() == path && schema_text(&child.2, "title") == Some(title))
+          })
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn external_references_prefetch_and_fail_with_typed_load_outcomes() -> Result<(), TestFailure> {
-    block_on(async {
+  fn external_references_prefetch_and_fail_with_typed_load_outcomes() -> Result<(), impl Debug> {
+    let observed = block_on(async {
       let environment = TestEnvironment::default();
-      environment.insert_file(
-        "/workspace/referenced.json",
-        serde_json::to_vec(&json!({ "type": "string", "minLength": 2 })).unwrap_or_default(),
-      );
-      let schemas = ensure_result(
-        Schemas::new_offline(environment),
-        "the reference-loading schema service must initialize",
-      )?;
+      let bytes = serde_json::to_vec(&json!({"type": "string", "minLength": 2}))?;
+      environment.insert_file("/workspace/referenced.json", bytes);
+      let schemas = Schemas::new_offline(environment)?;
       let root_url = url("https://example.com/reference-root.json")?;
-      seed(&schemas, &root_url, json!({ "$ref": "file:///workspace/referenced.json" }));
-      let valid = ensure_result(
-        schemas.validate(&root_url, &json!("valid")).await,
-        "an external file reference must be prefetched before validator compilation",
-      )?;
-      ensure(valid.is_empty(), "a value accepted by the external schema must validate")?;
-      let invalid = ensure_result(
-        schemas.validate(&root_url, &json!("x")).await,
-        "an external schema rejection must return owned validation errors",
-      )?;
-      ensure(
-        invalid.iter().any(|error| error.message.contains("shorter than")),
-        "the external schema's constraint must remain active after prefetch",
-      )?;
-
-      let missing_reference_url = url("https://example.com/missing-reference-root.json")?;
-      seed(
-        &schemas,
-        &missing_reference_url,
-        json!({ "$ref": "https://example.com/unavailable.json" }),
-      );
-      ensure(
-        matches!(
-          schemas.validate(&missing_reference_url, &Value::Null).await,
-          Err(SchemaError::Unavailable { .. })
-        ),
-        "an unavailable external reference must preserve the typed load failure",
-      )?;
-
-      let invalid_schema_url = url("https://example.com/invalid-schema.json")?;
-      seed(&schemas, &invalid_schema_url, json!({ "type": 7 }));
-      let invalid_schema = ensure_some(
-        schemas.validate(&invalid_schema_url, &Value::Null).await.err(),
-        "a structurally invalid schema must fail compilation",
-      )?;
-      ensure(
-        matches!(invalid_schema, SchemaError::InvalidSchema { .. }),
-        "schema compilation failures must retain the typed invalid-schema variant",
-      )
-    })
+      let missing_url = url("https://example.com/missing-reference-root.json")?;
+      let invalid_url = url("https://example.com/invalid-schema.json")?;
+      seed(&schemas, &root_url, json!({"$ref": "file:///workspace/referenced.json"}));
+      seed(&schemas, &missing_url, json!({"$ref": "https://example.com/unavailable.json"}));
+      seed(&schemas, &invalid_url, json!({"type": 7}));
+      let valid = schemas.validate(&root_url, &json!("valid")).await;
+      let invalid = schemas.validate(&root_url, &json!("x")).await;
+      let missing = schemas.validate(&missing_url, &Value::Null).await;
+      let malformed = schemas.validate(&invalid_url, &Value::Null).await;
+      Ok::<_, FixtureError>((schemas, valid, invalid, missing, malformed))
+    });
+    ensure_that(
+      observed,
+      "external references must prefetch, enforce constraints, and preserve unavailable-reference and invalid-schema failures",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        actual.1.as_ref().is_ok_and(Vec::is_empty)
+          && actual
+            .2
+            .as_ref()
+            .is_ok_and(|errors| errors.iter().any(|error| error.message.contains("shorter than")))
+          && matches!(&actual.3, Err(SchemaError::Unavailable { .. }))
+          && matches!(&actual.4, Err(SchemaError::InvalidSchema { .. }))
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn fragment_resolution_and_stale_cache_recovery_have_typed_outcomes() -> Result<(), TestFailure> {
-    block_on(async {
+  fn fragment_resolution_and_stale_cache_recovery_have_typed_outcomes() -> Result<(), impl Debug> {
+    let observed = block_on(async {
       let environment = TestEnvironment::default();
-      let schemas = ensure_result(
-        Schemas::new_offline(environment.clone()),
-        "the fragment-and-stale schema service must initialize",
-      )?;
-      let fragment_url = url("https://example.com/fragments.json")?;
-      seed(
-        &schemas,
-        &fragment_url,
-        json!({
-          "$defs": {
-            "leaf": { "title": "fragment leaf" }
-          }
-        }),
-      );
+      let schemas = Schemas::new_offline(environment.clone())?;
+      let root = url("https://example.com/fragments.json")?;
       let selected_url = url("https://example.com/fragments.json#/$defs/leaf")?;
-      let selected = ensure_result(
-        schemas.resolve_schema(selected_url).await,
-        "an existing JSON-pointer fragment must resolve",
-      )?;
-      ensure(
-        schema_text(&selected, "title") == Some("fragment leaf"),
-        "fragment resolution must return only the selected schema",
-      )?;
-      let missing_fragment_url = url("https://example.com/fragments.json#/$defs/missing")?;
-      ensure(
-        matches!(
-          schemas.resolve_schema(missing_fragment_url).await,
-          Err(SchemaError::MissingFragment { fragment, .. }) if fragment == "/$defs/missing"
-        ),
-        "a missing JSON-pointer fragment must retain its exact typed context",
-      )?;
-
+      let missing_url = url("https://example.com/fragments.json#/$defs/missing")?;
       let stale_url = url("https://example.com/stale.json")?;
+      seed(&schemas, &root, json!({"$defs": {"leaf": {"title": "fragment leaf"}}}));
+      let selected = schemas.resolve_schema(selected_url).await;
+      let missing = schemas.resolve_schema(missing_url).await;
       schemas.cache().set_cache_path(Some(PathBuf::from("/cache")));
-      ensure_result(
-        schemas
-          .cache()
-          .set_expiration_times(Duration::from_secs(1), Duration::from_secs(1)),
-        "the short stale-cache policy must install",
-      )?;
-      ensure_result(
-        schemas
-          .cache()
-          .save(stale_url.clone(), Arc::new(json!({ "title": "stale fallback" })))
-          .await,
-        "the stale schema fixture must persist",
-      )?;
-      let deadline = ensure_some(
-        time::OffsetDateTime::UNIX_EPOCH.checked_add(time::Duration::seconds(1)),
-        "the stale-cache deadline must be representable",
-      )?;
-      environment.set_now(deadline);
-      let stale_reader = ensure_result(Schemas::new_offline(environment), "the stale-cache reader must initialize")?;
-      stale_reader.cache().set_cache_path(Some(PathBuf::from("/cache")));
-      let stale = ensure_result(
-        stale_reader.load_schema(&stale_url).await,
-        "an expired disk entry must recover an unavailable remote schema",
-      )?;
-      ensure(
-        schema_text(&stale, "title") == Some("stale fallback"),
-        "stale recovery must preserve the complete cached schema",
-      )
-    })
+      let policy = schemas
+        .cache()
+        .set_expiration_times(Duration::from_secs(1), Duration::from_secs(1));
+      let saved = schemas
+        .cache()
+        .save(stale_url.clone(), Arc::new(json!({"title": "stale fallback"})))
+        .await;
+      let deadline = time::OffsetDateTime::UNIX_EPOCH.checked_add(time::Duration::seconds(1));
+      if let Some(instant) = deadline {
+        environment.set_now(instant);
+      }
+      let reader = Schemas::new_offline(environment);
+      let stale = if let Ok(ref fresh) = reader {
+        fresh.cache().set_cache_path(Some(PathBuf::from("/cache")));
+        Some(fresh.load_schema(&stale_url).await)
+      } else {
+        None
+      };
+      Ok::<_, FixtureError>((schemas, selected, missing, policy, saved, deadline, reader, stale))
+    });
+    ensure_that(
+      observed,
+      "fragment selection and stale recovery must preserve exact native outcomes at the expiration deadline",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        actual
+          .1
+          .as_ref()
+          .is_ok_and(|schema| schema_text(schema, "title") == Some("fragment leaf"))
+          && matches!(&actual.2, Err(SchemaError::MissingFragment { fragment, .. }) if fragment == "/$defs/missing")
+          && actual.3.is_ok()
+          && actual.4.is_ok()
+          && actual.5.is_some()
+          && actual.7.as_ref().is_some_and(|stale| {
+            stale
+              .as_ref()
+              .is_ok_and(|schema| schema_text(schema, "title") == Some("stale fallback"))
+          })
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn custom_semver_formats_accept_valid_values_and_reject_invalid_values() -> Result<(), TestFailure> {
-    block_on(async {
+  fn custom_semver_formats_accept_valid_values_and_reject_invalid_values() -> Result<(), impl Debug> {
+    let observed = block_on(async {
       let (schemas, schema_url) = seeded_schemas(
         "https://example.com/semantic-versions.json",
         json!({
-          "type": "object",
-          "required": ["version", "requirement"],
-          "properties": {
-            "version": {
-              "type": "string",
-              "format": "semver"
-            },
-            "requirement": {
-              "type": "string",
-              "format": "semver-requirement"
-            }
-          }
+          "type": "object", "required": ["version", "requirement"],
+          "properties": {"version": {"type": "string", "format": "semver"}, "requirement": {"type": "string", "format": "semver-requirement"}}
         }),
       )?;
-      let accepted = ensure_result(
-        schemas
-          .validate(&schema_url, &json!({ "version": "1.2.3", "requirement": "^1.2" }))
-          .await,
-        "valid semantic-version strings must complete validation",
-      )?;
-      ensure(accepted.is_empty(), "valid semantic versions and requirements must be accepted")?;
-      let rejected = ensure_result(
-        schemas
-          .validate(&schema_url, &json!({ "version": "release", "requirement": "maybe" }))
-          .await,
-        "invalid semantic-version strings must return validation errors",
-      )?;
-      let rejected_paths = rejected
-        .iter()
-        .filter_map(|error| single_property_path(&error.instance_path))
-        .collect::<Vec<_>>();
-      ensure(
-        (rejected_paths.contains(&"version"), rejected_paths.contains(&"requirement")) == (true, true),
-        "each invalid custom-format value must be rejected at its own property path",
-      )
-    })
+      let accepted = schemas
+        .validate(&schema_url, &json!({"version": "1.2.3", "requirement": "^1.2"}))
+        .await;
+      let rejected = schemas
+        .validate(&schema_url, &json!({"version": "release", "requirement": "maybe"}))
+        .await;
+      Ok::<_, FixtureError>((schemas, accepted, rejected))
+    });
+    ensure_that(
+      observed,
+      "custom formats must accept valid semantic versions and reject each invalid value at its own property",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        let Ok(ref errors) = actual.2 else {
+          return false;
+        };
+        actual.1.as_ref().is_ok_and(Vec::is_empty)
+          && ["version", "requirement"].iter().all(|property| {
+            errors
+              .iter()
+              .any(|error| single_property_path(&error.instance_path) == Some(*property))
+          })
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
   #[test]
-  fn local_and_concurrent_schema_families_preserve_validation_and_traversal() -> Result<(), TestFailure> {
-    block_on(async {
+  fn local_and_concurrent_schema_families_preserve_validation_and_traversal() -> Result<(), impl Debug> {
+    let observed = block_on(async {
       let schema_url = url("https://example.com/execution-families.json")?;
-      let schema = json!({
-        "type": "object",
-        "properties": {
-          "items": {
-            "type": "array",
-            "items": {
-              "title": "array item",
-              "type": "integer"
-            }
-          }
-        }
-      });
-      let instance = json!({ "items": [1, "wrong"] });
-
-      let local = local_schemas(TestEnvironment::default())?;
-      local.add_schema(&schema_url, Arc::new(schema.clone()));
-      let local_loaded = ensure_result(
-        local.load_schema(&schema_url).await,
-        "the local family must load an in-memory schema",
-      )?;
-      ensure(
-        *local_loaded == schema,
-        "the local family must preserve the complete schema document",
-      )?;
-      let local_errors = ensure_result(
-        local.validate(&schema_url, &instance).await,
-        "the local family must validate through its local future boundary",
-      )?;
-      ensure(
-        local_errors.iter().any(|error| {
-          matches!(
-            error.instance_path.as_slice(),
-            [PathSegment::Property(property), PathSegment::Index(1)] if property == "items"
-          )
-        }),
-        "the local family must retain the indexed validation failure",
-      )?;
-
-      let concurrent = concurrent_schemas(TestEnvironment::default())?;
-      concurrent.add_schema(&schema_url, Arc::new(schema));
-      let concurrent_loaded = ensure_result(
-        concurrent.load_schema_concurrent(&schema_url).await,
-        "the concurrent family must load an in-memory schema",
-      )?;
-      ensure(
-        schema_text(&concurrent_loaded, "type") == Some("object"),
-        "the concurrent family must preserve the schema root",
-      )?;
-      let concurrent_errors = ensure_result(
-        concurrent.validate_concurrent(&schema_url, &instance).await,
-        "the concurrent family must validate through its `Send` future boundary",
-      )?;
-      ensure(
-        concurrent_errors.iter().any(|error| {
-          matches!(
-            error.instance_path.as_slice(),
-            [PathSegment::Property(property), PathSegment::Index(1)] if property == "items"
-          )
-        }),
-        "the concurrent family must retain the same indexed validation failure",
-      )?;
-
+      let schema =
+        json!({"type": "object", "properties": {"items": {"type": "array", "items": {"title": "array item", "type": "integer"}}}});
+      let instance = json!({"items": [1, "wrong"]});
       let item_path = indexed_keys("items", 0)?;
-      let at_item = ensure_result(
-        concurrent.schemas_at_path_concurrent(&schema_url, &instance, &item_path).await,
-        "the concurrent family must resolve an array-item schema",
-      )?;
-      ensure(
-        at_item
+      let local = Schemas::new_local(TestEnvironment::default(), local_http_client()?)?;
+      let concurrent_environment = TestEnvironment::default();
+      let concurrent_http = concurrent_http_client(&concurrent_environment, Duration::from_secs(2))?;
+      let concurrent = Schemas::new_concurrent(concurrent_environment, concurrent_http)?;
+      local.add_schema(&schema_url, Arc::new(schema.clone()));
+      concurrent.add_schema(&schema_url, Arc::new(schema.clone()));
+      let local_loaded = local.load_schema(&schema_url).await;
+      let local_errors = local.validate(&schema_url, &instance).await;
+      let concurrent_loaded = concurrent.load_schema_concurrent(&schema_url).await;
+      let concurrent_errors = concurrent.validate_concurrent(&schema_url, &instance).await;
+      let at_item = concurrent.schemas_at_path_concurrent(&schema_url, &instance, &item_path).await;
+      let descendants = concurrent
+        .possible_schemas_from_concurrent(&schema_url, &instance, &item_path, 1)
+        .await;
+      Ok::<_, FixtureError>((
+        local,
+        concurrent,
+        schema,
+        [local_loaded, concurrent_loaded],
+        [local_errors, concurrent_errors],
+        at_item,
+        descendants,
+      ))
+    });
+    ensure_that(
+      observed,
+      "local and concurrent schema families must retain equivalent validation and traversal outcomes",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        let [Ok(ref local_errors), Ok(ref concurrent_errors)] = actual.4 else {
+          return false;
+        };
+        actual
+          .3
           .iter()
-          .any(|resolved| schema_text(&resolved.1, "title") == Some("array item")),
-        "the concurrent family must retain array-item schema metadata",
-      )?;
-      let descendants = ensure_result(
-        concurrent
-          .possible_schemas_from_concurrent(&schema_url, &instance, &item_path, 1)
-          .await,
-        "the concurrent family must enumerate descendant schemas",
-      )?;
-      let descendant_titles = child_text_facts(&descendants, "title");
-      ensure(
-        descendant_titles.contains(&(String::new(), Some(String::from("array item")))),
-        "the concurrent descendant query must expose the array-item schema",
-      )
-    })
+          .all(|loaded| loaded.as_ref().is_ok_and(|schema| **schema == actual.2))
+          && [local_errors, concurrent_errors].into_iter().all(|errors| {
+            errors.iter().any(|error|
+              matches!(error.instance_path.as_slice(), [PathSegment::Property(property), PathSegment::Index(1)] if property == "items"))
+          })
+          && actual.5.as_ref().is_ok_and(|resolved| {
+            resolved
+              .iter()
+              .any(|entry| schema_text(&entry.1, "title") == Some("array item"))
+          })
+          && actual.6.as_ref().is_ok_and(|children| {
+            children
+              .iter()
+              .any(|child| child.1.is_empty() && schema_text(&child.2, "title") == Some("array item"))
+          })
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn offline_transport_preserves_local_schema_capabilities() -> Result<(), TestFailure> {
-    block_on(async {
+  fn offline_transport_preserves_local_schema_capabilities() -> Result<(), impl Debug> {
+    let observed = block_on(async {
       let environment = TestEnvironment::default();
-      environment.insert_file(
-        "/workspace/file-schema.json",
-        serde_json::to_vec(&json!({ "title": "file" })).unwrap_or_default(),
-      );
-      let schemas = ensure_result(Schemas::new_offline(environment.clone()), "offline schema services must initialize")?;
-
+      environment.insert_file("/workspace/file-schema.json", serde_json::to_vec(&json!({"title": "file"}))?);
+      let schemas = Schemas::new_offline(environment.clone())?;
       let builtin_url = url(builtins::TAPLO_CONFIG_URL)?;
-      drop(ensure_result(
-        schemas.load_schema(&builtin_url).await,
-        "offline mode must retain built-in schemas",
-      )?);
-
       let memory_url = url("https://example.com/in-memory.json")?;
-      seed(&schemas, &memory_url, json!({ "title": "memory" }));
-      let memory = ensure_result(
-        schemas.load_schema(&memory_url).await,
-        "offline mode must retain explicitly seeded memory schemas",
-      )?;
-      ensure(schema_text(&memory, "title") == Some("memory"), "memory schema contents")?;
-
       let file_url = url("file:///workspace/file-schema.json")?;
-      let file = ensure_result(schemas.load_schema(&file_url).await, "offline mode must retain file-backed schemas")?;
-      ensure(schema_text(&file, "title") == Some("file"), "file schema contents")?;
-
       let disk_url = url("https://example.com/disk.json")?;
-      schemas.cache().set_cache_path(Some(PathBuf::from("/cache")));
-      ensure_result(
-        schemas
-          .cache()
-          .save(disk_url.clone(), Arc::new(json!({ "title": "disk" })))
-          .await,
-        "the disk schema fixture must persist",
-      )?;
-      let disk_reader = ensure_result(
-        Schemas::new_offline(environment),
-        "the second offline schema service must initialize",
-      )?;
-      disk_reader.cache().set_cache_path(Some(PathBuf::from("/cache")));
-      let disk = ensure_result(
-        disk_reader.load_schema(&disk_url).await,
-        "offline mode must retain disk-cached schemas",
-      )?;
-      ensure(schema_text(&disk, "title") == Some("disk"), "disk schema contents")?;
-
       let remote_url = url("https://example.com/not-cached.json")?;
-      let remote_error = ensure_some(
-        disk_reader.load_schema(&remote_url).await.err(),
-        "offline remote schema loading must fail",
-      )?;
-      ensure_contains(
-        &remote_error.to_string(),
-        "remote schema transport is unavailable",
-        "offline schema errors must explain the missing transport",
-      )?;
-      let catalog_error = ensure_some(
-        disk_reader.associations().add_from_catalog(&remote_url).await.err(),
-        "offline remote catalog loading must fail",
-      )?;
-      ensure_contains(
-        &catalog_error.to_string(),
-        "remote schema transport is unavailable",
-        "offline catalog errors must explain the missing transport",
-      )
-    })
+      seed(&schemas, &memory_url, json!({"title": "memory"}));
+      let builtin = schemas.load_schema(&builtin_url).await;
+      let memory = schemas.load_schema(&memory_url).await;
+      let file = schemas.load_schema(&file_url).await;
+      schemas.cache().set_cache_path(Some(PathBuf::from("/cache")));
+      let saved = schemas.cache().save(disk_url.clone(), Arc::new(json!({"title": "disk"}))).await;
+      let reader = Schemas::new_offline(environment);
+      let disk_reads = if let Ok(ref fresh) = reader {
+        fresh.cache().set_cache_path(Some(PathBuf::from("/cache")));
+        Some((
+          fresh.load_schema(&disk_url).await,
+          fresh.load_schema(&remote_url).await,
+          fresh.associations().add_from_catalog(&remote_url).await,
+        ))
+      } else {
+        None
+      };
+      Ok::<_, FixtureError>((schemas, builtin, memory, file, saved, reader, disk_reads))
+    });
+    ensure_that(
+      observed,
+      "offline services must retain builtin, memory, file, and disk schemas while explaining unavailable remote transport",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        actual.1.is_ok()
+          && actual
+            .2
+            .as_ref()
+            .is_ok_and(|schema| schema_text(schema, "title") == Some("memory"))
+          && actual
+            .3
+            .as_ref()
+            .is_ok_and(|schema| schema_text(schema, "title") == Some("file"))
+          && actual.4.is_ok()
+          && actual.6.as_ref().is_some_and(|disk| {
+            disk.0.as_ref().is_ok_and(|schema| schema_text(schema, "title") == Some("disk"))
+              && disk
+                .1
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains("remote schema transport is unavailable"))
+              && disk
+                .2
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains("remote schema transport is unavailable"))
+          })
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn pattern_properties_match_reject_and_report_invalid_regex() -> Result<(), TestFailure> {
-    block_on(async {
+  fn pattern_properties_match_reject_and_report_invalid_regex() -> Result<(), impl Debug> {
+    let observed = block_on(async {
       let (schemas, matching_url) = seeded_schemas(
         "https://example.com/pattern.json",
-        json!({
-            "patternProperties": {
-                "^foo$": { "title": "matched" }
-            }
-        }),
+        json!({"patternProperties": {"^foo$": {"title": "matched"}}}),
       )?;
-      let instance = json!({ "foo": 1, "bar": 2 });
-      let matching = ensure_result(
-        schemas.schemas_at_path(&matching_url, &instance, &keys("foo")?).await,
-        "a valid matching pattern must resolve",
-      )?;
-      ensure(
-        matching
-          .iter()
-          .any(|resolved| schema_text(&resolved.1, "title") == Some("matched")),
-        "a matching pattern property must contribute its schema",
-      )?;
-      let nonmatching = ensure_result(
-        schemas.schemas_at_path(&matching_url, &instance, &keys("bar")?).await,
-        "a valid nonmatching pattern must be skipped normally",
-      )?;
-      ensure(nonmatching.is_empty(), "a valid nonmatching pattern must not contribute a schema")?;
-
       let invalid_url = url("https://example.com/invalid-pattern.json")?;
-      seed(
-        &schemas,
-        &invalid_url,
-        json!({ "patternProperties": { "[": { "title": "invalid" } } }),
-      );
-      let invalid = ensure_some(
-        schemas.schemas_at_path(&invalid_url, &instance, &keys("foo")?).await.err(),
-        "an invalid pattern must return a resolution error",
-      )?;
-      ensure_contains(
-        &invalid.to_string(),
-        "invalid `patternProperties` expression `[`",
-        "the invalid pattern error must include the offending expression",
-      )?;
-      ensure_contains(
-        &invalid.to_string(),
-        "foo",
-        "the invalid pattern error must include the current key context",
-      )
-    })
+      seed(&schemas, &invalid_url, json!({"patternProperties": {"[": {"title": "invalid"}}}));
+      let instance = json!({"foo": 1, "bar": 2});
+      let foo = keys("foo")?;
+      let bar = keys("bar")?;
+      let matching = schemas.schemas_at_path(&matching_url, &instance, &foo).await;
+      let nonmatching = schemas.schemas_at_path(&matching_url, &instance, &bar).await;
+      let invalid = schemas.schemas_at_path(&invalid_url, &instance, &foo).await;
+      Ok::<_, FixtureError>((schemas, matching, nonmatching, invalid))
+    });
+    ensure_that(
+      observed,
+      "pattern properties must preserve match polarity and invalid regex context",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        actual
+          .1
+          .as_ref()
+          .is_ok_and(|schemas| schemas.iter().any(|entry| schema_text(&entry.1, "title") == Some("matched")))
+          && actual.2.as_ref().is_ok_and(Vec::is_empty)
+          && actual.3.as_ref().is_err_and(|error| {
+            error.to_string().contains("invalid `patternProperties` expression `[`") && error.to_string().contains("foo")
+          })
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn child_schema_traversal_distinguishes_wrappers_regular_composition_and_depth() -> Result<(), TestFailure> {
-    block_on(async {
+  fn child_schema_traversal_distinguishes_wrappers_regular_composition_and_depth() -> Result<(), impl Debug> {
+    let observed = block_on(async {
       let (schemas, wrapper_url) = seeded_schemas(
         "https://example.com/wrapper.json",
-        json!({
-            "description": "wrapper docs",
-            "allOf": [
-                { "properties": { "left": { "type": "string" } } },
-                { "properties": { "right": { "type": "integer" } } },
-                { "$ref": "all-of-branch.json" }
-            ]
-        }),
+        json!({"description": "wrapper docs", "allOf": [
+          {"properties": {"left": {"type": "string"}}}, {"properties": {"right": {"type": "integer"}}}, {"$ref": "all-of-branch.json"}
+        ]}),
       )?;
-      let referenced_branch_url = url("https://example.com/all-of-branch.json")?;
+      let referenced_url = url("https://example.com/all-of-branch.json")?;
+      let regular_url = url("https://example.com/regular.json")?;
+      let empty_url = url("https://example.com/empty-composition.json")?;
       seed(
         &schemas,
-        &referenced_branch_url,
-        json!({ "properties": { "referenced": { "type": "boolean" } } }),
+        &referenced_url,
+        json!({"properties": {"referenced": {"type": "boolean"}}}),
       );
-      let wrapper = ensure_result(
-        schemas.possible_schemas_from(&wrapper_url, &json!({}), &Keys::empty(), 2).await,
-        "a composition-only allOf wrapper must traverse",
-      )?;
-      let wrapper_descriptions = child_text_facts(&wrapper, "description");
-      ensure(
-        wrapper_descriptions.contains(&(String::new(), Some(String::from("wrapper docs")))),
-        "wrapper metadata must override and survive the merged composition",
-      )?;
-      let wrapper_paths = wrapper.iter().map(|child| child.1.dotted().to_owned()).collect::<Vec<_>>();
-      ensure(
-        (
-          wrapper_paths.contains(&String::from("left")),
-          wrapper_paths.contains(&String::from("right")),
-          wrapper_paths.contains(&String::from("referenced")),
-        ) == (true, true, true),
-        "inline and referenced allOf branch properties must survive the wrapper merge",
-      )?;
-
-      let regular_url = url("https://example.com/regular.json")?;
       seed(
         &schemas,
         &regular_url,
-        json!({
-            "properties": { "own": { "type": "boolean" } },
-            "allOf": [
-                { "properties": { "branch": { "type": "number" } } }
-            ]
-        }),
+        json!({"properties": {"own": {"type": "boolean"}}, "allOf": [{"properties": {"branch": {"type": "number"}}}]}),
       );
-      let regular = ensure_result(
+      seed(&schemas, &empty_url, json!({"title": "empty", "allOf": []}));
+      let results = [
+        schemas.possible_schemas_from(&wrapper_url, &json!({}), &Keys::empty(), 2).await,
         schemas.possible_schemas_from(&regular_url, &json!({}), &Keys::empty(), 2).await,
-        "a regular schema with allOf must traverse independently",
-      )?;
-      let regular_paths = regular.iter().map(|child| child.1.dotted().to_owned()).collect::<Vec<_>>();
-      ensure(
-        (
-          regular_paths.contains(&String::from("own")),
-          regular_paths.contains(&String::from("branch")),
-        ) == (true, true),
-        "regular own properties and allOf branch properties must both be exposed",
-      )?;
-
-      let empty_url = url("https://example.com/empty-composition.json")?;
-      seed(&schemas, &empty_url, json!({ "title": "empty", "allOf": [] }));
-      let zero_depth = ensure_result(
         schemas.possible_schemas_from(&empty_url, &json!({}), &Keys::empty(), 0).await,
-        "zero-depth traversal must terminate normally",
-      )?;
-      ensure(zero_depth.is_empty(), "zero depth must return no child schemas")?;
-      let positive_depth = ensure_result(
         schemas.possible_schemas_from(&empty_url, &json!({}), &Keys::empty(), 1).await,
-        "an empty composition array must not suppress the schema",
-      )?;
-      let positive_titles = child_text_facts(&positive_depth, "title");
-      ensure(
-        positive_titles.contains(&(String::new(), Some(String::from("empty")))),
-        "empty allOf must retain the schema itself at positive depth",
-      )
-    })
+      ];
+      Ok::<_, FixtureError>((schemas, results))
+    });
+    ensure_that(
+      observed,
+      "child traversal must preserve wrapper metadata, all composition branches, and depth boundaries",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        let [ref wrapper, ref regular, ref zero, ref positive] = actual.1;
+        wrapper.as_ref().is_ok_and(|children| {
+          children
+            .iter()
+            .any(|child| child.1.is_empty() && schema_text(&child.2, "description") == Some("wrapper docs"))
+            && ["left", "right", "referenced"]
+              .iter()
+              .all(|path| children.iter().any(|child| child.1.dotted() == *path))
+        }) && regular.as_ref().is_ok_and(|children| {
+          ["own", "branch"]
+            .iter()
+            .all(|path| children.iter().any(|child| child.1.dotted() == *path))
+        }) && zero.as_ref().is_ok_and(Vec::is_empty)
+          && positive.as_ref().is_ok_and(|children| {
+            children
+              .iter()
+              .any(|child| child.1.is_empty() && schema_text(&child.2, "title") == Some("empty"))
+          })
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn document_local_and_invalid_references_have_exact_typed_outcomes() -> Result<(), TestFailure> {
-    block_on(async {
+  fn document_local_and_invalid_references_have_exact_typed_outcomes() -> Result<(), impl Debug> {
+    let observed = block_on(async {
       let schemas = offline_schemas()?;
       let internal_url = url("https://example.com/internal.json")?;
+      let invalid_url = url("https://example.com/invalid-reference.json")?;
       seed(
         &schemas,
         &internal_url,
-        json!({
-          "$defs": {
-            "leaf": { "title": "internal leaf" }
-          },
-          "$ref": "#/$defs/leaf"
-        }),
+        json!({"$defs": {"leaf": {"title": "internal leaf"}}, "$ref": "#/$defs/leaf"}),
       );
-      let internal = ensure_result(
-        schemas.schemas_at_path(&internal_url, &Value::Null, &Keys::empty()).await,
-        "a document-local fragment reference must resolve",
-      )?;
-      ensure(
-        internal
-          .iter()
-          .any(|resolved| schema_text(&resolved.1, "title") == Some("internal leaf")),
-        "a fragment-only reference must retain its owning document and select the exact definition",
-      )?;
-
-      let invalid_reference_url = url("https://example.com/invalid-reference.json")?;
-      seed(&schemas, &invalid_reference_url, json!({ "$ref": "http://[" }));
-      let invalid_reference = ensure_some(
-        schemas
-          .schemas_at_path(&invalid_reference_url, &Value::Null, &Keys::empty())
-          .await
-          .err(),
-        "an invalid schema reference must return a typed resolution failure",
-      )?;
-      ensure(
-        matches!(
-          invalid_reference,
-          SchemaError::InvalidReference {
-            ref root,
-            ref reference,
-          } if root == &invalid_reference_url && reference == "http://["
-        ),
-        "invalid-reference failure must retain both its owning document and rejected reference",
-      )
-    })
+      seed(&schemas, &invalid_url, json!({"$ref": "http://["}));
+      let internal = schemas.schemas_at_path(&internal_url, &Value::Null, &Keys::empty()).await;
+      let invalid = schemas.schemas_at_path(&invalid_url, &Value::Null, &Keys::empty()).await;
+      Ok::<_, FixtureError>((schemas, invalid_url, internal, invalid))
+    });
+    ensure_that(
+      observed,
+      "fragment-only references must select their owner and invalid references must retain both owner and rejected value",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        actual.2.as_ref().is_ok_and(|schemas| {
+          schemas
+            .iter()
+            .any(|entry| schema_text(&entry.1, "title") == Some("internal leaf"))
+        }) && matches!(&actual.3, Err(SchemaError::InvalidReference { root, reference }) if root == &actual.1 && reference == "http://[")
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn relative_references_resolve_against_owning_documents_and_identifiers() -> Result<(), TestFailure> {
-    block_on(async {
+  fn relative_references_resolve_against_owning_documents_and_identifiers() -> Result<(), impl Debug> {
+    let observed = block_on(async {
       let schemas = offline_schemas()?;
       let root_url = url("https://example.com/root.json")?;
       let first_url = url("https://example.com/schemas/first.json")?;
       let second_url = url("https://example.com/schemas/second.json")?;
-      seed(&schemas, &root_url, json!({ "$ref": "schemas/first.json" }));
+      let identifier_root = url("https://example.com/id-root.json")?;
+      let identifier_leaf = url("https://example.com/schemas/leaf.json")?;
+      let next_path = keys("next")?;
+      let leaf_path = keys("leaf")?;
+      seed(&schemas, &root_url, json!({"$ref": "schemas/first.json"}));
       seed(
         &schemas,
         &first_url,
-        json!({
-          "properties": {
-            "next": { "$ref": "second.json#/$defs/leaf" }
-          }
-        }),
+        json!({"properties": {"next": {"$ref": "second.json#/$defs/leaf"}}}),
       );
       seed(
         &schemas,
         &second_url,
-        json!({
-          "$defs": {
-            "leaf": {
-              "title": "external leaf",
-              "properties": {
-                "child": { "type": "string" }
-              }
-            }
-          }
-        }),
+        json!({"$defs": {"leaf": {"title": "external leaf", "properties": {"child": {"type": "string"}}}}}),
       );
-
-      let at_path = ensure_result(
-        schemas.schemas_at_path(&root_url, &json!({ "next": {} }), &keys("next")?).await,
-        "nested relative references must resolve from their owning document",
-      )?;
-      ensure(
-        at_path
-          .iter()
-          .any(|resolved| schema_text(&resolved.1, "title") == Some("external leaf")),
-        "a nested relative reference must not fall back to the original root URL",
-      )?;
-      let descendants = ensure_result(
-        schemas.possible_schemas_from(&root_url, &json!({}), &Keys::empty(), 3).await,
-        "descendant traversal must retain external reference origins",
-      )?;
-      let descendant_titles = child_text_facts(&descendants, "title");
-      ensure(
-        descendant_titles.contains(&(String::from("next"), Some(String::from("external leaf")))),
-        "descendant traversal must resolve a referenced child's own relative reference",
-      )?;
-
-      let identifier_root = url("https://example.com/id-root.json")?;
-      let identifier_leaf = url("https://example.com/schemas/leaf.json")?;
       seed(
         &schemas,
         &identifier_root,
-        json!({
-          "$id": "schemas/base.json",
-          "properties": {
-            "leaf": { "$ref": "leaf.json" }
-          }
-        }),
+        json!({"$id": "schemas/base.json", "properties": {"leaf": {"$ref": "leaf.json"}}}),
       );
-      seed(&schemas, &identifier_leaf, json!({ "title": "id-relative leaf" }));
-      let identified = ensure_result(
-        schemas
-          .schemas_at_path(&identifier_root, &json!({ "leaf": null }), &keys("leaf")?)
-          .await,
-        "a schema identifier must replace the inherited relative-reference base",
-      )?;
-      ensure(
-        identified
-          .iter()
-          .any(|resolved| schema_text(&resolved.1, "title") == Some("id-relative leaf")),
-        "a relative reference must resolve against the nearest schema identifier",
-      )
-    })
-  }
-
-  #[test]
-  fn reference_cycles_terminate_without_inventing_schemas() -> Result<(), TestFailure> {
-    block_on(async {
-      let schemas = offline_schemas()?;
-      let cycle_root = url("https://example.com/cycle-root.json")?;
-      let cycle_a = url("https://example.com/a.json")?;
-      let cycle_b = url("https://example.com/b.json")?;
-      seed(&schemas, &cycle_root, json!({ "$ref": "a.json" }));
-      seed(&schemas, &cycle_a, json!({ "$ref": "b.json" }));
-      seed(&schemas, &cycle_b, json!({ "$ref": "a.json" }));
-      let cycle = ensure_result(
-        schemas.schemas_at_path(&cycle_root, &Value::Null, &Keys::empty()).await,
-        "a reference cycle must terminate deterministically",
-      )?;
-      ensure(cycle.is_empty(), "a pure reference cycle must not invent a terminal schema result")
-    })
-  }
-
-  #[test]
-  fn borrowed_validation_errors_retain_owned_paths_messages_and_ranges() -> Result<(), TestFailure> {
-    let schema = json!({
-        "type": "object",
-        "additionalProperties": false,
-        "properties": { "known": { "type": "integer" } }
+      seed(&schemas, &identifier_leaf, json!({"title": "id-relative leaf"}));
+      let resolved = schemas.schemas_at_path(&root_url, &json!({"next": {}}), &next_path).await;
+      let descendants = schemas.possible_schemas_from(&root_url, &json!({}), &Keys::empty(), 3).await;
+      let identified = schemas
+        .schemas_at_path(&identifier_root, &json!({"leaf": null}), &leaf_path)
+        .await;
+      Ok::<_, FixtureError>((schemas, resolved, descendants, identified))
     });
-    let validator = ensure_ok(jsonschema::validator_for(&schema), "the validation fixture schema must compile")?;
-    let value = json!({ "known": "wrong", "unexpected": 1 });
-    let owned: Vec<SchemaValidationError> = validator
-      .iter_errors(&value)
-      .map(|error| SchemaValidationError::from_jsonschema(&error))
-      .collect();
-
-    let additional = ensure_some(
-      owned.iter().find(|error| error.additional_properties.is_some()),
-      "the additional-properties error must be retained",
-    )?;
-    ensure(
-      additional
-        .additional_properties
-        .as_ref()
-        .is_some_and(|properties| properties == &["unexpected"]),
-      "the owned error must retain the unexpected property name",
-    )?;
-    ensure(
-      !additional.message.is_empty(),
-      "the owned additional-properties error must retain its message",
-    )?;
-
-    let typed = ensure_some(
-      owned.iter().find(|error| error.additional_properties.is_none()),
-      "the property-type error must be retained",
-    )?;
-    ensure(
-      matches!(typed.instance_path.as_slice(), [PathSegment::Property(property)] if property == "known"),
-      "the owned property error must retain its instance path",
-    )?;
-
-    let root = parse_valid_dom(
-      "known = \"wrong\"\nunexpected = 1\n",
-      "the validation range fixture must parse without syntax diagnostics",
-    )?;
-    let additional_node = ensure_result(
-      NodeValidationError::new(&root, additional.clone()),
-      "the additional-properties error must resolve to the DOM",
-    )?;
-    let additional_ranges = additional_node.text_ranges();
-    ensure(
-      !additional_ranges.is_empty(),
-      "an unexpected property must retain its concrete DOM range",
-    )?;
-    let typed_node = ensure_result(
-      NodeValidationError::new(&root, typed.clone()),
-      "the property-type error must resolve to the DOM child",
-    )?;
-    ensure(
-      !typed_node.text_ranges().is_empty(),
-      "a normal child validation error must retain a child range",
+    ensure_that(
+      observed,
+      "relative references must follow each owning document and the nearest schema identifier",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        actual.1.as_ref().is_ok_and(|schemas| {
+          schemas
+            .iter()
+            .any(|entry| schema_text(&entry.1, "title") == Some("external leaf"))
+        }) && actual.2.as_ref().is_ok_and(|children| {
+          children
+            .iter()
+            .any(|child| child.1.dotted() == "next" && schema_text(&child.2, "title") == Some("external leaf"))
+        }) && actual.3.as_ref().is_ok_and(|schemas| {
+          schemas
+            .iter()
+            .any(|entry| schema_text(&entry.1, "title") == Some("id-relative leaf"))
+        })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
+  }
+
+  #[test]
+  fn reference_cycles_terminate_without_inventing_schemas() -> Result<(), impl Debug> {
+    let observed = block_on(async {
+      let schemas = offline_schemas()?;
+      let root = url("https://example.com/cycle-root.json")?;
+      let first = url("https://example.com/a.json")?;
+      let second = url("https://example.com/b.json")?;
+      seed(&schemas, &root, json!({"$ref": "a.json"}));
+      seed(&schemas, &first, json!({"$ref": "b.json"}));
+      seed(&schemas, &second, json!({"$ref": "a.json"}));
+      let resolved = schemas.schemas_at_path(&root, &Value::Null, &Keys::empty()).await;
+      Ok::<_, FixtureError>((schemas, resolved))
+    });
+    ensure_that(
+      observed,
+      "a pure reference cycle must terminate without inventing a terminal schema",
+      |result| result.as_ref().is_ok_and(|actual| actual.1.as_ref().is_ok_and(Vec::is_empty)),
+    )
+    .map(drop)
+    .map_err(Box::new)
+  }
+
+  #[test]
+  fn borrowed_validation_errors_retain_owned_paths_messages_and_ranges() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let schema = json!({"type": "object", "additionalProperties": false, "properties": {"known": {"type": "integer"}}});
+      let root = parse_valid_dom(
+        "known = \"wrong\"\nunexpected = 1\n",
+        "the validation range fixture must parse cleanly",
+      )?;
+      let validator = jsonschema::validator_for(&schema);
+      let value = json!({"known": "wrong", "unexpected": 1});
+      let owned = validator.as_ref().ok().map(|compiled| {
+        compiled
+          .iter_errors(&value)
+          .map(|error| SchemaValidationError::from_jsonschema(&error))
+          .collect::<Vec<_>>()
+      });
+      let projected = owned.as_ref().map(|errors| {
+        errors
+          .iter()
+          .map(|error| NodeValidationError::new(&root, error.clone()))
+          .collect::<Vec<_>>()
+      });
+      Ok::<_, FixtureError>((schema, root, validator, value, owned, projected))
+    })();
+    ensure_that(
+      observed,
+      "borrowed validation errors must preserve owned property paths, messages, and concrete DOM ranges",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        let Some(ref errors) = actual.4 else {
+          return false;
+        };
+        errors.iter().any(|error| {
+          error
+            .additional_properties
+            .as_ref()
+            .is_some_and(|properties| properties == &["unexpected"])
+            && !error.message.is_empty()
+        }) && errors.iter().any(|error| {
+          error.additional_properties.is_none()
+            && matches!(error.instance_path.as_slice(), [PathSegment::Property(property)] if property == "known")
+        }) && actual.5.as_ref().is_some_and(|nodes| {
+          nodes
+            .iter()
+            .all(|node| node.as_ref().is_ok_and(|error| !error.text_ranges().is_empty()))
+        })
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

@@ -547,6 +547,7 @@ fn redistribution_inputs(detached: &WorkspaceSeed, existing: &IndexMap<Url, Work
 }
 
 /// Effects of one committed topology replacement.
+#[derive(Debug)]
 pub(crate) struct TopologyUpdate {
   /// Current schema-association notifications for every open document.
   pub(crate) notifications: Vec<DidChangeSchemaAssociationParams>,
@@ -1203,6 +1204,7 @@ enum CompiledManualAssociation {
 }
 
 /// Outcomes of a committed manual association update.
+#[derive(Debug)]
 pub(crate) struct ManualAssociationUpdate {
   /// Updated document-to-schema notifications.
   pub(crate) notifications:       Vec<DidChangeSchemaAssociationParams>,
@@ -1693,6 +1695,7 @@ define_lsp_execution_families!(
 );
 
 /// Mutable state owned by one detached or rooted workspace.
+#[cfg_attr(test, derive(Debug))]
 pub(crate) struct WorkspaceState<T: SchemaTransport> {
   /// Workspace domain root.
   pub(crate) root:         WorkspaceRoot,
@@ -2203,7 +2206,7 @@ fn prepare_loaded_config(
 }
 
 /// Cheap immutable inputs for handlers that may await schema resolution or client output.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct DocumentSnapshot<T: SchemaTransport> {
   /// Parsed immutable document state.
   pub(crate) document:     DocumentState,
@@ -2220,6 +2223,7 @@ pub(crate) struct DocumentSnapshot<T: SchemaTransport> {
 }
 
 /// Result of installing a changed document.
+#[derive(Debug)]
 pub(crate) struct DocumentUpdate {
   /// Whether the document remains owned and parsed.
   pub(crate) disposition:   DocumentDisposition,
@@ -2284,6 +2288,7 @@ impl DocumentState {
 
 #[cfg(test)]
 mod tests {
+  use std::fmt::Debug;
   use std::path::Path;
   use std::path::PathBuf;
   use std::slice::from_ref;
@@ -2293,11 +2298,9 @@ mod tests {
   use futures::executor::block_on;
   use serde_json::Value;
   use serde_json::json;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_eq;
+  use strict_test_support::ResultFailure;
   use strict_test_support::ensure_ok;
-  use strict_test_support::ensure_some;
+  use strict_test_support::ensure_that;
   use taplo_common::HashMap;
   use taplo_common::config::Config;
   use taplo_common::environment::EnvironmentError;
@@ -2311,10 +2314,14 @@ mod tests {
   use taplo_common::schema::transport::SchemaTransport;
   use taplo_common::schema::transport::TransportError;
   use taplo_common::schema::transport::local_http_client;
+  use thiserror::Error;
+  use url::ParseError;
   use url::Url;
 
+  use super::DocumentDisposition;
   use super::DocumentSnapshot;
   use super::DocumentState;
+  use super::DocumentUpdate;
   use super::ManualAssociationRule;
   use super::Revision;
   use super::TestEnvironment;
@@ -2331,8 +2338,29 @@ mod tests {
   use super::load_config_concurrent;
   use super::load_config_local;
   use super::merge_unique_documents;
+  use super::root_contains_document;
   use crate::LocalFuture;
-  use crate::LocalTestFuture;
+  use crate::config::InitConfig;
+  use crate::config::LspConfig;
+  use crate::config::LspConfigError;
+  use crate::lsp_ext::notification::DidChangeSchemaAssociationParams;
+
+  /// Native failures constructing inputs before a world scenario starts.
+  #[derive(Debug, Error)]
+  enum WorldFixtureError {
+    /// HTTP capability construction failed.
+    #[error(transparent)]
+    Transport(#[from] Box<ResultFailure<TransportError>>),
+    /// World or document construction failed.
+    #[error(transparent)]
+    World(#[from] Box<ResultFailure<WorldError>>),
+    /// A fixture URL was invalid.
+    #[error(transparent)]
+    Url(#[from] ResultFailure<ParseError>),
+    /// The default client configuration was invalid.
+    #[error(transparent)]
+    Config(#[from] ResultFailure<LspConfigError>),
+  }
 
   /// Local schema transport used by world owner tests.
   type LocalTestTransport = LocalSchemaTransport<TestEnvironment>;
@@ -2340,38 +2368,30 @@ mod tests {
   type LocalTestWorkspace = WorkspaceState<LocalTestTransport>;
   /// Local world state used by topology behavior tests.
   type LocalTestWorld = WorldState<TestEnvironment, LocalTestTransport>;
-  use super::root_contains_document;
-  use crate::config::InitConfig;
-  use crate::config::LspConfig;
+  /// Complete local and concurrent configuration-loader results.
+  type ConfigurationPair = [Result<Config, WorldError>; 2];
+  /// Complete effects of a workspace configuration application.
+  type ConfigurationResult = Result<Vec<DidChangeSchemaAssociationParams>, WorldError>;
+  /// Project owner, rooted identity, and the complete initialization effects.
+  type InitializedProject = (LocalTestWorld, Url, ConfigurationResult);
 
-  /// Require one concurrently published state type to be transferable and shareable.
-  #[cfg(not(target_arch = "wasm32"))]
-  fn require_send_sync<T: Send + Sync>() {}
-
-  /// Parse one fixture URL through the panic-free test vocabulary.
-  fn url(value: &str) -> Result<Url, TestFailure> {
+  /// Parse one fixture URL through the native extraction vocabulary.
+  fn url(value: &str) -> Result<Url, ResultFailure<ParseError>> {
     ensure_ok(Url::parse(value), "the world-state fixture URL must parse")
   }
 
   /// Construct one local world whose HTTP capability is never exercised by these tests.
-  fn local_world() -> Result<WorldState<TestEnvironment, LocalSchemaTransport<TestEnvironment>>, TestFailure> {
+  fn local_world() -> Result<LocalTestWorld, WorldFixtureError> {
     let environment = TestEnvironment::default();
-    let client = ensure_ok(local_http_client(), "the local schema client must construct")?;
+    let client = ensure_ok(local_http_client(), "the local schema client must construct").map_err(Box::new)?;
     let transport = LocalSchemaTransport::new(environment.clone(), client);
-    ensure_ok(
-      WorldState::with_transport(environment, transport),
-      "the local world fixture must construct",
+    Ok(
+      ensure_ok(
+        WorldState::with_transport(environment, transport),
+        "the local world fixture must construct",
+      )
+      .map_err(Box::new)?,
     )
-  }
-
-  /// Construct one local world with its standard document already open.
-  fn open_document_fixture(context: &'static str) -> LocalTestFuture<'static, (LocalTestWorld, Url)> {
-    Box::pin(async move {
-      let world = local_world()?;
-      let document = url("file:///workspace/document.toml")?;
-      drop(ensure_ok(world.replace_document(&document, "value = 1\n").await, context)?);
-      Ok((world, document))
-    })
   }
 
   /// Construct one default configuration whose prepared file rule selects a named fixture.
@@ -2384,15 +2404,7 @@ mod tests {
 
   /// Construct one global LSP configuration that avoids remote schemas.
   fn schema_disabled_configuration(semantic_tokens: bool) -> Value {
-    json!({
-      "schema": {
-        "enabled": false,
-        "catalogs": []
-      },
-      "syntax": {
-        "semanticTokens": semantic_tokens
-      }
-    })
+    json!({ "schema": { "enabled": false, "catalogs": [] }, "syntax": { "semanticTokens": semantic_tokens } })
   }
 
   /// Construct one client-owned schema association.
@@ -2410,323 +2422,91 @@ mod tests {
     drop(config.schema.associations.insert(pattern.to_owned(), schema.to_owned()));
   }
 
-  /// Verify that a rejected configuration preserved one committed association transaction.
-  fn ensure_committed_association<T: SchemaTransport>(
-    workspace: &WorkspaceState<T>,
-    document: &Url,
-    expected_schema: &Url,
-    expected_revision: Revision,
-    context: &'static str,
-  ) -> Result<(), TestFailure> {
-    let selected_schema = workspace
-      .schemas
-      .associations()
-      .association_for(document)
-      .map(|association| association.url);
-    ensure(
-      (selected_schema, workspace.config_revision, workspace.schema_revision)
-        == (Some(expected_schema.clone()), expected_revision, expected_revision),
-      context,
-    )
+  /// A complete configuration application and its immediately visible committed state.
+  #[derive(Debug)]
+  struct AssociationObservation {
+    /// Native notifications or configuration failure.
+    result:    ConfigurationResult,
+    /// Complete selected association at this boundary.
+    selected:  Option<SchemaAssociation>,
+    /// Configuration and schema revisions at this boundary.
+    revisions: (Revision, Revision),
   }
 
-  /// Generate the configured-association transaction contract for one execution family.
+  /// Capture committed association state before another configuration attempt can change it.
+  fn association_observation<T: SchemaTransport>(
+    workspace: &WorkspaceState<T>,
+    document: &Url,
+    result: ConfigurationResult,
+  ) -> AssociationObservation {
+    AssociationObservation {
+      result,
+      selected: workspace.schemas.associations().association_for(document),
+      revisions: (workspace.config_revision, workspace.schema_revision),
+    }
+  }
+
+  /// Exercise the complete configured-association transaction for each execution family.
   macro_rules! workspace_association_contract {
-    (
-      $name:ident,
-      $transport:ident,
-      $client_context:literal,
-      $apply_configuration:ident,
-      rejected = $rejected:ident,
-      commit = $commit:ident,
-      rejections = $rejections:ident,
-      lifecycle = $lifecycle:ident,
-      detached = $detached:ident $(,)?
-    ) => {
-      /// Apply one configured association that is expected to fail validation.
-      fn $rejected<'operation>(
-        workspace: &'operation mut WorkspaceState<$transport<TestEnvironment>>,
-        environment: &'operation TestEnvironment,
-        pattern: &'static str,
-        schema: &'static str,
-        revision: Revision,
-        context: &'static str,
-      ) -> LocalFuture<'operation, Result<WorldError, TestFailure>> {
-        Box::pin(async move {
-          set_lsp_association(&mut workspace.config, pattern, schema);
-          ensure_some(
-            workspace
-              .$apply_configuration(environment, Config::default(), revision)
-              .await
-              .err(),
-            context,
-          )
-        })
-      }
-
-      /// Commit the first configured association and return its selected schema URL.
-      #[allow(clippy::single_call_fn, reason = "naming the commit phase separates the one successful association transaction from the failure phases that must preserve its committed revision")]
-      fn $commit<'operation>(
-        workspace: &'operation mut WorkspaceState<$transport<TestEnvironment>>,
-        environment: &'operation TestEnvironment,
-        document: &'operation Url,
-        committed_revision: Revision,
-      ) -> LocalFuture<'operation, Result<Url, TestFailure>> {
-        Box::pin(async move {
-          let notifications = ensure_ok(
-            workspace
-              .$apply_configuration(environment, Config::default(), committed_revision)
-              .await,
-            "a rooted relative LSP association must commit",
-          )?;
-          let selected = ensure_some(
-            workspace.schemas.associations().association_for(document),
-            "the rooted LSP association must select its configured document",
-          )?;
-          ensure(
-            (
-              selected.url.clone(),
-              selected.priority,
-            ) == (
-              url("file:///workspace/schema.json")?,
-              priority::LSP_CONFIG,
-            ),
-            "a rooted relative association must resolve against its workspace and retain LSP priority",
-          )?;
-          let selected_source = ensure_some(
-            selected.meta.get("source"),
-            "the selected association must retain its owning source",
-          )?;
-          ensure_eq(
-            selected_source,
-            &json!(source::LSP_CONFIG),
-            "the selected association must identify the LSP configuration owner",
-          )?;
-          let selected_notification = ensure_some(
-            notifications
-              .iter()
-              .find(|notification| notification.document_uri == *document),
-            "configuration commit must notify the open document",
-          )?;
-          ensure(
-            selected_notification.schema_uri.as_ref() == Some(&selected.url),
-            "the association notification must expose the newly selected schema",
-          )?;
-          Ok(selected.url)
-        })
-      }
-
-      /// Reject invalid patterns and URLs while preserving the committed association.
-      #[allow(clippy::single_call_fn, reason = "the named phase pairs both invalid-input rejections with proof that the previously committed association and revisions survive them")]
-      fn $rejections<'operation>(
-        workspace: &'operation mut WorkspaceState<$transport<TestEnvironment>>,
-        environment: &'operation TestEnvironment,
-        document: &'operation Url,
-        selected_schema: &'operation Url,
-        committed_revision: Revision,
-      ) -> LocalFuture<'operation, Result<(), TestFailure>> {
-        Box::pin(async move {
-          let pattern_failure = $rejected(
-            workspace,
-            environment,
-            "[",
-            "https://example.com/rejected-pattern.json",
-            Revision(2),
-            "an invalid configured regular expression must be rejected",
-          )
-          .await?;
-          ensure(
-            matches!(
-              pattern_failure,
-              WorldError::AssociationPattern {
-                ref pattern,
-                ..
-              } if pattern == "["
-            ),
-            "configured regular-expression failure must retain the rejected pattern",
-          )?;
-          ensure_committed_association(
-            workspace,
-            document,
-            selected_schema,
-            committed_revision,
-            "pattern validation failure must preserve the committed association and both revisions",
-          )?;
-
-          let url_failure = $rejected(
-            workspace,
-            environment,
-            r".*/document\.toml$",
-            "::",
-            Revision(3),
-            "an invalid configured schema URL must be rejected",
-          )
-          .await?;
-          ensure(
-            matches!(
-              url_failure,
-              WorldError::AssociationUrl {
-                ref source_value,
-                ..
-              } if source_value == "::"
-            ),
-            "configured URL failure must retain the rejected source value",
-          )?;
-          ensure_committed_association(
-            workspace,
-            document,
-            selected_schema,
-            committed_revision,
-            "URL validation failure must preserve the committed association and both revisions",
-          )
-        })
-      }
-
-      /// Disable schema support, then require configured associations to recover.
-      #[allow(clippy::single_call_fn, reason = "the named phase keeps disable-then-recover ordering explicit, so removal and replacement of LSP-owned associations are asserted against the same committed workspace")]
-      fn $lifecycle<'operation>(
-        workspace: &'operation mut WorkspaceState<$transport<TestEnvironment>>,
-        environment: &'operation TestEnvironment,
-        document: &'operation Url,
-      ) -> LocalFuture<'operation, Result<(), TestFailure>> {
-        Box::pin(async move {
-          workspace.config.schema.enabled = false;
-          set_lsp_association(
-            &mut workspace.config,
-            r".*/document\.toml$",
-            "./disabled.json",
-          );
-          let disabled_revision = Revision(4);
-          let disabled_notifications = ensure_ok(
-            workspace
-              .$apply_configuration(environment, Config::default(), disabled_revision)
-              .await,
-            "disabling schemas must atomically remove LSP-owned associations",
-          )?;
-          ensure(
-            (
-              workspace.schemas.associations().association_for(document).is_none(),
-              workspace.config_revision,
-              workspace.schema_revision,
-            ) == (true, disabled_revision, disabled_revision),
-            "disabled schema configuration must remove prior selections and commit both revisions",
-          )?;
-          let disabled_notification = ensure_some(
-            disabled_notifications
-              .iter()
-              .find(|notification| notification.document_uri == *document),
-            "schema disablement must notify the open document",
-          )?;
-          ensure(
-            disabled_notification.schema_uri.is_none(),
-            "schema disablement must explicitly notify the client that no schema remains selected",
-          )?;
-
-          workspace.config.schema.enabled = true;
-          set_lsp_association(
-            &mut workspace.config,
-            r".*/document\.toml$",
-            "./recovered.json",
-          );
-          let recovered_revision = Revision(5);
-          let recovered_schema = url("file:///workspace/recovered.json")?;
-          drop(ensure_ok(
-            workspace
-              .$apply_configuration(environment, Config::default(), recovered_revision)
-              .await,
-            "configured associations must recover after schema support is re-enabled",
-          )?);
-          let recovered_selection = workspace
-            .schemas
-            .associations()
-            .association_for(document)
-            .map(|association| association.url);
-          ensure(
-            (
-              recovered_selection,
-              workspace.config_revision,
-              workspace.schema_revision,
-            ) == (Some(recovered_schema), recovered_revision, recovered_revision),
-            "re-enabled schema configuration must select the replacement association and advance both revisions",
-          )
-        })
-      }
-
-      /// Reject a relative configured association for a fresh detached workspace.
-      #[allow(clippy::single_call_fn, reason = "the named phase isolates the detached-workspace polarity, whose fresh workspace must reject relative association paths without touching the rooted contract")]
-      fn $detached<'operation>(
-        transport: $transport<TestEnvironment>,
-        environment: &'operation TestEnvironment,
-        document: &'operation Url,
-      ) -> LocalFuture<'operation, Result<(), TestFailure>> {
-        Box::pin(async move {
-          let mut detached = ensure_ok(
-            WorkspaceState::new(WorkspaceRoot::Detached, transport),
-            "the detached configured-association workspace must construct",
-          )?;
-          detached.config.schema.catalogs.clear();
-          set_lsp_association(&mut detached.config, r".*\.toml$", "./schema.json");
-          let detached_failure = ensure_some(
-            detached
-              .$apply_configuration(environment, Config::default(), Revision(1))
-              .await
-              .err(),
-            "a detached relative LSP association must be rejected",
-          )?;
-          ensure(
-            matches!(
-              detached_failure,
-              WorldError::DetachedRelativePath {
-                ref path
-              } if path == Path::new("./schema.json")
-            ),
-            "detached association failure must retain the unresolved relative path",
-          )?;
-          ensure(
-            (
-              detached.config_revision,
-              detached.schema_revision,
-              detached.schemas.associations().association_for(document).is_none(),
-            ) == (Revision::INITIAL, Revision::INITIAL, true),
-            "detached-path rejection must preserve initial revisions and install no association",
-          )
-        })
-      }
-
+    ($name:ident, $transport:ident, $apply_configuration:ident) => {
       #[test]
-      fn $name() -> Result<(), TestFailure> {
-        block_on(async {
+      fn $name() -> Result<(), impl Debug> {
+        let observations = block_on(async {
           let environment = TestEnvironment::default();
-          let transport = $transport::new(
-            environment.clone(),
-            ensure_ok(local_http_client(), $client_context)?,
-          );
+          let transport = $transport::new(environment.clone(), ensure_ok(local_http_client(), "the association client must construct").map_err(Box::new)?);
           let root = WorkspaceRoot::Rooted(url("file:///workspace/")?);
           let document = url("file:///workspace/document.toml")?;
-          let mut workspace = ensure_ok(
-            WorkspaceState::new(root, transport.clone()),
-            "the rooted configured-association workspace must construct",
-          )?;
+          let committed_schema = url("file:///workspace/schema.json")?;
+          let recovered_schema = url("file:///workspace/recovered.json")?;
+          let parsed = ensure_ok(DocumentState::parse("value = 1\n"), "the association document must parse").map_err(Box::new)?;
+          let mut workspace = ensure_ok(WorkspaceState::new(root, transport.clone()), "the rooted association workspace must construct").map_err(Box::new)?;
+          let mut detached = ensure_ok(WorkspaceState::new(WorkspaceRoot::Detached, transport), "the detached association workspace must construct").map_err(Box::new)?;
           workspace.config.schema.catalogs.clear();
-          set_lsp_association(
-            &mut workspace.config,
-            r".*/document\.toml$",
-            "./schema.json",
-          );
-          drop(workspace.documents.insert(
-            document.clone(),
-            ensure_ok(
-              DocumentState::parse("value = 1\n"),
-              "the configured-association document must parse",
-            )?,
-          ));
-
-          let committed_revision = Revision(1);
-          let selected_schema = $commit(&mut workspace, &environment, &document, committed_revision).await?;
-          $rejections(&mut workspace, &environment, &document, &selected_schema, committed_revision).await?;
-          $lifecycle(&mut workspace, &environment, &document).await?;
-          $detached(transport, &environment, &document).await
-        })
+          detached.config.schema.catalogs.clear();
+          let previous = workspace.documents.insert(document.clone(), parsed);
+          set_lsp_association(&mut workspace.config, r".*/document\.toml$", "./schema.json");
+          let committed = workspace.$apply_configuration(&environment, Config::default(), Revision(1)).await;
+          let committed = association_observation(&workspace, &document, committed);
+          set_lsp_association(&mut workspace.config, "[", "https://example.com/rejected-pattern.json");
+          let rejected_pattern = workspace.$apply_configuration(&environment, Config::default(), Revision(2)).await;
+          let rejected_pattern = association_observation(&workspace, &document, rejected_pattern);
+          set_lsp_association(&mut workspace.config, r".*/document\.toml$", "::");
+          let rejected_url = workspace.$apply_configuration(&environment, Config::default(), Revision(3)).await;
+          let rejected_url = association_observation(&workspace, &document, rejected_url);
+          workspace.config.schema.enabled = false;
+          set_lsp_association(&mut workspace.config, r".*/document\.toml$", "./disabled.json");
+          let disabled = workspace.$apply_configuration(&environment, Config::default(), Revision(4)).await;
+          let disabled = association_observation(&workspace, &document, disabled);
+          workspace.config.schema.enabled = true;
+          set_lsp_association(&mut workspace.config, r".*/document\.toml$", "./recovered.json");
+          let recovered = workspace.$apply_configuration(&environment, Config::default(), Revision(5)).await;
+          let recovered = association_observation(&workspace, &document, recovered);
+          set_lsp_association(&mut detached.config, r".*\.toml$", "./schema.json");
+          let detached_result = detached.$apply_configuration(&environment, Config::default(), Revision(1)).await;
+          let detached_result = association_observation(&detached, &document, detached_result);
+          Ok::<_, WorldFixtureError>((workspace, detached, document, committed_schema, recovered_schema, previous,
+            [committed, rejected_pattern, rejected_url, disabled, recovered, detached_result]))
+        });
+        ensure_that(observations, "association commit, rejection, disablement, recovery, and detached rejection must retain their complete transaction outcomes", |result| {
+          let Ok((_, _, ref document, ref committed_schema, ref recovered_schema, ref previous, ref observations)) = *result else { return false; };
+          let [ref committed, ref rejected_pattern, ref rejected_url, ref disabled, ref recovered, ref detached] = *observations;
+          previous.is_none()
+            && committed.result.as_ref().is_ok_and(|notifications| notifications.iter().any(|notification| notification.document_uri == *document && notification.schema_uri.as_ref() == Some(committed_schema)))
+            && committed.selected.as_ref().is_some_and(|selected| selected.url == *committed_schema && selected.priority == priority::LSP_CONFIG && selected.meta.get("source") == Some(&json!(source::LSP_CONFIG)))
+            && committed.revisions == (Revision(1), Revision(1))
+            && matches!(rejected_pattern.result, Err(WorldError::AssociationPattern { ref pattern, .. }) if pattern == "[")
+            && rejected_pattern.selected.as_ref().is_some_and(|selected| selected.url == *committed_schema)
+            && rejected_pattern.revisions == (Revision(1), Revision(1))
+            && matches!(rejected_url.result, Err(WorldError::AssociationUrl { ref source_value, .. }) if source_value == "::")
+            && rejected_url.selected.as_ref().is_some_and(|selected| selected.url == *committed_schema)
+            && rejected_url.revisions == (Revision(1), Revision(1))
+            && disabled.result.as_ref().is_ok_and(|notifications| notifications.iter().any(|notification| notification.document_uri == *document && notification.schema_uri.is_none()))
+            && disabled.selected.is_none() && disabled.revisions == (Revision(4), Revision(4))
+            && recovered.result.is_ok() && recovered.selected.as_ref().is_some_and(|selected| selected.url == *recovered_schema)
+            && recovered.revisions == (Revision(5), Revision(5))
+            && matches!(detached.result, Err(WorldError::DetachedRelativePath { ref path }) if path == Path::new("./schema.json"))
+            && detached.selected.is_none() && detached.revisions == (Revision::INITIAL, Revision::INITIAL)
+        }).map(drop).map_err(Box::new)
       }
     };
   }
@@ -2734,720 +2514,331 @@ mod tests {
   workspace_association_contract!(
     local_workspace_lsp_associations_validate_commit_disable_and_recover,
     LocalSchemaTransport,
-    "the local association client must construct",
-    apply_configuration_local,
-    rejected = rejected_local_association,
-    commit = commit_local_configured_association,
-    rejections = reject_local_invalid_associations,
-    lifecycle = disable_and_recover_local_associations,
-    detached = reject_local_detached_relative_association,
+    apply_configuration_local
   );
-
   #[cfg(not(target_arch = "wasm32"))]
   workspace_association_contract!(
     concurrent_workspace_lsp_associations_validate_commit_disable_and_recover,
     ConcurrentSchemaTransport,
-    "the concurrent association client must construct",
-    apply_configuration_concurrent,
-    rejected = rejected_concurrent_association,
-    commit = commit_concurrent_configured_association,
-    rejections = reject_concurrent_invalid_associations,
-    lifecycle = disable_and_recover_concurrent_associations,
-    detached = reject_concurrent_detached_relative_association,
+    apply_configuration_concurrent
   );
 
-  /// Load one configuration through both execution families for parity assertions.
+  /// Load one configuration through both execution families, preserving both native outcomes.
   fn load_config_pair<'fixture>(
     environment: &'fixture TestEnvironment,
     root: &'fixture WorkspaceRoot,
     lsp_config: &'fixture LspConfig,
     default: &'fixture Config,
-  ) -> LocalTestFuture<'fixture, (Config, Config)> {
+  ) -> LocalFuture<'fixture, ConfigurationPair> {
     Box::pin(async move {
-      let local = ensure_ok(
+      [
         load_config_local(environment, root, lsp_config, default).await,
-        "the local configuration loader must succeed",
-      )?;
-      let concurrent = ensure_ok(
         load_config_concurrent(environment, root, lsp_config, default).await,
-        "the concurrent configuration loader must succeed",
-      )?;
-      Ok((local, concurrent))
+      ]
     })
-  }
-
-  /// Load one explicit client configuration path through both execution families.
-  fn load_explicit_config_pair<'fixture>(
-    environment: &'fixture TestEnvironment,
-    root: &'fixture WorkspaceRoot,
-    default: &'fixture Config,
-    configured_path: &str,
-  ) -> LocalTestFuture<'fixture, (Config, Config)> {
-    let path = PathBuf::from(configured_path);
-    Box::pin(async move {
-      let mut lsp_config = ensure_ok(LspConfig::new(), "the explicit-path LSP configuration must construct")?;
-      lsp_config.taplo.config_file.path = Some(path);
-      load_config_pair(environment, root, &lsp_config, default).await
-    })
-  }
-
-  /// Require both execution families to agree on one prepared file inclusion.
-  fn ensure_configuration_inclusion(
-    local: &Config,
-    concurrent: &Config,
-    path: &Path,
-    expected: bool,
-    context: &'static str,
-  ) -> Result<(), TestFailure> {
-    ensure(
-      (local.is_included(path), concurrent.is_included(path)) == (expected, expected),
-      context,
-    )
   }
 
   #[test]
-  fn configuration_loaders_share_rooted_discovery_and_explicit_path_semantics() -> Result<(), TestFailure> {
-    block_on(async {
+  fn configuration_loaders_share_rooted_discovery_and_explicit_path_semantics() -> Result<(), impl Debug> {
+    let observations = block_on(async {
       let environment = TestEnvironment::default();
       environment.insert_file("/workspace/taplo.toml", b"include = [\"discovered.toml\"]\n".to_vec());
       environment.insert_file("/workspace/config/project.toml", b"include = [\"relative.toml\"]\n".to_vec());
       environment.insert_file("/configs/absolute.toml", b"include = [\"absolute.toml\"]\n".to_vec());
       let root = WorkspaceRoot::Rooted(url("file:///workspace")?);
       let default = default_config("default.toml");
-      let discovered_lsp = ensure_ok(LspConfig::new(), "the discovery LSP configuration must construct")?;
-      let (local_discovered, concurrent_discovered) = load_config_pair(&environment, &root, &discovered_lsp, &default).await?;
-      ensure_configuration_inclusion(
-        &local_discovered,
-        &concurrent_discovered,
-        Path::new("/workspace/discovered.toml"),
-        true,
-        "both loaders must prepare the discovered configuration against the rooted base",
-      )?;
-      ensure_configuration_inclusion(
-        &local_discovered,
-        &concurrent_discovered,
-        Path::new("/workspace/default.toml"),
-        false,
-        "a discovered configuration must replace rather than merge the host default file rule",
-      )?;
-      ensure(
-        environment.discovery_bases() == [PathBuf::from("/workspace"), PathBuf::from("/workspace")],
-        "local and concurrent discovery must consult the same normalized root",
-      )?;
-
-      let (local_relative, concurrent_relative) = load_explicit_config_pair(&environment, &root, &default, "config/project.toml").await?;
-      ensure_configuration_inclusion(
-        &local_relative,
-        &concurrent_relative,
-        Path::new("/workspace/relative.toml"),
-        true,
-        "both loaders must resolve rooted relative paths against the workspace",
-      )?;
-
-      let (local_absolute, concurrent_absolute) =
-        load_explicit_config_pair(&environment, &root, &default, "/configs/absolute.toml").await?;
-      ensure_configuration_inclusion(
-        &local_absolute,
-        &concurrent_absolute,
-        Path::new("/workspace/absolute.toml"),
-        true,
-        "both loaders must prepare absolute configuration contents against the workspace base",
-      )?;
-      ensure(
-        environment.discovery_bases() == [PathBuf::from("/workspace"), PathBuf::from("/workspace")],
-        "explicit configuration paths must not perform incidental discovery",
-      )
-    })
+      let discovered_config = ensure_ok(LspConfig::new(), "the discovery configuration must construct")?;
+      let mut relative_config = discovered_config.clone();
+      relative_config.taplo.config_file.path = Some(PathBuf::from("config/project.toml"));
+      let mut absolute_config = discovered_config.clone();
+      absolute_config.taplo.config_file.path = Some(PathBuf::from("/configs/absolute.toml"));
+      let discovered = load_config_pair(&environment, &root, &discovered_config, &default).await;
+      let discovered_bases = environment.discovery_bases();
+      let relative = load_config_pair(&environment, &root, &relative_config, &default).await;
+      let absolute = load_config_pair(&environment, &root, &absolute_config, &default).await;
+      let final_bases = environment.discovery_bases();
+      Ok::<_, WorldFixtureError>((environment, discovered, relative, absolute, discovered_bases, final_bases))
+    });
+    let discovery_matches = |loaded: &Result<Config, WorldError>| {
+      let Ok(ref config) = *loaded else {
+        return false;
+      };
+      config.is_included(Path::new("/workspace/discovered.toml")) && !config.is_included(Path::new("/workspace/default.toml"))
+    };
+    ensure_that(
+      observations,
+      "local and concurrent loaders must preserve rooted discovery, replacement, and explicit-path semantics",
+      |result| {
+        let Ok((_, ref discovered, ref relative, ref absolute, ref discovered_bases, ref final_bases)) = *result else {
+          return false;
+        };
+        discovered.iter().all(discovery_matches)
+          && relative.iter().all(|loaded| {
+            loaded
+              .as_ref()
+              .is_ok_and(|config| config.is_included(Path::new("/workspace/relative.toml")))
+          })
+          && absolute.iter().all(|loaded| {
+            loaded
+              .as_ref()
+              .is_ok_and(|config| config.is_included(Path::new("/workspace/absolute.toml")))
+          })
+          && *discovered_bases == [PathBuf::from("/workspace"), PathBuf::from("/workspace")]
+          && final_bases == discovered_bases
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn configuration_loaders_share_disabled_and_detached_default_behavior() -> Result<(), TestFailure> {
-    block_on(async {
+  fn configuration_loaders_share_disabled_and_detached_default_behavior() -> Result<(), impl Debug> {
+    let observations = block_on(async {
       let environment = TestEnvironment::default();
       environment.set_read_failure(true);
       let default = default_config("default.toml");
-      let detached = WorkspaceRoot::Detached;
-      let mut disabled = ensure_ok(LspConfig::new(), "the disabled LSP configuration must construct")?;
+      let mut disabled = ensure_ok(LspConfig::new(), "the disabled configuration must construct")?;
+      let detached_default = disabled.clone();
       disabled.taplo.config_file.enabled = false;
       disabled.taplo.config_file.path = Some(PathBuf::from("/missing/config.toml"));
-      let local_disabled = ensure_ok(
-        load_config_local(&environment, &detached, &disabled, &default).await,
-        "disabled local loading must use the prepared host default without reading",
-      )?;
-      let concurrent_disabled = ensure_ok(
-        load_config_concurrent(&environment, &detached, &disabled, &default).await,
-        "disabled concurrent loading must use the prepared host default without reading",
-      )?;
-      ensure(
-        (
-          local_disabled.is_included(Path::new("/workspace/default.toml")),
-          concurrent_disabled.is_included(Path::new("/workspace/default.toml")),
-        ) == (true, true),
-        "disabled loading must preserve the host default under both execution models",
-      )?;
-
-      let detached_default = ensure_ok(LspConfig::new(), "the detached-default LSP configuration must construct")?;
-      let local_default = ensure_ok(
-        load_config_local(&environment, &detached, &detached_default, &default).await,
-        "detached local loading without a path must use the host default",
-      )?;
-      let concurrent_default = ensure_ok(
-        load_config_concurrent(&environment, &detached, &detached_default, &default).await,
-        "detached concurrent loading without a path must use the host default",
-      )?;
-      ensure(
-        (
-          local_default.is_included(Path::new("/workspace/default.toml")),
-          concurrent_default.is_included(Path::new("/workspace/default.toml")),
-        ) == (true, true),
-        "detached default loading must prepare against the deterministic current directory",
-      )?;
-      ensure(
-        environment.discovery_bases().is_empty(),
-        "disabled and detached-default loading must not perform rooted discovery",
-      )
-    })
+      let disabled_results = load_config_pair(&environment, &WorkspaceRoot::Detached, &disabled, &default).await;
+      let default_results = load_config_pair(&environment, &WorkspaceRoot::Detached, &detached_default, &default).await;
+      let discovery = environment.discovery_bases();
+      Ok::<_, WorldFixtureError>((environment, disabled_results, default_results, discovery))
+    });
+    ensure_that(
+      observations,
+      "disabled and detached loading must preserve defaults without reading or discovery",
+      |result| {
+        let Ok((_, ref disabled, ref default, ref discovery)) = *result else {
+          return false;
+        };
+        disabled.iter().chain(default).all(|loaded| {
+          loaded
+            .as_ref()
+            .is_ok_and(|config| config.is_included(Path::new("/workspace/default.toml")))
+        }) && discovery.is_empty()
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn configuration_loaders_reject_invalid_host_context_and_recover_after_read_failure() -> Result<(), TestFailure> {
-    block_on(async {
+  fn configuration_loaders_reject_invalid_host_context_and_recover_after_read_failure() -> Result<(), impl Debug> {
+    let observations = block_on(async {
       let environment = TestEnvironment::default();
-      let detached = WorkspaceRoot::Detached;
-      let default = default_config("default.toml");
-      let mut relative = ensure_ok(LspConfig::new(), "the detached-relative LSP configuration must construct")?;
-      relative.taplo.config_file.path = Some(PathBuf::from("relative.toml"));
-      ensure(
-        [
-          matches!(
-            load_config_local(&environment, &detached, &relative, &default).await,
-            Err(WorldError::DetachedRelativePath { .. })
-          ),
-          matches!(
-            load_config_concurrent(&environment, &detached, &relative, &default).await,
-            Err(WorldError::DetachedRelativePath { .. })
-          ),
-        ] == [true, true],
-        "both loaders must reject relative configuration paths for a detached workspace",
-      )?;
-
       let missing_cwd = TestEnvironment::default();
       missing_cwd.set_cwd(None);
-      let implicit = ensure_ok(LspConfig::new(), "the implicit detached LSP configuration must construct")?;
-      ensure(
-        [
-          matches!(
-            load_config_local(&missing_cwd, &detached, &implicit, &default).await,
-            Err(WorldError::MissingCurrentDirectory)
-          ),
-          matches!(
-            load_config_concurrent(&missing_cwd, &detached, &implicit, &default).await,
-            Err(WorldError::MissingCurrentDirectory)
-          ),
-        ] == [true, true],
-        "both loaders must reject detached configuration without a current directory",
-      )?;
-
-      let root = WorkspaceRoot::Rooted(url("file:///workspace")?);
-      let mut explicit = ensure_ok(LspConfig::new(), "the explicit recovery LSP configuration must construct")?;
+      let default = default_config("default.toml");
+      let implicit = ensure_ok(LspConfig::new(), "the implicit configuration must construct")?;
+      let mut relative = implicit.clone();
+      relative.taplo.config_file.path = Some(PathBuf::from("relative.toml"));
+      let mut explicit = implicit.clone();
       explicit.taplo.config_file.path = Some(PathBuf::from("/configs/recovery.toml"));
+      let root = WorkspaceRoot::Rooted(url("file:///workspace")?);
       environment.insert_file("/configs/recovery.toml", b"include = [\"recovered.toml\"]\n".to_vec());
+      let relative_results = load_config_pair(&environment, &WorkspaceRoot::Detached, &relative, &default).await;
+      let cwd_results = load_config_pair(&missing_cwd, &WorkspaceRoot::Detached, &implicit, &default).await;
       environment.set_read_failure(true);
-      ensure(
-        [
-          matches!(
-            load_config_local(&environment, &root, &explicit, &default).await,
-            Err(WorldError::Environment(EnvironmentError::Io { .. }))
-          ),
-          matches!(
-            load_config_concurrent(&environment, &root, &explicit, &default).await,
-            Err(WorldError::Environment(EnvironmentError::Io { .. }))
-          ),
-        ] == [true, true],
-        "both loaders must preserve injected read failures as typed environment errors",
-      )?;
+      let read_results = load_config_pair(&environment, &root, &explicit, &default).await;
       environment.set_read_failure(false);
-      let local_recovered = ensure_ok(
-        load_config_local(&environment, &root, &explicit, &default).await,
-        "the local loader must recover after reads become available",
-      )?;
-      let concurrent_recovered = ensure_ok(
-        load_config_concurrent(&environment, &root, &explicit, &default).await,
-        "the concurrent loader must recover after reads become available",
-      )?;
-      ensure(
-        (
-          local_recovered.is_included(Path::new("/workspace/recovered.toml")),
-          concurrent_recovered.is_included(Path::new("/workspace/recovered.toml")),
-        ) == (true, true),
-        "both loaders must commit the expected configuration after recovery",
-      )
-    })
+      let recovered = load_config_pair(&environment, &root, &explicit, &default).await;
+      Ok::<_, WorldFixtureError>((environment, missing_cwd, relative_results, cwd_results, read_results, recovered))
+    });
+    ensure_that(
+      observations,
+      "both configuration loaders must retain host failures and recover when reads return",
+      |result| {
+        let Ok((_, _, ref relative, ref cwd, ref read, ref recovered)) = *result else {
+          return false;
+        };
+        relative
+          .iter()
+          .all(|loaded| matches!(*loaded, Err(WorldError::DetachedRelativePath { .. })))
+          && cwd
+            .iter()
+            .all(|loaded| matches!(*loaded, Err(WorldError::MissingCurrentDirectory)))
+          && read
+            .iter()
+            .all(|loaded| matches!(*loaded, Err(WorldError::Environment(EnvironmentError::Io { .. }))))
+          && recovered.iter().all(|loaded| {
+            loaded
+              .as_ref()
+              .is_ok_and(|config| config.is_included(Path::new("/workspace/recovered.toml")))
+          })
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn configuration_loaders_preserve_absence_utf8_and_toml_failure_boundaries() -> Result<(), TestFailure> {
-    block_on(async {
+  fn configuration_loaders_preserve_absence_utf8_and_toml_failure_boundaries() -> Result<(), impl Debug> {
+    let observations = block_on(async {
       let environment = TestEnvironment::default();
       let root = WorkspaceRoot::Rooted(url("file:///workspace")?);
       let default = default_config("default.toml");
-      let implicit = ensure_ok(LspConfig::new(), "the absent-discovery LSP configuration must construct")?;
-      let (local_default, concurrent_default) = load_config_pair(&environment, &root, &implicit, &default).await?;
-      ensure(
-        (
-          local_default.is_included(Path::new("/workspace/default.toml")),
-          concurrent_default.is_included(Path::new("/workspace/default.toml")),
-        ) == (true, true),
-        "missing discovered configuration must retain the prepared host default",
-      )?;
-      ensure(
-        environment.discovery_bases() == [PathBuf::from("/workspace"), PathBuf::from("/workspace")],
-        "both absent discovery paths must record the same rooted base",
-      )?;
-
-      environment.insert_file("/configs/non-utf8.toml", vec![0xff]);
-      let mut invalid_utf8 = ensure_ok(LspConfig::new(), "the invalid-UTF-8 LSP configuration must construct")?;
+      let implicit = ensure_ok(LspConfig::new(), "the absent-discovery configuration must construct")?;
+      let mut invalid_utf8 = implicit.clone();
       invalid_utf8.taplo.config_file.path = Some(PathBuf::from("/configs/non-utf8.toml"));
-      ensure(
-        [
-          matches!(
-            load_config_local(&environment, &root, &invalid_utf8, &default).await,
-            Err(WorldError::ConfigUtf8 { path, .. }) if path == Path::new("/configs/non-utf8.toml")
-          ),
-          matches!(
-            load_config_concurrent(&environment, &root, &invalid_utf8, &default).await,
-            Err(WorldError::ConfigUtf8 { path, .. }) if path == Path::new("/configs/non-utf8.toml")
-          ),
-        ] == [true, true],
-        "both loaders must preserve the selected path in typed UTF-8 failures",
-      )?;
-
-      environment.insert_file("/configs/invalid.toml", b"include = [\n".to_vec());
-      let mut invalid_toml = ensure_ok(LspConfig::new(), "the invalid-TOML LSP configuration must construct")?;
+      let mut invalid_toml = implicit.clone();
       invalid_toml.taplo.config_file.path = Some(PathBuf::from("/configs/invalid.toml"));
-      ensure(
-        [
-          matches!(
-            load_config_local(&environment, &root, &invalid_toml, &default).await,
-            Err(WorldError::ConfigToml { path, .. }) if path == Path::new("/configs/invalid.toml")
-          ),
-          matches!(
-            load_config_concurrent(&environment, &root, &invalid_toml, &default).await,
-            Err(WorldError::ConfigToml { path, .. }) if path == Path::new("/configs/invalid.toml")
-          ),
-        ] == [true, true],
-        "both loaders must preserve the selected path in typed TOML failures",
-      )
-    })
-  }
-
-  #[test]
-  fn concurrent_document_snapshots_are_send_and_sync() -> Result<(), TestFailure> {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-      require_send_sync::<DocumentSnapshot<ConcurrentSchemaTransport<TestEnvironment>>>();
-      require_send_sync::<WorldState<TestEnvironment, ConcurrentSchemaTransport<TestEnvironment>>>();
-    };
-    ensure(true, "the target-specific concurrent type assertions must compile")
-  }
-
-  #[test]
-  fn workspace_ownership_respects_url_identity_and_path_boundaries() -> Result<(), TestFailure> {
-    let root = url("file:///workspace")?;
-    let nested = url("file:///workspace/nested")?;
-    let document = url("file:///workspace/nested/file.toml")?;
-    ensure(
-      (WorkspaceRoot::Detached.url(), WorkspaceRoot::Rooted(root.clone()).url()) == (None, Some(&root)),
-      "workspace-root identity must distinguish detached and rooted domains",
-    )?;
-    ensure(
-      root_contains_document(&root, &document),
-      "a document below a root path boundary must be owned by that root",
-    )?;
-    ensure(
-      root_contains_document(&root, &root),
-      "a document URL exactly equal to a root path must remain owned by that root",
-    )?;
-    ensure(
-      root_contains_document(&url("file:///")?, &document),
-      "a filesystem URL root must own every absolute child path",
-    )?;
-    ensure(
-      !root_contains_document(&root, &url("file:///workspace-other/file.toml")?),
-      "a textual path prefix without a segment boundary must not establish ownership",
-    )?;
-    ensure(
-      !root_contains_document(&root, &url("https://example.com/workspace/file.toml")?),
-      "a different URL origin must not establish workspace ownership",
-    )?;
-    ensure(
-      [
-        root_contains_document(
-          &url("https://user@example.com/workspace")?,
-          &url("https://example.com/workspace/file.toml")?,
-        ),
-        root_contains_document(
-          &url("https://example.com:8443/workspace")?,
-          &url("https://example.com/workspace/file.toml")?,
-        ),
-      ] == [false, false],
-      "different credentials or effective ports must not establish workspace ownership",
-    )?;
-    ensure(
-      !root_contains_document(&url("mailto:user@example.com")?, &url("mailto:other@example.com")?),
-      "non-hierarchical URLs must never establish workspace ownership",
-    )?;
-    ensure(
-      deepest_root([&root, &nested].into_iter(), &document) == Some(&nested),
-      "the deepest matching root must own the document",
+      let absent = load_config_pair(&environment, &root, &implicit, &default).await;
+      let discovery = environment.discovery_bases();
+      environment.insert_file("/configs/non-utf8.toml", vec![0xff]);
+      let utf8_results = load_config_pair(&environment, &root, &invalid_utf8, &default).await;
+      environment.insert_file("/configs/invalid.toml", b"include = [\n".to_vec());
+      let toml_results = load_config_pair(&environment, &root, &invalid_toml, &default).await;
+      Ok::<_, WorldFixtureError>((environment, absent, discovery, utf8_results, toml_results))
+    });
+    ensure_that(
+      observations,
+      "configuration absence and malformed contents must preserve distinct native outcomes",
+      |result| {
+        let Ok((_, ref absent, ref discovery, ref utf8, ref toml)) = *result else {
+          return false;
+        };
+        absent.iter().all(|loaded| {
+          loaded
+            .as_ref()
+            .is_ok_and(|config| config.is_included(Path::new("/workspace/default.toml")))
+        }) && *discovery == [PathBuf::from("/workspace"), PathBuf::from("/workspace")]
+          && utf8
+            .iter()
+            .all(|loaded| matches!(*loaded, Err(WorldError::ConfigUtf8 { ref path, .. }) if path == Path::new("/configs/non-utf8.toml")))
+          && toml
+            .iter()
+            .all(|loaded| matches!(*loaded, Err(WorldError::ConfigToml { ref path, .. }) if path == Path::new("/configs/invalid.toml")))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
+  /// Require a real concurrently published value to remain transferable and shareable.
+  #[cfg(not(target_arch = "wasm32"))]
+  fn require_send_sync<T: Send + Sync>(value: T) -> T {
+    value
+  }
+
+  #[cfg(not(target_arch = "wasm32"))]
   #[test]
-  fn duplicate_roots_and_revision_exhaustion_are_typed_failures() -> Result<(), TestFailure> {
-    let root = url("file:///workspace")?;
-    ensure(
-      matches!(
-        ensure_unique_roots(&[root.clone(), root]),
-        Err(WorldError::DuplicateWorkspaceRoot { .. })
-      ),
-      "duplicate initialization roots must be rejected before mutation",
-    )?;
-
-    let world = local_world()?;
-    world.revision.store(u64::MAX, Ordering::SeqCst);
-    ensure(
-      matches!(world.candidate_revision(), Err(WorldError::RevisionExhausted)),
-      "the world revision counter must fail rather than wrap",
-    )?;
-
-    let document = url("file:///workspace/duplicate.toml")?;
-    let state = ensure_ok(DocumentState::parse("value = 1\n"), "the duplicate-ownership document must parse")?;
-    let mut documents = HashMap::default();
-    ensure_ok(
-      insert_unique_document(&mut documents, document.clone(), state.clone()),
-      "the first document owner must install",
-    )?;
-    let mut incoming = HashMap::default();
-    incoming.extend([(document.clone(), state)]);
-    ensure(
-      matches!(
-        merge_unique_documents(&mut documents, incoming),
-        Err(WorldError::DuplicateDocumentOwnership {
-          document: duplicate
-        }) if duplicate == document
-      ),
-      "merging a second workspace seed for the same document must reject ambiguous ownership",
-    )
-  }
-
-  /// Initialize one schema-disabled world with a single committed project root.
-  fn initialized_project_world() -> LocalTestFuture<'static, (LocalTestWorld, Url)> {
-    Box::pin(async {
-      let world = local_world()?;
-      let root = url("file:///workspace/project")?;
-      let preparation_environment = world.env.clone();
-      drop(ensure_ok(
-        WorldTransaction::new(&world, move |preparation| {
-          prepare_schema_disabled(preparation, preparation_environment.clone())
-        })
-        .initialize_roots_with(Arc::new(InitConfig::default()), vec![root.clone()])
-        .await,
-        "one valid rooted topology must initialize transactionally",
-      )?);
-      Ok((world, root))
-    })
-  }
-
-  #[test]
-  fn initialization_commits_atomically_and_rejects_reinitialization() -> Result<(), TestFailure> {
-    block_on(async {
-      let (world, root) = initialized_project_world().await?;
-      ensure(
-        world.rooted_workspace_urls().await == [root.clone()],
-        "initialization must publish the complete rooted topology",
-      )?;
-      let debug = format!("{world:?}");
-      ensure(
-        (
-          debug.contains("revision: 1"),
-          debug.contains("rooted_workspaces: 1"),
-          debug.contains("open_documents: 0"),
-        ) == (true, true, true),
-        "world debug output must report only stable committed topology state",
-      )?;
-      let topology_guard = world.workspaces.write().await;
-      let locked_debug = format!("{world:?}");
-      drop(topology_guard);
-      ensure(
-        (
-          locked_debug.contains("revision: 1"),
-          locked_debug.contains("rooted_workspaces"),
-          locked_debug.contains("open_documents"),
-        ) == (true, false, false),
-        "world debug output must remain nonblocking and omit topology fields while their lock is unavailable",
-      )?;
-
-      ensure(
-        matches!(
-          world
-            .initialize_roots_local(Arc::new(InitConfig::default()), vec![root.clone()])
-            .await,
-          Err(WorldError::AlreadyInitialized)
-        ),
-        "a second initialization must fail before replacing the committed topology",
-      )?;
-      let initialized_revision = world.revision.load(Ordering::SeqCst);
-      let empty = ensure_ok(
-        world.apply_configuration_values_local(None, &[]).await,
-        "an empty configuration response must be a successful no-op",
-      )?;
-      ensure(
-        (empty.is_empty(), world.revision.load(Ordering::SeqCst)) == (true, initialized_revision),
-        "an empty configuration response must not emit effects or advance the revision",
-      )
-    })
-  }
-
-  #[test]
-  fn scoped_configuration_validates_before_atomic_commit() -> Result<(), TestFailure> {
-    block_on(async {
-      let (world, root) = initialized_project_world().await?;
-      let initialized_revision = world.revision.load(Ordering::SeqCst);
-      let invalid_global = Value::String(String::from("invalid"));
-      ensure(
-        matches!(
-          world
-            .apply_configuration_values_local(Some(&invalid_global), &[])
-            .await,
-          Err(WorldError::ConfigurationResponse { ref scope, .. })
-            if scope == "global workspace configuration"
-        ),
-        "a non-object global configuration must retain its typed scope",
-      )?;
-      let invalid_scoped = [(root.clone(), Value::Bool(false))];
-      ensure(
-        matches!(
-          world
-            .apply_configuration_values_local(None, &invalid_scoped)
-            .await,
-          Err(WorldError::ConfigurationResponse { ref scope, .. })
-            if scope == root.as_str()
-        ),
-        "a non-object scoped configuration must retain its root scope",
-      )?;
-      let missing_root = url("file:///workspace/missing")?;
-      let missing_scoped = [(missing_root.clone(), json!({}))];
-      ensure(
-        matches!(
-          world
-            .apply_configuration_values_local(None, &missing_scoped)
-            .await,
-          Err(WorldError::MissingWorkspace { root: missing }) if missing == missing_root
-        ),
-        "a scoped configuration for an unknown root must preserve its typed ownership failure",
-      )?;
-      ensure(
-        world.revision.load(Ordering::SeqCst) == initialized_revision,
-        "rejected configuration responses must leave the committed revision unchanged",
-      )?;
-
-      let global = json!({
-        "schema": {
-          "enabled": false,
-          "catalogs": [],
-          "links": true
-        }
-      });
-      let scoped = [(
-        root.clone(),
-        json!({
-          "syntax": {
-            "semanticTokens": false
-          }
-        }),
-      )];
-      drop(ensure_ok(
-        world.apply_configuration_values_local(Some(&global), &scoped).await,
-        "valid global and scoped configuration must merge and commit together",
-      )?);
-      let topology = world.workspaces.read().await;
-      let rooted = ensure_some(topology.rooted(&root), "the configured root must remain present after replacement")?;
-      let detached = Arc::clone(&topology.detached);
-      drop(topology);
-      let rooted_config = rooted.read().await.config.clone();
-      let detached_config = detached.read().await.config.clone();
-      ensure(
-        (
-          rooted_config.schema.links,
-          rooted_config.syntax.semantic_tokens,
-          detached_config.schema.links,
-          detached_config.syntax.semantic_tokens,
-        ) == (true, false, true, true),
-        "global configuration must reach every workspace while the scoped overlay changes only its root",
-      )
-    })
-  }
-
-  #[test]
-  fn configuration_reclassifies_included_and_excluded_open_documents() -> Result<(), TestFailure> {
-    block_on(async {
-      let world = local_world()?;
-      world.set_default_config(Arc::new(default_config("included.toml")));
-      let schema_disabled = schema_disabled_configuration(true);
-      drop(ensure_ok(
-        world.apply_configuration_values_local(Some(&schema_disabled), &[]).await,
-        "the initial inclusion configuration must commit without schema catalogs",
-      )?);
-      let included = url("file:///workspace/included.toml")?;
-      let excluded = url("file:///workspace/excluded.toml")?;
-      let included_update = ensure_ok(
-        world.replace_document(&included, "value = 1\n").await,
-        "the selected document must install",
-      )?;
-      let excluded_update = ensure_ok(
-        world.replace_document(&excluded, "value = 2\n").await,
-        "the unselected document must remain tracked",
-      )?;
-      ensure(
-        (included_update.disposition, excluded_update.disposition)
-          == (super::DocumentDisposition::Included, super::DocumentDisposition::Excluded),
-        "document replacement must report inclusion from the prepared file rule",
-      )?;
-      ensure(
-        (
-          world.document_snapshot(&included).await.is_some(),
-          world.document_snapshot(&excluded).await.is_some(),
-        ) == (true, false),
-        "only included documents may expose handler snapshots",
-      )?;
-
-      world.set_default_config(Arc::new(default_config("excluded.toml")));
-      drop(ensure_ok(
-        world.apply_configuration_values_local(Some(&schema_disabled), &[]).await,
-        "the replacement inclusion configuration must commit",
-      )?);
-      ensure(
-        (
-          world.document_snapshot(&included).await.is_some(),
-          world.document_snapshot(&excluded).await.is_some(),
-        ) == (false, true),
-        "configuration replacement must atomically reclassify every retained open document",
-      )?;
-      ensure(
-        world.open_document_dispositions().await
-          == [
-            (excluded, super::DocumentDisposition::Included),
-            (included, super::DocumentDisposition::Excluded),
-          ],
-        "open-document dispositions must remain complete and stably ordered after reclassification",
-      )
-    })
-  }
-
-  #[test]
-  fn document_replacement_and_close_transactions_are_idempotent_at_their_boundaries() -> Result<(), TestFailure> {
-    block_on(async {
-      let world = local_world()?;
+  fn concurrent_document_snapshots_are_send_and_sync() -> Result<(), impl Debug> {
+    let observations = block_on(async {
+      let environment = TestEnvironment::default();
       let document = url("file:///workspace/document.toml")?;
-      let unknown = url("file:///workspace/unknown.toml")?;
-      let initial_revision = world.revision.load(Ordering::SeqCst);
-      let unknown_close = ensure_ok(
-        world.close_document(&unknown).await,
-        "closing an unknown document must be a successful no-op",
-      )?;
-      ensure(
-        (unknown_close.is_empty(), world.revision.load(Ordering::SeqCst)) == (true, initial_revision),
-        "an unknown close must emit no effects and must not advance the world revision",
-      )?;
-
-      let first = ensure_ok(
-        world.replace_document(&document, "value = 1\n").await,
-        "the vacant document entry must install",
-      )?;
-      ensure(
-        first.disposition == super::DocumentDisposition::Included,
-        "a default-config document must install as included",
-      )?;
-      let first_revision = world.revision.load(Ordering::SeqCst);
-      let second = ensure_ok(
-        world.replace_document(&document, "value = 2\n").await,
-        "the occupied document entry must replace in place",
-      )?;
-      ensure(
-        (second.disposition, world.revision.load(Ordering::SeqCst) > first_revision) == (super::DocumentDisposition::Included, true),
-        "occupied replacement must retain inclusion and commit a later revision",
-      )?;
-      let snapshot = ensure_some(
-        world.document_snapshot(&document).await,
-        "the replaced document must retain one current snapshot",
-      )?;
-      ensure_eq(
-        &ensure_ok(serde_json::to_value(&snapshot.document.dom), "the replacement DOM must serialize")?,
-        &json!({ "value": 2 }),
-        "occupied replacement must expose only the new semantic document",
-      )?;
-
-      drop(ensure_ok(
-        world.close_document(&document).await,
-        "closing a present document must commit",
-      )?);
-      let closed_revision = world.revision.load(Ordering::SeqCst);
-      ensure(
-        world.document_snapshot(&document).await.is_none(),
-        "a committed close must remove the document snapshot",
-      )?;
-      let repeated = ensure_ok(
-        world.close_document(&document).await,
-        "closing an already closed document must remain a successful no-op",
-      )?;
-      ensure(
-        (repeated.is_empty(), world.revision.load(Ordering::SeqCst)) == (true, closed_revision),
-        "a repeated close must emit no effects and must not advance the committed revision",
-      )
-    })
+      let client = ensure_ok(local_http_client(), "the concurrent schema client must construct").map_err(Box::new)?;
+      let transport = ConcurrentSchemaTransport::new(environment.clone(), client);
+      let world = require_send_sync(
+        ensure_ok(
+          WorldState::with_transport(environment, transport),
+          "the concurrent world must construct",
+        )
+        .map_err(Box::new)?,
+      );
+      let installed = world.replace_document_concurrent(&document, "value = 1\n").await;
+      let snapshot = require_send_sync(world.document_snapshot_concurrent(&document).await);
+      Ok::<_, WorldFixtureError>((world, installed, snapshot))
+    });
+    ensure_that(
+      observations,
+      "the concurrent world and its published document snapshot must be transferable and shareable",
+      |result| result.as_ref().is_ok_and(|observed| observed.1.is_ok() && observed.2.is_some()),
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
-  /// A schema-independent topology fixture with one future-rooted and one detached document.
-  struct TopologyFixture {
-    /// World whose topology is under test.
-    world:             LocalTestWorld,
-    /// Valid workspace root used by the transaction.
-    root:              Url,
-    /// Document beneath `root`.
-    rooted_document:   Url,
-    /// Document outside `root`.
-    detached_document: Url,
+  #[test]
+  fn workspace_ownership_respects_url_identity_and_path_boundaries() -> Result<(), impl Debug> {
+    let observations = (|| {
+      let root = url("file:///workspace")?;
+      let nested = url("file:///workspace/nested")?;
+      let document = url("file:///workspace/nested/file.toml")?;
+      let cases = [
+        (root.clone(), document.clone(), true),
+        (root.clone(), root.clone(), true),
+        (url("file:///")?, document.clone(), true),
+        (root.clone(), url("file:///workspace-other/file.toml")?, false),
+        (root.clone(), url("https://example.com/workspace/file.toml")?, false),
+        (
+          url("https://user@example.com/workspace")?,
+          url("https://example.com/workspace/file.toml")?,
+          false,
+        ),
+        (
+          url("https://example.com:8443/workspace")?,
+          url("https://example.com/workspace/file.toml")?,
+          false,
+        ),
+        (url("mailto:user@example.com")?, url("mailto:other@example.com")?, false),
+      ];
+      let ownership = cases.map(|(owner, child, expected)| {
+        let actual = root_contains_document(&owner, &child);
+        (owner, child, actual, expected)
+      });
+      let deepest = deepest_root([&root, &nested].into_iter(), &document).cloned();
+      Ok::<_, WorldFixtureError>((
+        WorkspaceRoot::Detached,
+        WorkspaceRoot::Rooted(root.clone()),
+        root,
+        nested,
+        document,
+        ownership,
+        deepest,
+      ))
+    })();
+    ensure_that(
+      observations,
+      "workspace ownership must respect complete URL identities, segment boundaries, and deepest-root selection",
+      |result| {
+        let Ok((ref detached, ref rooted, ref expected_root, ref nested, _, ref ownership, ref deepest)) = *result else {
+          return false;
+        };
+        detached.url().is_none()
+          && rooted.url() == Some(expected_root)
+          && ownership.iter().all(|case| case.2 == case.3)
+          && deepest.as_ref() == Some(nested)
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
-  /// Build the shared topology fixture without contacting schema catalogs.
-  fn topology_fixture() -> LocalFuture<'static, Result<TopologyFixture, TestFailure>> {
-    Box::pin(async {
+  #[test]
+  fn duplicate_roots_and_revision_exhaustion_are_typed_failures() -> Result<(), impl Debug> {
+    let observations = (|| {
+      let root = url("file:///workspace")?;
+      let document = url("file:///workspace/duplicate.toml")?;
+      let state = ensure_ok(DocumentState::parse("value = 1\n"), "the duplicate-ownership document must parse").map_err(Box::new)?;
       let world = local_world()?;
-      let topology = world.workspaces.read().await;
-      let mut detached = topology.detached.write().await;
-      detached.config.schema.enabled = false;
-      detached.config.schema.catalogs.clear();
-      drop(detached);
-      drop(topology);
-
-      let rooted_document = url("file:///workspace/project/document.toml")?;
-      let detached_document = url("file:///outside/document.toml")?;
-      drop(ensure_ok(
-        world.replace_document(&rooted_document, "owner = \"root\"\n").await,
-        "the future rooted document must install while detached",
-      )?);
-      drop(ensure_ok(
-        world.replace_document(&detached_document, "owner = \"detached\"\n").await,
-        "the permanently detached document must install",
-      )?);
-      Ok(TopologyFixture {
-        world,
-        root: url("file:///workspace/project")?,
-        rooted_document,
-        detached_document,
-      })
-    })
+      let roots = [root.clone(), root];
+      let duplicates = ensure_unique_roots(&roots);
+      world.revision.store(u64::MAX, Ordering::SeqCst);
+      let revision = world.candidate_revision();
+      let mut documents = HashMap::default();
+      let installed = insert_unique_document(&mut documents, document.clone(), state.clone());
+      let incoming = HashMap::from_iter([(document.clone(), state)]);
+      let merged = merge_unique_documents(&mut documents, incoming);
+      Ok::<_, WorldFixtureError>((world, roots, duplicates, revision, document, documents, installed, merged))
+    })();
+    ensure_that(
+      observations,
+      "duplicate topology/document owners and exhausted revisions must retain their native failures",
+      |result| {
+        let Ok((_, _, ref duplicates, ref revision, ref document, ref documents, ref installed, ref merged)) = *result else {
+          return false;
+        };
+        matches!(*duplicates, Err(WorldError::DuplicateWorkspaceRoot { .. }))
+          && matches!(*revision, Err(WorldError::RevisionExhausted))
+          && installed.is_ok()
+          && matches!(*merged, Err(WorldError::DuplicateDocumentOwnership { document: ref duplicate }) if duplicate == document)
+          && documents.contains_key(document)
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Prepare one topology candidate using its loaded configuration with schemas disabled.
@@ -3460,513 +2851,770 @@ mod tests {
     Box::pin(async move { preparation.prepare_loaded_local(&transaction_environment).await })
   }
 
+  /// Initialize a project world while retaining the native initialization outcome.
+  fn initialized_project_world() -> LocalFuture<'static, Result<InitializedProject, WorldFixtureError>> {
+    Box::pin(async {
+      let world = local_world()?;
+      let root = url("file:///workspace/project")?;
+      let environment = world.env.clone();
+      let initialized = WorldTransaction::new(&world, move |preparation| prepare_schema_disabled(preparation, environment.clone()))
+        .initialize_roots_with(Arc::new(InitConfig::default()), vec![root.clone()])
+        .await;
+      Ok((world, root, initialized))
+    })
+  }
+
   #[test]
-  fn topology_transactions_redistribute_documents_and_preserve_no_ops() -> Result<(), TestFailure> {
-    block_on(async {
+  fn initialization_commits_atomically_and_rejects_reinitialization() -> Result<(), impl Debug> {
+    let observations = block_on(async {
+      let (world, root, initialized) = initialized_project_world().await?;
+      let roots = world.rooted_workspace_urls().await;
+      let debug = format!("{world:?}");
+      let topology_guard = world.workspaces.write().await;
+      let locked_debug = format!("{world:?}");
+      drop(topology_guard);
+      let reinitialized = world
+        .initialize_roots_local(Arc::new(InitConfig::default()), vec![root.clone()])
+        .await;
+      let initialized_revision = world.revision.load(Ordering::SeqCst);
+      let empty = world.apply_configuration_values_local(None, &[]).await;
+      let final_revision = world.revision.load(Ordering::SeqCst);
+      Ok::<_, WorldFixtureError>((
+        world,
+        root,
+        initialized,
+        roots,
+        debug,
+        locked_debug,
+        reinitialized,
+        empty,
+        (initialized_revision, final_revision),
+      ))
+    });
+    ensure_that(
+      observations,
+      "initialization must commit once, keep debug reads nonblocking, and preserve no-op revisions",
+      |result| {
+        let Ok((_, ref root, ref initialized, ref roots, ref debug, ref locked_debug, ref reinitialized, ref empty, revisions)) = *result
+        else {
+          return false;
+        };
+        initialized.is_ok()
+          && roots == from_ref(root)
+          && debug.contains("revision: 1")
+          && debug.contains("rooted_workspaces: 1")
+          && debug.contains("open_documents: 0")
+          && locked_debug.contains("revision: 1")
+          && !locked_debug.contains("rooted_workspaces")
+          && !locked_debug.contains("open_documents")
+          && matches!(*reinitialized, Err(WorldError::AlreadyInitialized))
+          && empty.as_ref().is_ok_and(Vec::is_empty)
+          && revisions.0 == revisions.1
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
+  }
+
+  #[test]
+  fn scoped_configuration_validates_before_atomic_commit() -> Result<(), impl Debug> {
+    let observations = block_on(async {
+      let missing_root = url("file:///workspace/missing")?;
+      let (world, root, initialized) = initialized_project_world().await?;
+      let before_revision = world.revision.load(Ordering::SeqCst);
+      let invalid_global = Value::String(String::from("invalid"));
+      let global_failure = world.apply_configuration_values_local(Some(&invalid_global), &[]).await;
+      let invalid_scoped = [(root.clone(), Value::Bool(false))];
+      let scoped_failure = world.apply_configuration_values_local(None, &invalid_scoped).await;
+      let missing_scoped = [(missing_root.clone(), json!({}))];
+      let missing_failure = world.apply_configuration_values_local(None, &missing_scoped).await;
+      let rejected_revision = world.revision.load(Ordering::SeqCst);
+      let global = json!({ "schema": { "enabled": false, "catalogs": [], "links": true } });
+      let scoped = [(root.clone(), json!({ "syntax": { "semanticTokens": false } }))];
+      let committed = world.apply_configuration_values_local(Some(&global), &scoped).await;
+      let topology = world.workspaces.read().await;
+      let rooted = topology.rooted(&root);
+      let detached = Arc::clone(&topology.detached);
+      drop(topology);
+      let rooted_config = match rooted {
+        Some(handle) => Some(handle.read().await.config.clone()),
+        None => None,
+      };
+      let detached_config = detached.read().await.config.clone();
+      Ok::<_, WorldFixtureError>((
+        world,
+        root,
+        missing_root,
+        initialized,
+        (global_failure, scoped_failure, missing_failure, before_revision, rejected_revision),
+        committed,
+        rooted_config,
+        detached_config,
+      ))
+    });
+    ensure_that(
+      observations,
+      "configuration rejection must preserve revision and valid global/scoped updates must commit atomically",
+      |result| {
+        let Ok((_, ref root, ref missing_root, ref initialized, ref rejected, ref committed, ref rooted, ref detached)) = *result else {
+          return false;
+        };
+        initialized.is_ok()
+          && matches!(rejected.0, Err(WorldError::ConfigurationResponse { ref scope, .. }) if scope == "global workspace configuration")
+          && matches!(rejected.1, Err(WorldError::ConfigurationResponse { ref scope, .. }) if scope == root.as_str())
+          && matches!(rejected.2, Err(WorldError::MissingWorkspace { root: ref missing }) if missing == missing_root)
+          && rejected.3 == rejected.4
+          && committed.is_ok()
+          && rooted
+            .as_ref()
+            .is_some_and(|config| config.schema.links && !config.syntax.semantic_tokens)
+          && detached.schema.links
+          && detached.syntax.semantic_tokens
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
+  }
+
+  #[test]
+  fn configuration_reclassifies_included_and_excluded_open_documents() -> Result<(), impl Debug> {
+    let observations = block_on(async {
+      let world = local_world()?;
+      let included = url("file:///workspace/included.toml")?;
+      let excluded = url("file:///workspace/excluded.toml")?;
+      world.set_default_config(Arc::new(default_config("included.toml")));
+      let configuration = schema_disabled_configuration(true);
+      let initial = world.apply_configuration_values_local(Some(&configuration), &[]).await;
+      let included_update = world.replace_document(&included, "value = 1\n").await;
+      let excluded_update = world.replace_document(&excluded, "value = 2\n").await;
+      let before = [
+        world.document_snapshot(&included).await,
+        world.document_snapshot(&excluded).await,
+      ];
+      world.set_default_config(Arc::new(default_config("excluded.toml")));
+      let replacement = world.apply_configuration_values_local(Some(&configuration), &[]).await;
+      let after = [
+        world.document_snapshot(&included).await,
+        world.document_snapshot(&excluded).await,
+      ];
+      let dispositions = world.open_document_dispositions().await;
+      Ok::<_, WorldFixtureError>((
+        world, included, excluded, initial, included_update, excluded_update, before, replacement, after, dispositions,
+      ))
+    });
+    ensure_that(
+      observations,
+      "configuration must atomically reclassify every retained document and preserve ordered dispositions",
+      |result| {
+        let Ok((
+          _,
+          ref included,
+          ref excluded,
+          ref initial,
+          ref included_update,
+          ref excluded_update,
+          ref before,
+          ref replacement,
+          ref after,
+          ref dispositions,
+        )) = *result
+        else {
+          return false;
+        };
+        initial.is_ok()
+          && replacement.is_ok()
+          && included_update
+            .as_ref()
+            .is_ok_and(|update| update.disposition == DocumentDisposition::Included)
+          && excluded_update
+            .as_ref()
+            .is_ok_and(|update| update.disposition == DocumentDisposition::Excluded)
+          && matches!(*before, [Some(_), None])
+          && matches!(*after, [None, Some(_)])
+          && *dispositions
+            == [
+              (excluded.clone(), DocumentDisposition::Included),
+              (included.clone(), DocumentDisposition::Excluded),
+            ]
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
+  }
+
+  #[test]
+  fn document_replacement_and_close_transactions_are_idempotent_at_their_boundaries() -> Result<(), impl Debug> {
+    let observations = block_on(async {
+      let world = local_world()?;
+      let document = url("file:///workspace/document.toml")?;
+      let unknown = url("file:///workspace/unknown.toml")?;
+      let initial_revision = world.revision.load(Ordering::SeqCst);
+      let unknown_close = world.close_document(&unknown).await;
+      let unknown_revision = world.revision.load(Ordering::SeqCst);
+      let first = world.replace_document(&document, "value = 1\n").await;
+      let first_revision = world.revision.load(Ordering::SeqCst);
+      let second = world.replace_document(&document, "value = 2\n").await;
+      let second_revision = world.revision.load(Ordering::SeqCst);
+      let snapshot = world.document_snapshot(&document).await;
+      let semantic = snapshot.as_ref().map(|captured| serde_json::to_value(&captured.document.dom));
+      let closed = world.close_document(&document).await;
+      let closed_revision = world.revision.load(Ordering::SeqCst);
+      let after_close = world.document_snapshot(&document).await;
+      let repeated = world.close_document(&document).await;
+      let repeated_revision = world.revision.load(Ordering::SeqCst);
+      Ok::<_, WorldFixtureError>((
+        world,
+        (unknown_close, initial_revision, unknown_revision),
+        (first, first_revision, second, second_revision, snapshot, semantic),
+        (closed, closed_revision, after_close, repeated, repeated_revision),
+      ))
+    });
+    ensure_that(
+      observations,
+      "document replacement and close must retain effects, semantic snapshots, and idempotent revision boundaries",
+      |result| {
+        let Ok((_, ref unknown, ref replacements, ref closes)) = *result else {
+          return false;
+        };
+        unknown.0.as_ref().is_ok_and(Vec::is_empty)
+          && unknown.1 == unknown.2
+          && replacements
+            .0
+            .as_ref()
+            .is_ok_and(|update| update.disposition == DocumentDisposition::Included)
+          && replacements
+            .2
+            .as_ref()
+            .is_ok_and(|update| update.disposition == DocumentDisposition::Included)
+          && replacements.3 > replacements.1
+          && replacements.4.is_some()
+          && replacements
+            .5
+            .as_ref()
+            .is_some_and(|semantic| semantic.as_ref().is_ok_and(|value| *value == json!({ "value": 2 })))
+          && closes.0.is_ok()
+          && closes.2.is_none()
+          && closes.3.as_ref().is_ok_and(Vec::is_empty)
+          && closes.1 == closes.4
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
+  }
+
+  /// A schema-independent topology fixture retaining both document installation outcomes.
+  #[derive(Debug)]
+  struct TopologyFixture {
+    /// World whose topology is under test.
+    world:             LocalTestWorld,
+    /// Valid workspace root used by the transaction.
+    root:              Url,
+    /// Document beneath the future root.
+    rooted_document:   Url,
+    /// Document outside every configured root.
+    detached_document: Url,
+    /// Native results from opening both documents.
+    installations:     [Result<DocumentUpdate, WorldError>; 2],
+  }
+
+  /// Build the topology fixture without contacting schema catalogs or discarding installation
+  /// effects.
+  fn topology_fixture() -> LocalFuture<'static, Result<TopologyFixture, WorldFixtureError>> {
+    Box::pin(async {
+      let world = local_world()?;
+      let root = url("file:///workspace/project")?;
+      let rooted_document = url("file:///workspace/project/document.toml")?;
+      let detached_document = url("file:///outside/document.toml")?;
+      let topology = world.workspaces.read().await;
+      let mut detached = topology.detached.write().await;
+      detached.config.schema.enabled = false;
+      detached.config.schema.catalogs.clear();
+      drop(detached);
+      drop(topology);
+      let installations = [
+        world.replace_document(&rooted_document, "owner = \"root\"\n").await,
+        world.replace_document(&detached_document, "owner = \"detached\"\n").await,
+      ];
+      Ok(TopologyFixture {
+        world,
+        root,
+        rooted_document,
+        detached_document,
+        installations,
+      })
+    })
+  }
+
+  #[test]
+  fn topology_transactions_redistribute_documents_and_preserve_no_ops() -> Result<(), impl Debug> {
+    let observations = block_on(async {
+      let unknown = url("file:///workspace/unknown")?;
       let fixture = topology_fixture().await?;
       let add_environment = fixture.world.env.clone();
-      let added = ensure_ok(
-        WorldTransaction::new(&fixture.world, move |preparation| {
-          prepare_schema_disabled(preparation, add_environment.clone())
-        })
-        .change_roots_with(&[], from_ref(&fixture.root))
-        .await,
-        "adding a valid root must atomically redistribute matching documents",
-      )?;
-      ensure(
-        (fixture.world.rooted_workspace_urls().await, added.documents)
-          == (vec![fixture.root.clone()], vec![
-            fixture.detached_document.clone(),
-            fixture.rooted_document.clone(),
-          ]),
-        "the committed topology must expose the root and report every reconsidered document in stable order",
-      )?;
-      ensure(
-        (
-          fixture.world.document_snapshot(&fixture.rooted_document).await.is_some(),
-          fixture.world.document_snapshot(&fixture.detached_document).await.is_some(),
-        ) == (true, true),
-        "redistribution must preserve both rooted and detached document snapshots",
-      )?;
-
+      let added = WorldTransaction::new(&fixture.world, move |preparation| {
+        prepare_schema_disabled(preparation, add_environment.clone())
+      })
+      .change_roots_with(&[], from_ref(&fixture.root))
+      .await;
+      let added_roots = fixture.world.rooted_workspace_urls().await;
+      let snapshots = [
+        fixture.world.document_snapshot(&fixture.rooted_document).await,
+        fixture.world.document_snapshot(&fixture.detached_document).await,
+      ];
       let committed_revision = fixture.world.revision.load(Ordering::SeqCst);
       let repeat_environment = fixture.world.env.clone();
-      let repeated_add = ensure_ok(
-        WorldTransaction::new(&fixture.world, move |preparation| {
-          prepare_schema_disabled(preparation, repeat_environment.clone())
-        })
-        .change_roots_with(&[], from_ref(&fixture.root))
-        .await,
-        "adding an existing root must be a successful no-op",
-      )?;
-      let unknown = url("file:///workspace/unknown")?;
-      let unknown_remove = ensure_ok(
-        fixture.world.change_roots_local(from_ref(&unknown), &[]).await,
-        "removing an unknown root must be a successful no-op",
-      )?;
-      ensure(
-        (
-          repeated_add.documents.is_empty(),
-          repeated_add.notifications.is_empty(),
-          unknown_remove.documents.is_empty(),
-          unknown_remove.notifications.is_empty(),
-          fixture.world.revision.load(Ordering::SeqCst),
-        ) == (true, true, true, true, committed_revision),
-        "repeated add and unknown removal must emit no effects and preserve the revision",
-      )?;
-
+      let repeated_add = WorldTransaction::new(&fixture.world, move |preparation| {
+        prepare_schema_disabled(preparation, repeat_environment.clone())
+      })
+      .change_roots_with(&[], from_ref(&fixture.root))
+      .await;
+      let unknown_remove = fixture.world.change_roots_local(from_ref(&unknown), &[]).await;
+      let no_op_revision = fixture.world.revision.load(Ordering::SeqCst);
       let remove_environment = fixture.world.env.clone();
-      let removed = ensure_ok(
-        WorldTransaction::new(&fixture.world, move |preparation| {
-          prepare_schema_disabled(preparation, remove_environment.clone())
-        })
-        .change_roots_with(from_ref(&fixture.root), &[])
-        .await,
-        "removing a present root must redistribute its documents to detached state",
-      )?;
-      ensure(
-        (fixture.world.rooted_workspace_urls().await, removed.documents)
-          == (Vec::<Url>::new(), vec![fixture.detached_document, fixture.rooted_document]),
-        "root removal must commit an empty rooted topology and report the redistributed documents",
-      )
-    })
+      let removed = WorldTransaction::new(&fixture.world, move |preparation| {
+        prepare_schema_disabled(preparation, remove_environment.clone())
+      })
+      .change_roots_with(from_ref(&fixture.root), &[])
+      .await;
+      let final_roots = fixture.world.rooted_workspace_urls().await;
+      Ok::<_, WorldFixtureError>((
+        fixture,
+        added,
+        added_roots,
+        snapshots,
+        (repeated_add, unknown_remove, committed_revision, no_op_revision),
+        removed,
+        final_roots,
+      ))
+    });
+    ensure_that(
+      observations,
+      "topology changes must redistribute both documents while repeated changes preserve effects and revision",
+      |result| {
+        let Ok((ref fixture, ref added, ref added_roots, ref snapshots, ref no_ops, ref removed, ref final_roots)) = *result else {
+          return false;
+        };
+        let expected_documents = [fixture.detached_document.clone(), fixture.rooted_document.clone()];
+        fixture.installations.iter().all(Result::is_ok)
+          && added_roots == from_ref(&fixture.root)
+          && added.as_ref().is_ok_and(|update| update.documents == expected_documents)
+          && snapshots.iter().all(Option::is_some)
+          && no_ops
+            .0
+            .as_ref()
+            .is_ok_and(|update| update.documents.is_empty() && update.notifications.is_empty())
+          && no_ops
+            .1
+            .as_ref()
+            .is_ok_and(|update| update.documents.is_empty() && update.notifications.is_empty())
+          && no_ops.2 == no_ops.3
+          && removed.as_ref().is_ok_and(|update| update.documents == expected_documents)
+          && final_roots.is_empty()
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn added_roots_inherit_global_configuration_while_retained_roots_preserve_scoped_overrides() -> Result<(), TestFailure> {
-    block_on(async {
+  fn added_roots_inherit_global_configuration_while_retained_roots_preserve_scoped_overrides() -> Result<(), impl Debug> {
+    let observations = block_on(async {
       let world = local_world()?;
-      let global = schema_disabled_configuration(false);
-      drop(ensure_ok(
-        world.apply_configuration_values_local(Some(&global), &[]).await,
-        "global configuration must commit before workspace roots are added",
-      )?);
-
       let first_root = url("file:///workspace/first")?;
-      drop(ensure_ok(
-        world.change_roots_local(&[], from_ref(&first_root)).await,
-        "the first root must prepare from the committed global configuration",
-      )?);
-      let first_scoped = [(
-        first_root.clone(),
-        json!({
-          "syntax": {
-            "semanticTokens": true
-          }
-        }),
-      )];
-      drop(ensure_ok(
-        world.apply_configuration_values_local(None, &first_scoped).await,
-        "the first root's scoped configuration must commit",
-      )?);
-
       let second_root = url("file:///workspace/second")?;
-      drop(ensure_ok(
-        world.change_roots_local(&[], from_ref(&second_root)).await,
-        "a later root must prepare from the committed global configuration",
-      )?);
-
+      let global = schema_disabled_configuration(false);
+      let configured = world.apply_configuration_values_local(Some(&global), &[]).await;
+      let first_added = world.change_roots_local(&[], from_ref(&first_root)).await;
+      let scoped = [(first_root.clone(), json!({ "syntax": { "semanticTokens": true } }))];
+      let scoped_result = world.apply_configuration_values_local(None, &scoped).await;
+      let second_added = world.change_roots_local(&[], from_ref(&second_root)).await;
       let topology = world.workspaces.read().await;
       let detached = Arc::clone(&topology.detached);
-      let first = ensure_some(
-        topology.rooted(&first_root),
-        "the retained first root must remain in the committed topology",
-      )?;
-      let second = ensure_some(
-        topology.rooted(&second_root),
-        "the added second root must enter the committed topology",
-      )?;
+      let first = topology.rooted(&first_root);
+      let second = topology.rooted(&second_root);
       drop(topology);
       let detached_config = detached.read().await.config.clone();
-      let first_config = first.read().await.config.clone();
-      let second_config = second.read().await.config.clone();
-
-      ensure(
-        (
-          detached_config.schema.enabled,
-          detached_config.syntax.semantic_tokens,
-          first_config.schema.enabled,
-          first_config.syntax.semantic_tokens,
-          second_config.schema.enabled,
-          second_config.syntax.semantic_tokens,
-        ) == (false, false, false, true, false, false),
-        "new roots must inherit global configuration while retained roots keep their scoped overlay",
-      )
-    })
-  }
-
-  #[test]
-  fn topology_transactions_are_failure_atomic_and_recover() -> Result<(), TestFailure> {
-    block_on(async {
-      let fixture = topology_fixture().await?;
-      let before_failure = fixture.world.revision.load(Ordering::SeqCst);
-      let invalid_root = url("https://example.com/workspace")?;
-      let failure = ensure_some(
-        fixture.world.change_roots_local(&[], from_ref(&invalid_root)).await.err(),
-        "a root outside the host file-path model must reject topology preparation",
-      )?;
-      ensure(
-        matches!(failure, WorldError::InvalidWorkspaceRoot { .. }),
-        "invalid root preparation must retain the typed workspace-root failure",
-      )?;
-      ensure(
-        (
-          fixture.world.rooted_workspace_urls().await,
-          fixture.world.revision.load(Ordering::SeqCst),
-          fixture.world.document_snapshot(&fixture.rooted_document).await.is_some(),
-          fixture.world.document_snapshot(&fixture.detached_document).await.is_some(),
-        ) == (Vec::<Url>::new(), before_failure, true, true),
-        "failed preparation must leave roots, revision, and every document unchanged",
-      )?;
-
-      let recovery_environment = fixture.world.env.clone();
-      drop(ensure_ok(
-        WorldTransaction::new(&fixture.world, move |preparation| {
-          prepare_schema_disabled(preparation, recovery_environment.clone())
-        })
-        .change_roots_with(&[], from_ref(&fixture.root))
-        .await,
-        "topology mutation must recover after a rejected root",
-      )?);
-      ensure(
-        fixture.world.rooted_workspace_urls().await == [fixture.root],
-        "recovery must commit the next valid rooted topology",
-      )
-    })
-  }
-
-  #[test]
-  fn embedding_cache_default_yields_to_explicit_client_configuration() -> Result<(), TestFailure> {
-    let world = local_world()?;
-    let host_cache = PathBuf::from("/host/cache");
-    world.set_default_cache_path(Some(host_cache.clone()));
-
-    let inherited = world.effective_init_config(Arc::new(InitConfig {
-      cache_path:            None,
-      configuration_section: "client-section".into(),
-    }));
-    let inherited_cache_path = ensure_some(
-      inherited.cache_path.as_ref(),
-      "omitting cachePath must retain a configured host cache directory",
-    )?;
-    ensure(
-      inherited_cache_path == &host_cache,
-      "omitting cachePath must retain the embedding host's configured cache directory",
-    )?;
-    ensure_eq(
-      &inherited.configuration_section,
-      &String::from("client-section"),
-      "host cache defaults must not replace client configuration-section selection",
-    )?;
-
-    let client_cache = PathBuf::from("/client/cache");
-    let explicit = world.effective_init_config(Arc::new(InitConfig {
-      cache_path:            Some(client_cache.clone()),
-      configuration_section: "explicit-section".into(),
-    }));
-    let explicit_cache_path = ensure_some(explicit.cache_path.as_ref(), "an explicit client cachePath must remain present")?;
-    ensure(
-      explicit_cache_path == &client_cache,
-      "an explicit client cachePath must override the embedding host default",
-    )?;
-    ensure_eq(
-      &explicit.configuration_section,
-      &String::from("explicit-section"),
-      "explicit client initialization must remain otherwise unchanged",
+      let first_config = match first {
+        Some(handle) => Some(handle.read().await.config.clone()),
+        None => None,
+      };
+      let second_config = match second {
+        Some(handle) => Some(handle.read().await.config.clone()),
+        None => None,
+      };
+      Ok::<_, WorldFixtureError>((
+        world, configured, first_added, scoped_result, second_added, detached_config, first_config, second_config,
+      ))
+    });
+    ensure_that(
+      observations,
+      "new roots must inherit global configuration while retained roots preserve their scoped overlay",
+      |result| {
+        let Ok((_, ref configured, ref first_added, ref scoped, ref second_added, ref detached, ref first, ref second)) = *result else {
+          return false;
+        };
+        configured.is_ok()
+          && first_added.is_ok()
+          && scoped.is_ok()
+          && second_added.is_ok()
+          && !detached.schema.enabled
+          && !detached.syntax.semantic_tokens
+          && first
+            .as_ref()
+            .is_some_and(|config| !config.schema.enabled && config.syntax.semantic_tokens)
+          && second
+            .as_ref()
+            .is_some_and(|config| !config.schema.enabled && !config.syntax.semantic_tokens)
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn cache_configuration_propagates_clock_failures_atomically_and_recovers() -> Result<(), TestFailure> {
-    block_on(async {
+  fn topology_transactions_are_failure_atomic_and_recover() -> Result<(), impl Debug> {
+    let observations = block_on(async {
+      let invalid_root = url("https://example.com/workspace")?;
+      let fixture = topology_fixture().await?;
+      let before = fixture.world.revision.load(Ordering::SeqCst);
+      let rejected = fixture.world.change_roots_local(&[], from_ref(&invalid_root)).await;
+      let rejected_roots = fixture.world.rooted_workspace_urls().await;
+      let rejected_revision = fixture.world.revision.load(Ordering::SeqCst);
+      let snapshots = [
+        fixture.world.document_snapshot(&fixture.rooted_document).await,
+        fixture.world.document_snapshot(&fixture.detached_document).await,
+      ];
+      let recovery_environment = fixture.world.env.clone();
+      let recovered = WorldTransaction::new(&fixture.world, move |preparation| {
+        prepare_schema_disabled(preparation, recovery_environment.clone())
+      })
+      .change_roots_with(&[], from_ref(&fixture.root))
+      .await;
+      let final_roots = fixture.world.rooted_workspace_urls().await;
+      Ok::<_, WorldFixtureError>((
+        fixture, rejected, rejected_roots, before, rejected_revision, snapshots, recovered, final_roots,
+      ))
+    });
+    ensure_that(
+      observations,
+      "invalid topology preparation must retain every document and revision before recovery commits",
+      |result| {
+        let Ok((ref fixture, ref rejected, ref rejected_roots, before, rejected_revision, ref snapshots, ref recovered, ref final_roots)) =
+          *result
+        else {
+          return false;
+        };
+        fixture.installations.iter().all(Result::is_ok)
+          && matches!(*rejected, Err(WorldError::InvalidWorkspaceRoot { .. }))
+          && rejected_roots.is_empty()
+          && before == rejected_revision
+          && snapshots.iter().all(Option::is_some)
+          && recovered.is_ok()
+          && final_roots == from_ref(&fixture.root)
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
+  }
+
+  #[test]
+  fn embedding_cache_default_yields_to_explicit_client_configuration() -> Result<(), impl Debug> {
+    let observations = (|| {
+      let world = local_world()?;
+      let host_cache = PathBuf::from("/host/cache");
+      let client_cache = PathBuf::from("/client/cache");
+      world.set_default_cache_path(Some(host_cache.clone()));
+      let inherited = world.effective_init_config(Arc::new(InitConfig {
+        cache_path:            None,
+        configuration_section: "client-section".into(),
+      }));
+      let explicit = world.effective_init_config(Arc::new(InitConfig {
+        cache_path:            Some(client_cache.clone()),
+        configuration_section: "explicit-section".into(),
+      }));
+      Ok::<_, WorldFixtureError>((world, host_cache, client_cache, inherited, explicit))
+    })();
+    ensure_that(
+      observations,
+      "client cache selection must override host defaults while preserving the configuration section",
+      |result| {
+        let Ok((_, ref host_cache, ref client_cache, ref inherited, ref explicit)) = *result else {
+          return false;
+        };
+        inherited.cache_path.as_ref() == Some(host_cache)
+          && inherited.configuration_section == "client-section"
+          && explicit.cache_path.as_ref() == Some(client_cache)
+          && explicit.configuration_section == "explicit-section"
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
+  }
+
+  #[test]
+  fn cache_configuration_propagates_clock_failures_atomically_and_recovers() -> Result<(), impl Debug> {
+    let observations = block_on(async {
       let environment = TestEnvironment::default();
-      let client = ensure_ok(local_http_client(), "the cache-policy schema client must construct")?;
+      let client = ensure_ok(local_http_client(), "the cache-policy schema client must construct").map_err(Box::new)?;
       let transport = LocalSchemaTransport::new(environment.clone(), client);
       let mut workspace = ensure_ok(
         WorkspaceState::new(WorkspaceRoot::Detached, transport),
-        "the cache-policy workspace must construct while the host clock is available",
-      )?;
+        "the cache-policy workspace must construct",
+      )
+      .map_err(Box::new)?;
       workspace.config.schema.enabled = false;
       workspace.config.schema.catalogs.clear();
-
-      let committed = Revision(1);
-      drop(ensure_ok(
-        workspace
-          .apply_configuration_local(&environment, Config::default(), committed)
-          .await,
-        "cache policy and workspace revisions must commit while the host clock is available",
-      )?);
-      ensure(
-        (workspace.config_revision, workspace.schema_revision) == (committed, committed),
-        "successful cache configuration must commit both configuration and schema revisions",
-      )?;
-
+      let committed = workspace
+        .apply_configuration_local(&environment, Config::default(), Revision(1))
+        .await;
+      let committed_revisions = (workspace.config_revision, workspace.schema_revision);
       environment.set_clock_available(false);
-      let failed_revision = Revision(2);
-      let failure = ensure_some(
-        workspace
-          .apply_configuration_local(&environment, Config::default(), failed_revision)
-          .await
-          .err(),
-        "an unavailable host clock must reject cache-policy application",
-      )?;
-      ensure(
-        matches!(
-          failure,
-          WorldError::Cache(CacheError::Transport(TransportError::Environment(
-            EnvironmentError::MissingCallback {
-              name: "now"
-            }
-          )))
-        ),
-        "clock failures must retain the complete world, cache, transport, and environment error chain",
-      )?;
-      ensure(
-        (workspace.config_revision, workspace.schema_revision) == (committed, committed),
-        "failed cache configuration must not advance either committed workspace revision",
-      )?;
-
+      let rejected = workspace
+        .apply_configuration_local(&environment, Config::default(), Revision(2))
+        .await;
+      let rejected_revisions = (workspace.config_revision, workspace.schema_revision);
       environment.set_clock_available(true);
-      let recovered = Revision(3);
-      drop(ensure_ok(
-        workspace
-          .apply_configuration_local(&environment, Config::default(), recovered)
-          .await,
-        "cache policy application must recover after the host clock returns",
-      )?);
-      ensure(
-        (workspace.config_revision, workspace.schema_revision) == (recovered, recovered),
-        "recovered cache configuration must commit both revisions at the requested generation",
-      )
-    })
+      let recovered = workspace
+        .apply_configuration_local(&environment, Config::default(), Revision(3))
+        .await;
+      let recovered_revisions = (workspace.config_revision, workspace.schema_revision);
+      Ok::<_, WorldFixtureError>((
+        workspace, environment, committed, committed_revisions, rejected, rejected_revisions, recovered, recovered_revisions,
+      ))
+    });
+    ensure_that(
+      observations,
+      "clock failure must preserve its world/cache/transport/environment sources and committed revisions before recovery",
+      |result| {
+        let Ok((_, _, ref committed, committed_revisions, ref rejected, rejected_revisions, ref recovered, recovered_revisions)) = *result
+        else {
+          return false;
+        };
+        committed.is_ok()
+          && committed_revisions == (Revision(1), Revision(1))
+          && matches!(
+            *rejected,
+            Err(WorldError::Cache(CacheError::Transport(TransportError::Environment(
+              EnvironmentError::MissingCallback {
+                name: "now"
+              }
+            ))))
+          )
+          && rejected_revisions == committed_revisions
+          && recovered.is_ok()
+          && recovered_revisions == (Revision(3), Revision(3))
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn manual_global_associations_select_by_priority_and_reject_invalid_patterns() -> Result<(), TestFailure> {
-    block_on(async {
-      let (world, document) = open_document_fixture("the manual-association document must install").await?;
-
+  fn manual_global_associations_select_by_priority_and_reject_invalid_patterns() -> Result<(), impl Debug> {
+    let observations = block_on(async {
+      let world = local_world()?;
+      let document = url("file:///workspace/document.toml")?;
       let glob_schema = url("https://example.com/glob.json")?;
-      let glob_update = ensure_ok(
-        world
-          .associate_schema(
-            ManualAssociationRule::Glob(String::from("**/*.toml")),
-            manual_association(glob_schema.clone(), priority::LSP_CONFIG),
-          )
-          .await,
-        "a valid global glob association must commit",
-      )?;
-      ensure(
-        (glob_update.diagnostic_document, glob_update.notifications.is_empty()) == (None, false),
-        "a global association must refresh effective associations without singling out one document",
-      )?;
-      let selected_glob = ensure_some(
-        world.associated_schema(&document).await,
-        "the matching glob association must become effective",
-      )?;
-      ensure(
-        selected_glob.url == glob_schema,
-        "the matching glob must select its configured schema",
-      )?;
-
       let regex_schema = url("https://example.com/regex.json")?;
-      drop(ensure_ok(
-        world
-          .associate_schema(
-            ManualAssociationRule::Regex(String::from(r".*/document\.toml$")),
-            manual_association(regex_schema.clone(), priority::DIRECTIVE),
-          )
-          .await,
-        "a valid global regular-expression association must commit",
-      )?);
-      let selected_regex = ensure_some(
-        world.associated_schema(&document).await,
-        "the higher-priority regular expression must become effective",
-      )?;
-      ensure(
-        selected_regex.url == regex_schema,
-        "association priority must select the matching regular-expression schema",
-      )?;
+      let invalid_regex_schema = url("https://example.com/invalid-regex.json")?;
+      let invalid_glob_schema = url("https://example.com/invalid-glob.json")?;
+      let installed = world.replace_document(&document, "value = 1\n").await;
+      let glob = world
+        .associate_schema(
+          ManualAssociationRule::Glob(String::from("**/*.toml")),
+          manual_association(glob_schema.clone(), priority::LSP_CONFIG),
+        )
+        .await;
+      let selected_glob = world.associated_schema(&document).await;
+      let regex = world
+        .associate_schema(
+          ManualAssociationRule::Regex(String::from(r".*/document\.toml$")),
+          manual_association(regex_schema.clone(), priority::DIRECTIVE),
+        )
+        .await;
+      let selected_regex = world.associated_schema(&document).await;
       let listed = world.list_schema_associations(&document).await;
-      ensure(
-        (
-          listed.iter().any(|association| association.url == glob_schema),
-          listed.iter().any(|association| association.url == regex_schema),
-        ) == (true, true),
-        "schema listing must retain both non-document manual associations",
-      )?;
-
-      let revision_before_rejections = world.revision.load(Ordering::SeqCst);
-      ensure(
-        matches!(
-          world
-            .associate_schema(
-              ManualAssociationRule::Regex(String::from("[")),
-              manual_association(url("https://example.com/invalid-regex.json")?, priority::MAX),
-            )
-            .await,
-          Err(WorldError::ManualAssociationPattern { ref pattern, .. }) if pattern == "["
-        ),
-        "an invalid regular expression must preserve its manual-association error context",
-      )?;
-      ensure(
-        world
-          .associate_schema(
-            ManualAssociationRule::Glob(String::from("[")),
-            manual_association(url("https://example.com/invalid-glob.json")?, priority::MAX),
-          )
-          .await
-          .is_err(),
-        "an invalid glob must fail before mutating association state",
-      )?;
-      ensure(
-        world.revision.load(Ordering::SeqCst) == revision_before_rejections,
-        "failed manual-association compilation must leave the world revision unchanged",
-      )
-    })
+      let before = world.revision.load(Ordering::SeqCst);
+      let rejected_regex = world
+        .associate_schema(
+          ManualAssociationRule::Regex(String::from("[")),
+          manual_association(invalid_regex_schema, priority::MAX),
+        )
+        .await;
+      let rejected_glob = world
+        .associate_schema(
+          ManualAssociationRule::Glob(String::from("[")),
+          manual_association(invalid_glob_schema, priority::MAX),
+        )
+        .await;
+      let after = world.revision.load(Ordering::SeqCst);
+      Ok::<_, WorldFixtureError>((
+        world,
+        installed,
+        (glob_schema, glob, selected_glob),
+        (regex_schema, regex, selected_regex),
+        listed,
+        (before, rejected_regex, rejected_glob, after),
+      ))
+    });
+    ensure_that(
+      observations,
+      "manual global associations must retain both rules, select by priority, and reject malformed rules without revision changes",
+      |result| {
+        let Ok((_, ref installed, ref glob, ref regex, ref listed, ref rejected)) = *result else {
+          return false;
+        };
+        installed.is_ok()
+          && glob
+            .1
+            .as_ref()
+            .is_ok_and(|update| update.diagnostic_document.is_none() && !update.notifications.is_empty())
+          && glob.2.as_ref().is_some_and(|selected| selected.url == glob.0)
+          && regex.1.is_ok()
+          && regex.2.as_ref().is_some_and(|selected| selected.url == regex.0)
+          && listed.iter().any(|association| association.url == glob.0)
+          && listed.iter().any(|association| association.url == regex.0)
+          && matches!(rejected.1, Err(WorldError::ManualAssociationPattern { ref pattern, .. }) if pattern == "[")
+          && matches!(rejected.2, Err(WorldError::AssociationGlob(_)))
+          && rejected.0 == rejected.3
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn manual_exact_associations_replace_their_prior_owner_atomically() -> Result<(), TestFailure> {
-    block_on(async {
-      let (world, document) = open_document_fixture("the exact-association document must install").await?;
+  fn manual_exact_associations_replace_their_prior_owner_atomically() -> Result<(), impl Debug> {
+    let observations = block_on(async {
+      let world = local_world()?;
+      let document = url("file:///workspace/document.toml")?;
       let glob_schema = url("https://example.com/glob.json")?;
-      drop(ensure_ok(
-        world
-          .associate_schema(
-            ManualAssociationRule::Glob(String::from("**/*.toml")),
-            manual_association(glob_schema.clone(), priority::LSP_CONFIG),
-          )
-          .await,
-        "the listing-context glob association must commit",
-      )?);
-
       let exact_schema = url("https://example.com/exact.json")?;
-      let exact_update = ensure_ok(
-        world
-          .associate_schema(
-            ManualAssociationRule::Url(document.clone()),
-            manual_association(exact_schema.clone(), priority::MAX),
-          )
-          .await,
-        "an exact-document association must commit",
-      )?;
-      ensure(
-        exact_update.diagnostic_document == Some(document.clone()),
-        "an exact association must identify the one document requiring diagnostics",
-      )?;
       let replacement_schema = url("https://example.com/replacement.json")?;
-      drop(ensure_ok(
-        world
-          .associate_schema(
-            ManualAssociationRule::Url(document.clone()),
-            manual_association(replacement_schema.clone(), priority::MAX),
-          )
-          .await,
-        "a second exact-document association must replace its prior manual owner",
-      )?);
-      let selected_exact = ensure_some(
-        world.associated_schema(&document).await,
-        "the replacement exact association must remain effective",
-      )?;
-      ensure(
-        selected_exact.url == replacement_schema,
-        "exact-document replacement must not leave the previous schema selected",
-      )?;
-      ensure(
-        {
-          let listed_urls = world
-            .list_schema_associations(&document)
-            .await
-            .into_iter()
-            .map(|association| association.url)
-            .collect::<Vec<_>>();
-          (
-            listed_urls.contains(&glob_schema),
-            listed_urls.contains(&exact_schema),
-            listed_urls.contains(&replacement_schema),
-          ) == (true, false, false)
-        },
-        "non-document schema listing must retain global rules while excluding exact document associations",
-      )
+      let installed = world.replace_document(&document, "value = 1\n").await;
+      let glob = world
+        .associate_schema(
+          ManualAssociationRule::Glob(String::from("**/*.toml")),
+          manual_association(glob_schema.clone(), priority::LSP_CONFIG),
+        )
+        .await;
+      let exact = world
+        .associate_schema(
+          ManualAssociationRule::Url(document.clone()),
+          manual_association(exact_schema.clone(), priority::MAX),
+        )
+        .await;
+      let replacement = world
+        .associate_schema(
+          ManualAssociationRule::Url(document.clone()),
+          manual_association(replacement_schema.clone(), priority::MAX),
+        )
+        .await;
+      let selected = world.associated_schema(&document).await;
+      let listed = world.list_schema_associations(&document).await;
+      Ok::<_, WorldFixtureError>((
+        world,
+        document,
+        installed,
+        (glob_schema, glob),
+        (exact_schema, exact),
+        (replacement_schema, replacement),
+        selected,
+        listed,
+      ))
+    });
+    ensure_that(
+      observations,
+      "exact manual associations must replace their owner, identify diagnostics, and remain excluded from global listings",
+      |result| {
+        let Ok((_, ref document, ref installed, ref glob, ref exact, ref replacement, ref selected, ref listed)) = *result else {
+          return false;
+        };
+        installed.is_ok()
+          && glob.1.is_ok()
+          && exact
+            .1
+            .as_ref()
+            .is_ok_and(|update| update.diagnostic_document.as_ref() == Some(document))
+          && replacement.1.is_ok()
+          && selected.as_ref().is_some_and(|association| association.url == replacement.0)
+          && listed.iter().any(|association| association.url == glob.0)
+          && listed
+            .iter()
+            .all(|association| association.url != exact.0 && association.url != replacement.0)
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
+  }
+
+  /// Observe snapshot currency without consuming the captured native document state.
+  fn snapshot_currency<'capture>(
+    world: &'capture LocalTestWorld,
+    document: &'capture Url,
+    snapshot: Option<&'capture DocumentSnapshot<LocalTestTransport>>,
+  ) -> LocalFuture<'capture, Option<bool>> {
+    Box::pin(async move {
+      match snapshot {
+        Some(captured) => Some(world.snapshot_is_current(document, captured).await),
+        None => None,
+      }
     })
   }
 
   #[test]
-  fn document_schema_and_configuration_mutations_invalidate_old_snapshots() -> Result<(), TestFailure> {
-    block_on(async {
-      let (world, document) = open_document_fixture("the initial document must install").await?;
-      let original = ensure_some(
-        world.document_snapshot(&document).await,
-        "the initial document must expose a snapshot",
-      )?;
-      ensure(
-        world.snapshot_is_current(&document, &original).await,
-        "a newly captured document snapshot must be current",
-      )?;
-
-      drop(ensure_ok(
-        world.replace_document(&document, "value = 2\n").await,
-        "the replacement document must install",
-      )?);
-      ensure(
-        !world.snapshot_is_current(&document, &original).await,
-        "a document replacement must invalidate output captured from the old source",
-      )?;
-      let after_document = ensure_some(
-        world.document_snapshot(&document).await,
-        "the replacement document must expose a snapshot",
-      )?;
-
+  fn document_schema_and_configuration_mutations_invalidate_old_snapshots() -> Result<(), impl Debug> {
+    let observations = block_on(async {
+      let world = local_world()?;
+      let document = url("file:///workspace/document.toml")?;
       let schema_url = url("https://example.com/schema.json")?;
-      drop(ensure_ok(
-        world
-          .associate_schema(ManualAssociationRule::Url(document.clone()), SchemaAssociation {
-            url:      schema_url,
-            meta:     json!({ "source": source::MANUAL }),
-            priority: priority::MAX,
-          })
-          .await,
-        "the manual schema association must commit",
-      )?);
-      ensure(
-        !world.snapshot_is_current(&document, &after_document).await,
-        "a schema-association mutation must invalidate old generation-dependent output",
-      )?;
-      let after_schema = ensure_some(
-        world.document_snapshot(&document).await,
-        "the associated document must retain a snapshot",
-      )?;
-
-      let configuration = json!({
-        "schema": { "enabled": false },
-        "syntax": { "semanticTokens": false }
-      });
-      drop(ensure_ok(
-        world.apply_configuration_values_local(Some(&configuration), &[]).await,
-        "the offline client configuration must commit",
-      )?);
-      ensure(
-        !world.snapshot_is_current(&document, &after_schema).await,
-        "a configuration mutation must invalidate old generation-dependent output",
-      )?;
-      let current = ensure_some(
-        world.document_snapshot(&document).await,
-        "the reconfigured document must retain a current snapshot",
-      )?;
-      ensure(
-        world.snapshot_is_current(&document, &current).await,
-        "a snapshot captured after every committed mutation must be current",
-      )?;
-
-      drop(ensure_ok(
-        world.close_document(&document).await,
-        "closing the document must commit",
-      )?);
-      ensure(
-        !world.snapshot_is_current(&document, &current).await,
-        "closing a document must suppress every previously captured result",
-      )
-    })
+      let installed = world.replace_document(&document, "value = 1\n").await;
+      let original = world.document_snapshot(&document).await;
+      let initial_currency = snapshot_currency(&world, &document, original.as_ref()).await;
+      let replaced = world.replace_document(&document, "value = 2\n").await;
+      let stale_document = snapshot_currency(&world, &document, original.as_ref()).await;
+      let after_document = world.document_snapshot(&document).await;
+      let associated = world
+        .associate_schema(
+          ManualAssociationRule::Url(document.clone()),
+          manual_association(schema_url, priority::MAX),
+        )
+        .await;
+      let stale_schema = snapshot_currency(&world, &document, after_document.as_ref()).await;
+      let after_schema = world.document_snapshot(&document).await;
+      let configuration = json!({ "schema": { "enabled": false }, "syntax": { "semanticTokens": false } });
+      let configured = world.apply_configuration_values_local(Some(&configuration), &[]).await;
+      let stale_configuration = snapshot_currency(&world, &document, after_schema.as_ref()).await;
+      let current = world.document_snapshot(&document).await;
+      let current_currency = snapshot_currency(&world, &document, current.as_ref()).await;
+      let closed = world.close_document(&document).await;
+      let stale_closed = snapshot_currency(&world, &document, current.as_ref()).await;
+      Ok::<_, WorldFixtureError>((
+        world,
+        [installed, replaced],
+        associated,
+        [configured, closed],
+        [original, after_document, after_schema, current],
+        [
+          initial_currency, stale_document, stale_schema, stale_configuration, current_currency, stale_closed,
+        ],
+      ))
+    });
+    ensure_that(
+      observations,
+      "document, schema, configuration, and close mutations must each invalidate previously captured snapshots",
+      |result| {
+        let Ok((_, ref documents, ref associated, ref configurations, ref snapshots, ref currency)) = *result else {
+          return false;
+        };
+        documents.iter().all(Result::is_ok)
+          && associated.is_ok()
+          && configurations.iter().all(Result::is_ok)
+          && snapshots.iter().all(Option::is_some)
+          && *currency == [Some(true), Some(false), Some(false), Some(false), Some(true), Some(false)]
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

@@ -279,24 +279,22 @@ impl Mapper {
   /// ```
   /// use lsp_types::Position;
   /// use rowan::TextSize;
-  /// use strict_test_support::TestFailure;
-  /// use strict_test_support::ensure;
-  /// use strict_test_support::ensure_ok;
+  /// use strict_test_support::PredicateFailure;
+  /// use strict_test_support::ensure_that;
   /// use taplo_lsp_async::util::Mapper;
+  /// use taplo_lsp_async::util::MappingError;
   ///
-  /// fn main() -> Result<(), TestFailure> {
-  ///   let mapper = ensure_ok(
+  /// fn main() -> Result<(), PredicateFailure<Result<Mapper, MappingError>>> {
+  ///   ensure_that(
   ///     Mapper::new_utf16("a\u{1f600}z"),
-  ///     "the UTF-16 mapper must construct",
-  ///   )?;
-  ///   let position = ensure_ok(
-  ///     mapper.position(TextSize::from(5)),
-  ///     "the emoji boundary must map",
-  ///   )?;
-  ///   ensure(
-  ///     position == Position::new(0, 3),
   ///     "UTF-16 columns must count surrogate code units",
+  ///     |outcome| {
+  ///       outcome
+  ///         .as_ref()
+  ///         .is_ok_and(|mapper| mapper.position(TextSize::from(5)) == Ok(Position::new(0, 3)))
+  ///     },
   ///   )
+  ///   .map(drop)
   /// }
   /// ```
   ///
@@ -588,308 +586,269 @@ const fn ensure_ordered_range(range: Range) -> Result<(), MappingError> {
 #[cfg(test)]
 mod tests {
   use core::iter::once;
+  use core::num::TryFromIntError;
 
   use lsp_types::Position;
   use lsp_types::Range;
   use proptest::arbitrary::any;
   use proptest::strict::ensure_property;
+  use proptest::test_runner::PropertyFailure;
   use rowan::TextRange;
   use rowan::TextSize;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
+  use strict_test_support::ComparisonFailure;
+  use strict_test_support::PredicateFailure;
   use strict_test_support::ensure_eq;
-  use strict_test_support::ensure_ok;
-  use strict_test_support::ensure_some;
+  use strict_test_support::ensure_that;
 
   use super::Mapper;
   use super::MappingError;
+  use super::PositionEncoding;
   use super::relative_position;
   use super::relative_range;
 
-  /// Assert UTF-8, UTF-16, and UTF-32 columns at Unicode boundaries.
-  #[test]
-  fn maps_each_position_encoding_at_character_boundaries() -> Result<(), TestFailure> {
-    let source = "a\u{1f600}z";
-    let utf8 = ensure_ok(Mapper::new_utf8(source), "UTF-8 mapper construction")?;
-    let utf16 = ensure_ok(Mapper::new_utf16(source), "UTF-16 mapper construction")?;
-    let utf32 = ensure_ok(Mapper::new_utf32(source), "UTF-32 mapper construction")?;
-    let after_emoji = TextSize::from(5);
-
-    let utf8_position = ensure_ok(utf8.position(after_emoji), "the UTF-8 emoji boundary must map")?;
-    ensure(utf8_position == Position::new(0, 5), "UTF-8 columns must count source bytes")?;
-    let utf16_position = ensure_ok(utf16.position(after_emoji), "the UTF-16 emoji boundary must map")?;
-    ensure(
-      utf16_position == Position::new(0, 3),
-      "UTF-16 columns must count surrogate code units",
-    )?;
-    let utf32_position = ensure_ok(utf32.position(after_emoji), "the UTF-32 emoji boundary must map")?;
-    ensure(
-      utf32_position == Position::new(0, 2),
-      "UTF-32 columns must count Unicode scalar values",
-    )?;
-    let split_multibyte = ensure_some(
-      utf8.position(TextSize::from(2)).err(),
-      "a UTF-8 byte offset within a multibyte character must be rejected",
-    )?;
-    ensure(
-      split_multibyte
-        == MappingError::OffsetNotBoundary {
-          offset: 2
-        },
-      "the multibyte-character failure must retain its exact byte offset",
-    )?;
-    let split_surrogate = ensure_some(
-      utf16.offset(Position::new(0, 2)).err(),
-      "a UTF-16 column within a surrogate pair must be rejected",
-    )?;
-    ensure(
-      split_surrogate
-        == MappingError::PositionNotBoundary {
-          line:      0,
-          character: 2,
-        },
-      "the surrogate-pair failure must retain its exact position",
-    )
+  /// One constructed mapper and every native lookup made against it.
+  #[derive(Debug)]
+  struct MappingObservations {
+    /// Original immutable mapper retaining its character tables.
+    mapper:      Mapper,
+    /// Byte-to-position lookups in scenario order.
+    positions:   Vec<Result<Position, MappingError>>,
+    /// Position-to-byte lookups in scenario order.
+    offsets:     Vec<Result<TextSize, MappingError>>,
+    /// Byte range lookup results.
+    ranges:      Vec<Result<Range, MappingError>>,
+    /// Protocol range lookup results.
+    text_ranges: Vec<Result<TextRange, MappingError>>,
   }
 
-  /// Assert LF, CRLF, empty lines, and a final empty line.
+  /// Native construction result retaining the mapper and its lookups.
+  type MappingOutcome = Result<MappingObservations, MappingError>;
+
+  /// Complete construction and lookup results across the encoding matrix.
+  type EncodingObservations = [MappingOutcome; 3];
+
   #[test]
-  fn maps_line_terminators_without_exposing_crlf_interior() -> Result<(), TestFailure> {
-    let mapper = ensure_ok(Mapper::new_utf16("a\r\n\nb\r"), "line mapper construction")?;
-    ensure_eq(&mapper.line_count(), &4, "all physical lines including the final line")?;
-    let next_line = ensure_ok(mapper.position(TextSize::from(3)), "the offset after CRLF must map")?;
-    ensure(next_line == Position::new(1, 0), "the offset after CRLF must start the next line")?;
-    let crlf_interior = ensure_some(
-      mapper.position(TextSize::from(2)).err(),
-      "the interior of CRLF must not map to an LSP position",
-    )?;
-    ensure(
-      crlf_interior
-        == MappingError::OffsetNotBoundary {
-          offset: 2
-        },
-      "the CRLF-interior failure must retain its exact byte offset",
-    )?;
-    ensure(
-      mapper.all_range() == Range::new(Position::new(0, 0), Position::new(3, 0)),
-      "a trailing terminator must produce a final empty line",
-    )
+  fn maps_each_position_encoding_at_character_boundaries() -> Result<(), Box<PredicateFailure<EncodingObservations>>> {
+    let observations = [PositionEncoding::Utf8, PositionEncoding::Utf16, PositionEncoding::Utf32].map(|encoding| {
+      Mapper::new("a\u{1f600}z", encoding).map(|mapper| MappingObservations {
+        positions: vec![mapper.position(TextSize::from(5)), mapper.position(TextSize::from(2))],
+        offsets: vec![mapper.offset(Position::new(0, 2))],
+        ranges: Vec::new(),
+        text_ranges: Vec::new(),
+        mapper,
+      })
+    });
+    ensure_that(observations, "encodings must retain exact Unicode boundaries and reject split characters", |observed| {
+      observed.iter().zip([5, 3, 2]).all(|(outcome, column)| matches!(*outcome, Ok(ref mapping)
+        if mapping.positions == [Ok(Position::new(0, column)), Err(MappingError::OffsetNotBoundary { offset: 2 })]
+          && (mapping.mapper.encoding() != PositionEncoding::Utf16 || mapping.offsets == [Err(MappingError::PositionNotBoundary { line: 0, character: 2 })])))
+    }).map(drop).map_err(Box::new)
   }
 
-  /// Assert exact round trips and both invalid endpoint polarities.
   #[test]
-  fn round_trips_ranges_and_rejects_invalid_endpoints() -> Result<(), TestFailure> {
-    let mapper = ensure_ok(Mapper::new_utf16("alpha\n\u{3b2}eta"), "range mapper construction")?;
+  fn maps_line_terminators_without_exposing_crlf_interior() -> Result<(), Box<PredicateFailure<MappingOutcome>>> {
+    let observed = Mapper::new_utf16("a\r\n\nb\r").map(|mapper| MappingObservations {
+      positions: vec![mapper.position(TextSize::from(3)), mapper.position(TextSize::from(2))],
+      offsets: Vec::new(),
+      ranges: Vec::new(),
+      text_ranges: Vec::new(),
+      mapper,
+    });
+    ensure_that(
+      observed,
+      "line mapping must preserve all four physical lines while rejecting CRLF interior",
+      |outcome| {
+        outcome.as_ref().is_ok_and(|mapping| {
+          mapping.mapper.line_count() == 4
+            && mapping.positions
+              == [
+                Ok(Position::new(1, 0)),
+                Err(MappingError::OffsetNotBoundary {
+                  offset: 2
+                }),
+              ]
+            && mapping.mapper.all_range() == Range::new(Position::new(0, 0), Position::new(3, 0))
+        })
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
+  }
+
+  #[test]
+  fn round_trips_ranges_and_rejects_invalid_endpoints() -> Result<(), Box<PredicateFailure<MappingOutcome>>> {
     let text_range = TextRange::new(TextSize::from(0), TextSize::from(5));
     let lsp_range = Range::new(Position::new(0, 0), Position::new(0, 5));
-    let mapped_range = ensure_ok(mapper.range(text_range), "a valid source range must map")?;
-    ensure(mapped_range == lsp_range, "a valid source range must map exactly")?;
-    let mapped_text_range = ensure_ok(mapper.text_range(lsp_range), "a valid LSP range must map")?;
-    ensure(mapped_text_range == text_range, "a valid LSP range must round-trip exactly")?;
-    let offset_out_of_bounds = ensure_some(
-      mapper.position(TextSize::from(100)).err(),
-      "an out-of-bounds source offset must be rejected",
-    )?;
-    ensure(
-      offset_out_of_bounds
-        == MappingError::OffsetOutOfBounds {
-          offset:        100,
-          source_length: 11,
-        },
-      "an out-of-bounds source offset must retain the requested and source extents",
-    )?;
-    let line_out_of_bounds = ensure_some(
-      mapper.offset(Position::new(2, 0)).err(),
-      "an out-of-bounds LSP line must be rejected",
-    )?;
-    ensure(
-      line_out_of_bounds
-        == MappingError::PositionLineOutOfBounds {
-          line: 2
-        },
-      "an out-of-bounds LSP line must retain the requested line",
-    )?;
-    let column_out_of_bounds = ensure_some(
-      mapper.offset(Position::new(0, 6)).err(),
-      "an out-of-bounds LSP column must be rejected",
-    )?;
-    ensure(
-      column_out_of_bounds
-        == MappingError::PositionCharacterOutOfBounds {
-          line:      0,
-          character: 6,
-        },
-      "an out-of-bounds LSP column must retain the requested position",
-    )?;
-    let reversed = ensure_some(
-      mapper.text_range(Range::new(Position::new(1, 0), Position::new(0, 0))).err(),
-      "a reversed LSP range must be rejected",
-    )?;
-    ensure(
-      reversed
-        == MappingError::ReversedRange {
-          start_line:      1,
-          start_character: 0,
-          end_line:        0,
-          end_character:   0,
-        },
-      "a reversed LSP range must retain both exact endpoints",
-    )?;
-    let reversed_columns = ensure_some(
-      mapper.text_range(Range::new(Position::new(0, 5), Position::new(0, 4))).err(),
-      "a same-line range with reversed columns must be rejected",
-    )?;
-    ensure(
-      reversed_columns
-        == MappingError::ReversedRange {
-          start_line:      0,
-          start_character: 5,
-          end_line:        0,
-          end_character:   4,
-        },
-      "same-line reversal must retain both exact character columns",
-    )?;
-    ensure(
-      mapper.encoding() == super::PositionEncoding::Utf16,
-      "the mapper must report the position encoding selected at construction",
+    let observed = Mapper::new_utf16("alpha\n\u{3b2}eta").map(|mapper| MappingObservations {
+      positions: vec![mapper.position(TextSize::from(100))],
+      offsets: vec![mapper.offset(Position::new(2, 0)), mapper.offset(Position::new(0, 6))],
+      ranges: vec![mapper.range(text_range)],
+      text_ranges: vec![
+        mapper.text_range(lsp_range),
+        mapper.text_range(Range::new(Position::new(1, 0), Position::new(0, 0))),
+        mapper.text_range(Range::new(Position::new(0, 5), Position::new(0, 4))),
+      ],
+      mapper,
+    });
+    ensure_that(
+      observed,
+      "range mapping must round-trip and retain exact invalid coordinates",
+      |outcome| {
+        outcome.as_ref().is_ok_and(|mapping| {
+          mapping.ranges == [Ok(lsp_range)]
+            && mapping.positions
+              == [Err(MappingError::OffsetOutOfBounds {
+                offset:        100,
+                source_length: 11,
+              })]
+            && mapping.offsets
+              == [
+                Err(MappingError::PositionLineOutOfBounds {
+                  line: 2
+                }),
+                Err(MappingError::PositionCharacterOutOfBounds {
+                  line:      0,
+                  character: 6,
+                }),
+              ]
+            && mapping.text_ranges
+              == [
+                Ok(text_range),
+                Err(MappingError::ReversedRange {
+                  start_line:      1,
+                  start_character: 0,
+                  end_line:        0,
+                  end_character:   0,
+                }),
+                Err(MappingError::ReversedRange {
+                  start_line:      0,
+                  start_character: 5,
+                  end_line:        0,
+                  end_character:   4,
+                }),
+              ]
+            && mapping.mapper.encoding() == PositionEncoding::Utf16
+        })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
-  /// Assert relative positions and ranges use exact start-referenced deltas.
+  /// Native relative position and range results compared without extracting failures.
+  type RelativeObservations = ([Result<Position, MappingError>; 2], [Result<Range, MappingError>; 4]);
+
   #[test]
-  fn computes_checked_relative_coordinates() -> Result<(), TestFailure> {
-    let position = ensure_ok(
-      relative_position(Position::new(3, 4), Position::new(1, 8)),
-      "a later position must relativize",
-    )?;
-    ensure(
-      position == Position::new(2, 4),
-      "a later line must retain its absolute character column",
-    )?;
-    let range = ensure_ok(
-      relative_range(
-        Range::new(Position::new(3, 4), Position::new(3, 9)),
-        Range::new(Position::new(1, 8), Position::new(1, 10)),
-      ),
-      "a later range must relativize",
-    )?;
-    ensure(
-      range == Range::new(Position::new(2, 4), Position::new(2, 9)),
-      "a single-line range must preserve its character width after relativization",
-    )?;
-    let same_line = ensure_ok(
-      relative_range(
-        Range::new(Position::new(1, 10), Position::new(1, 14)),
-        Range::new(Position::new(1, 8), Position::new(1, 9)),
-      ),
-      "a same-line range after its reference must relativize",
-    )?;
-    ensure(
-      same_line == Range::new(Position::new(0, 2), Position::new(0, 6)),
-      "same-line endpoints must be measured independently from the reference start",
-    )?;
-    let underflow = ensure_some(
-      relative_position(Position::new(0, 0), Position::new(1, 0)).err(),
-      "a position before its reference must be rejected",
-    )?;
-    ensure(
-      underflow
-        == MappingError::RelativePositionUnderflow {
+  fn computes_checked_relative_coordinates() -> Result<(), Box<ComparisonFailure<RelativeObservations, RelativeObservations>>> {
+    let observed = (
+      [
+        relative_position(Position::new(3, 4), Position::new(1, 8)),
+        relative_position(Position::new(0, 0), Position::new(1, 0)),
+      ],
+      [
+        relative_range(
+          Range::new(Position::new(3, 4), Position::new(3, 9)),
+          Range::new(Position::new(1, 8), Position::new(1, 10)),
+        ),
+        relative_range(
+          Range::new(Position::new(1, 10), Position::new(1, 14)),
+          Range::new(Position::new(1, 8), Position::new(1, 9)),
+        ),
+        relative_range(
+          Range::new(Position::new(3, 0), Position::new(3, 1)),
+          Range::new(Position::new(2, 1), Position::new(2, 0)),
+        ),
+        relative_range(
+          Range::new(Position::new(0, 5), Position::new(0, 6)),
+          Range::new(Position::new(0, 6), Position::new(0, 7)),
+        ),
+      ],
+    );
+    let expected = (
+      [
+        Ok(Position::new(2, 4)),
+        Err(MappingError::RelativePositionUnderflow {
           line:                0,
           character:           0,
           reference_line:      1,
           reference_character: 0,
-        },
-      "relative underflow must retain the absolute and reference positions",
-    )?;
-    let reversed_reference = ensure_some(
-      relative_range(
-        Range::new(Position::new(3, 0), Position::new(3, 1)),
-        Range::new(Position::new(2, 1), Position::new(2, 0)),
-      )
-      .err(),
-      "a reversed reference range must be rejected before relativization",
-    )?;
-    ensure(
-      reversed_reference
-        == MappingError::ReversedRange {
+        }),
+      ],
+      [
+        Ok(Range::new(Position::new(2, 4), Position::new(2, 9))),
+        Ok(Range::new(Position::new(0, 2), Position::new(0, 6))),
+        Err(MappingError::ReversedRange {
           start_line:      2,
           start_character: 1,
           end_line:        2,
           end_character:   0,
-        },
-      "a reversed reference must retain its exact endpoints",
-    )?;
-    let range_underflow = ensure_some(
-      relative_range(
-        Range::new(Position::new(0, 5), Position::new(0, 6)),
-        Range::new(Position::new(0, 6), Position::new(0, 7)),
-      )
-      .err(),
-      "a range beginning before its reference must be rejected",
-    )?;
-    ensure(
-      range_underflow
-        == MappingError::RelativePositionUnderflow {
+        }),
+        Err(MappingError::RelativePositionUnderflow {
           line:                0,
           character:           5,
           reference_line:      0,
           reference_character: 6,
-        },
-      "range underflow must retain the exact start and reference positions",
+        }),
+      ],
+    );
+    ensure_eq(
+      observed,
+      expected,
+      "relative coordinates must retain exact deltas and invalid endpoints",
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
-  /// Require every generated Unicode boundary to round-trip in each supported encoding.
-  #[test]
-  fn generated_offsets_and_positions_round_trip() -> Result<(), TestFailure> {
-    let input = (any::<String>(), any::<usize>());
-    ensure_property(
-      &input,
-      "generated Unicode boundaries round-trip through every advertised position encoding",
-      |(source, selection)| {
-        let boundaries = source
-          .char_indices()
-          .map(|(offset, _character)| offset)
-          .chain(once(source.len()))
-          .filter(|offset| {
-            (
-              source.get(..*offset).is_some_and(|prefix| prefix.ends_with('\r')),
-              source.get(*offset..).is_some_and(|suffix| suffix.starts_with('\n')),
-            ) != (true, true)
-          })
-          .collect::<Vec<_>>();
-        let selected = ensure_some(
-          selection.checked_rem(boundaries.len()),
-          "every source must expose at least its final character boundary",
-        )?;
-        let boundary = ensure_some(
-          boundaries.get(selected).copied(),
-          "the reduced boundary index must identify a source offset",
-        )?;
-        let raw = ensure_ok(u32::try_from(boundary), "generated sources must fit Rowan's coordinate width")?;
-        let offset = TextSize::from(raw);
+  /// Native mapper construction and both directional boundary lookups.
+  #[derive(Debug)]
+  struct BoundaryMapping {
+    /// Constructed mapper retained even when a later lookup fails.
+    mapper:     Result<Mapper, MappingError>,
+    /// Forward lookup when setup exposed both mapper and source boundary.
+    position:   Option<Result<Position, MappingError>>,
+    /// Reverse lookup retaining the earlier successful position independently.
+    round_trip: Option<Result<TextSize, MappingError>>,
+  }
 
-        for mapper in [
-          ensure_ok(Mapper::new_utf8(&source), "the UTF-8 mapper must construct")?,
-          ensure_ok(Mapper::new_utf16(&source), "the UTF-16 mapper must construct")?,
-          ensure_ok(Mapper::new_utf32(&source), "the UTF-32 mapper must construct")?,
-        ] {
-          let position = ensure_ok(
-            mapper.position(offset),
-            "a generated character boundary must map to a protocol position",
-          )?;
-          let round_trip = ensure_ok(
-            mapper.offset(position),
-            "a generated protocol position must map to a source boundary",
-          )?;
-          ensure(
-            round_trip == offset,
-            "a generated protocol position must map back to its exact source boundary",
-          )?;
-        }
-        Ok(())
-      },
-    )
+  /// A generated source, selected native boundary, and all mapper round trips.
+  #[derive(Debug)]
+  struct BoundaryObservations {
+    /// Original generated text.
+    source:     String,
+    /// Original random boundary selector.
+    selection:  usize,
+    /// Every selectable boundary after excluding CRLF interiors.
+    boundaries: Vec<usize>,
+    /// Checked native byte coordinate, including integer conversion failure.
+    offset:     Option<Result<TextSize, TryFromIntError>>,
+    /// All native mapper and lookup results.
+    mappings:   Vec<BoundaryMapping>,
+  }
+
+  /// Native property report for a generated Unicode source and selector.
+  type BoundaryFailure = PropertyFailure<(String, usize), BoundaryObservations, PredicateFailure<BoundaryObservations>>;
+
+  #[test]
+  fn generated_offsets_and_positions_round_trip() -> Result<(), Box<BoundaryFailure>> {
+    ensure_property(&(any::<String>(), any::<usize>()), "generated Unicode boundaries round-trip through every advertised position encoding", |(source, selection)| {
+      let boundaries = source.char_indices().map(|(offset, _character)| offset).chain(once(source.len())).filter(|offset| {
+        (source.get(..*offset).is_some_and(|prefix| prefix.ends_with('\r')), source.get(*offset..).is_some_and(|suffix| suffix.starts_with('\n'))) != (true, true)
+      }).collect::<Vec<_>>();
+      let offset = selection.checked_rem(boundaries.len()).and_then(|selected| boundaries.get(selected)).map(|boundary| u32::try_from(*boundary).map(TextSize::from));
+      let coordinate = offset.as_ref().and_then(|native| native.as_ref().ok());
+      let mut mappings = Vec::new();
+      for encoding in [PositionEncoding::Utf8, PositionEncoding::Utf16, PositionEncoding::Utf32] {
+        let mapper = Mapper::new(&source, encoding);
+        let position = mapper.as_ref().ok().zip(coordinate).map(|(mapped, selected)| mapped.position(*selected));
+        let round_trip = mapper.as_ref().ok().zip(position.as_ref().and_then(|native| native.as_ref().ok())).map(|(mapped, forward)| mapped.offset(*forward));
+        mappings.push(BoundaryMapping { mapper, position, round_trip });
+      }
+      ensure_that(BoundaryObservations { source, selection, boundaries, offset, mappings }, "every encoding must map the selected source boundary back to its exact byte offset", |observed| {
+        matches!(observed.offset, Some(Ok(expected)) if observed.selection.checked_rem(observed.boundaries.len()).and_then(|index| observed.boundaries.get(index)).is_some_and(|boundary| *boundary <= observed.source.len())
+          && observed.mappings.len() == 3
+          && observed.mappings.iter().all(|mapping| mapping.mapper.is_ok() && matches!(mapping.position, Some(Ok(_))) && mapping.round_trip == Some(Ok(expected))))
+      })
+    }).map(drop)
   }
 }

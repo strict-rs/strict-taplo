@@ -486,8 +486,11 @@ fn lex_multi_line_string_literal(lexer: &mut logos::Lexer<'_, LexToken>) -> bool
 #[cfg(test)]
 /// Raw-kind stability and private lexer behavior contracts.
 mod tests {
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
+  use core::fmt::Debug;
+
+  use strict_test_support::ComparisonFailure;
+  use strict_test_support::ensure_eq;
+  use strict_test_support::ensure_that;
 
   use super::SyntaxKind;
   use super::SyntaxLexer;
@@ -502,14 +505,20 @@ mod tests {
     kinds
   }
 
+  /// Native observed token sequence paired with its exact expected token.
+  type SingleKindObservation = (Vec<SyntaxKind>, [SyntaxKind; 1]);
+
+  /// Native operands retained when one-token lexing differs.
+  type SingleKindFailure = ComparisonFailure<Vec<SyntaxKind>, [SyntaxKind; 1]>;
+
   /// Require one isolated source fragment to produce exactly one kind.
-  fn ensure_single_kind(source: &str, expected: SyntaxKind, message: &'static str) -> Result<(), TestFailure> {
-    ensure(kinds(source) == vec![expected], message)
+  fn ensure_single_kind(source: &str, expected: SyntaxKind, message: &'static str) -> Result<SingleKindObservation, SingleKindFailure> {
+    ensure_eq(kinds(source), [expected], message)
   }
 
   /// Preserve every known raw assignment and round-trip unknown Rowan kinds without loss.
   #[test]
-  fn raw_kind_conversion_is_total_and_stable() -> Result<(), TestFailure> {
+  fn raw_kind_conversion_is_total_and_stable() -> Result<(), impl Debug> {
     let known = [
       SyntaxKind::WHITESPACE,
       SyntaxKind::NEWLINE,
@@ -547,170 +556,173 @@ mod tests {
       SyntaxKind::INLINE_TABLE,
       SyntaxKind::ROOT,
     ];
-    ensure(
-      known.map(SyntaxKind::raw)
-        == [
-          0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34,
-        ],
-      "every known syntax kind must retain its historical raw assignment",
-    )?;
-
     let unknown = SyntaxKind::from_raw(u16::MAX);
-    ensure(unknown.raw() == u16::MAX, "unknown raw syntax kinds must round-trip unchanged")?;
-    ensure(
-      format!("{unknown:?}").contains("65535"),
-      "unknown syntax-kind diagnostics must retain the raw value",
+    let rendered = format!("{unknown:?}");
+    ensure_that(
+      (known, unknown, rendered),
+      "known kinds must retain assignments and unknown kinds must round-trip visibly",
+      |observed| {
+        observed.0.map(SyntaxKind::raw)
+          == [
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33,
+            34,
+          ]
+          && observed.1.raw() == u16::MAX
+          && observed.2.contains("65535")
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Map every lexical token class explicitly into its public syntax kind.
   #[test]
-  fn private_lexer_maps_every_token_class() -> Result<(), TestFailure> {
-    ensure_single_kind(" \t", SyntaxKind::WHITESPACE, "horizontal whitespace must remain one token")?;
-    ensure_single_kind("\r\n\n", SyntaxKind::NEWLINE, "CRLF and LF runs must remain newline tokens")?;
-    ensure_single_kind("# comment", SyntaxKind::COMMENT, "comments must extend through line content")?;
-    ensure_single_kind("bare-key", SyntaxKind::IDENT, "bare keys must remain identifiers")?;
-    ensure_single_kind(
-      "*?key",
-      SyntaxKind::IDENT_WITH_GLOB,
-      "glob key segments must retain their query kind",
-    )?;
-    ensure_single_kind(".", SyntaxKind::PERIOD, "period punctuation must retain its kind")?;
-    ensure_single_kind(",", SyntaxKind::COMMA, "comma punctuation must retain its kind")?;
-    ensure_single_kind("=", SyntaxKind::EQ, "equals punctuation must retain its kind")?;
-    ensure_single_kind("\"value\"", SyntaxKind::STRING, "basic strings must retain their kind")?;
-    ensure_single_kind(
-      "\"\"\"value\"\"\"",
-      SyntaxKind::MULTI_LINE_STRING,
-      "multiline basic strings must retain their kind",
-    )?;
-    ensure_single_kind("'value'", SyntaxKind::STRING_LITERAL, "literal strings must retain their kind")?;
-    ensure_single_kind(
-      "'''value'''",
-      SyntaxKind::MULTI_LINE_STRING_LITERAL,
-      "multiline literal strings must retain their kind",
-    )?;
-    ensure_single_kind("+12_345", SyntaxKind::INTEGER, "decimal integers must retain their kind")?;
-    ensure_single_kind("0xCA_FE", SyntaxKind::INTEGER_HEX, "hexadecimal integers must retain their kind")?;
-    ensure_single_kind("0o7_55", SyntaxKind::INTEGER_OCT, "octal integers must retain their kind")?;
-    ensure_single_kind("0b10_01", SyntaxKind::INTEGER_BIN, "binary integers must retain their kind")?;
-    ensure_single_kind("-1.25e+3", SyntaxKind::FLOAT, "finite floats must retain their kind")?;
-    ensure_single_kind("inf", SyntaxKind::FLOAT, "special floats must retain their kind")?;
-    ensure_single_kind("false", SyntaxKind::BOOL, "Booleans must retain their kind")?;
-    ensure_single_kind(
-      "1979-05-27T07:32:00Z",
-      SyntaxKind::DATE_TIME_OFFSET,
-      "offset date-times must retain their kind",
-    )?;
-    ensure_single_kind(
-      "1979-05-27 07:32:00",
-      SyntaxKind::DATE_TIME_LOCAL,
-      "local date-times must retain their kind",
-    )?;
-    ensure_single_kind("1979-05-27", SyntaxKind::DATE, "local dates must retain their kind")?;
-    ensure_single_kind("07:32:00.5", SyntaxKind::TIME, "local times must retain their kind")?;
-    ensure_single_kind("[", SyntaxKind::BRACKET_START, "opening brackets must retain their kind")?;
-    ensure_single_kind("]", SyntaxKind::BRACKET_END, "closing brackets must retain their kind")?;
-    ensure_single_kind("{", SyntaxKind::BRACE_START, "opening braces must retain their kind")?;
-    ensure_single_kind("}", SyntaxKind::BRACE_END, "closing braces must retain their kind")?;
-
-    ensure(
-      kinds("key = [true, \"\u{503c}\"] # comment\r\n")
-        == [
-          SyntaxKind::IDENT,
-          SyntaxKind::WHITESPACE,
-          SyntaxKind::EQ,
-          SyntaxKind::WHITESPACE,
-          SyntaxKind::BRACKET_START,
-          SyntaxKind::BOOL,
-          SyntaxKind::COMMA,
-          SyntaxKind::WHITESPACE,
-          SyntaxKind::STRING,
-          SyntaxKind::BRACKET_END,
-          SyntaxKind::WHITESPACE,
-          SyntaxKind::COMMENT,
-          SyntaxKind::NEWLINE,
-        ],
-      "mixed Unicode TOML must preserve every token boundary and CRLF ending",
+  fn private_lexer_maps_every_token_class() -> Result<(), impl Debug> {
+    let isolated = [
+      ensure_single_kind(" \t", SyntaxKind::WHITESPACE, "horizontal whitespace must remain one token"),
+      ensure_single_kind("\r\n\n", SyntaxKind::NEWLINE, "CRLF and LF runs must remain newline tokens"),
+      ensure_single_kind("# comment", SyntaxKind::COMMENT, "comments must extend through line content"),
+      ensure_single_kind("bare-key", SyntaxKind::IDENT, "bare keys must remain identifiers"),
+      ensure_single_kind(
+        "*?key",
+        SyntaxKind::IDENT_WITH_GLOB,
+        "glob key segments must retain their query kind",
+      ),
+      ensure_single_kind(".", SyntaxKind::PERIOD, "period punctuation must retain its kind"),
+      ensure_single_kind(",", SyntaxKind::COMMA, "comma punctuation must retain its kind"),
+      ensure_single_kind("=", SyntaxKind::EQ, "equals punctuation must retain its kind"),
+      ensure_single_kind("\"value\"", SyntaxKind::STRING, "basic strings must retain their kind"),
+      ensure_single_kind(
+        "\"\"\"value\"\"\"",
+        SyntaxKind::MULTI_LINE_STRING,
+        "multiline basic strings must retain their kind",
+      ),
+      ensure_single_kind("'value'", SyntaxKind::STRING_LITERAL, "literal strings must retain their kind"),
+      ensure_single_kind(
+        "'''value'''",
+        SyntaxKind::MULTI_LINE_STRING_LITERAL,
+        "multiline literal strings must retain their kind",
+      ),
+      ensure_single_kind("+12_345", SyntaxKind::INTEGER, "decimal integers must retain their kind"),
+      ensure_single_kind("0xCA_FE", SyntaxKind::INTEGER_HEX, "hexadecimal integers must retain their kind"),
+      ensure_single_kind("0o7_55", SyntaxKind::INTEGER_OCT, "octal integers must retain their kind"),
+      ensure_single_kind("0b10_01", SyntaxKind::INTEGER_BIN, "binary integers must retain their kind"),
+      ensure_single_kind("-1.25e+3", SyntaxKind::FLOAT, "finite floats must retain their kind"),
+      ensure_single_kind("inf", SyntaxKind::FLOAT, "special floats must retain their kind"),
+      ensure_single_kind("false", SyntaxKind::BOOL, "Booleans must retain their kind"),
+      ensure_single_kind(
+        "1979-05-27T07:32:00Z",
+        SyntaxKind::DATE_TIME_OFFSET,
+        "offset date-times must retain their kind",
+      ),
+      ensure_single_kind(
+        "1979-05-27 07:32:00",
+        SyntaxKind::DATE_TIME_LOCAL,
+        "local date-times must retain their kind",
+      ),
+      ensure_single_kind("1979-05-27", SyntaxKind::DATE, "local dates must retain their kind"),
+      ensure_single_kind("07:32:00.5", SyntaxKind::TIME, "local times must retain their kind"),
+      ensure_single_kind("[", SyntaxKind::BRACKET_START, "opening brackets must retain their kind"),
+      ensure_single_kind("]", SyntaxKind::BRACKET_END, "closing brackets must retain their kind"),
+      ensure_single_kind("{", SyntaxKind::BRACE_START, "opening braces must retain their kind"),
+      ensure_single_kind("}", SyntaxKind::BRACE_END, "closing braces must retain their kind"),
+    ];
+    let mixed = kinds("key = [true, \"\u{503c}\"] # comment\r\n");
+    ensure_that(
+      (isolated, mixed),
+      "isolated classes and mixed Unicode token boundaries must retain their public kinds",
+      |observed| {
+        observed.0.iter().all(Result::is_ok)
+          && observed.1
+            == [
+              SyntaxKind::IDENT,
+              SyntaxKind::WHITESPACE,
+              SyntaxKind::EQ,
+              SyntaxKind::WHITESPACE,
+              SyntaxKind::BRACKET_START,
+              SyntaxKind::BOOL,
+              SyntaxKind::COMMA,
+              SyntaxKind::WHITESPACE,
+              SyntaxKind::STRING,
+              SyntaxKind::BRACKET_END,
+              SyntaxKind::WHITESPACE,
+              SyntaxKind::COMMENT,
+              SyntaxKind::NEWLINE,
+            ]
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Distinguish escaped quotes from valid multiline basic-string terminators.
   #[test]
-  fn multiline_basic_strings_respect_escape_parity() -> Result<(), TestFailure> {
-    ensure_single_kind(
-      "\"\"\"value\\\\\"\"\"",
-      SyntaxKind::MULTI_LINE_STRING,
-      "an even backslash run must not escape the multiline terminator",
-    )?;
-    ensure(
-      kinds("\"\"\"value\\\"\"\"").contains(&SyntaxKind::ERROR),
-      "an odd backslash run must escape one quote and leave the source unterminated",
-    )?;
-    ensure_single_kind(
-      "\"\"\"prefix\"\"\\\\\"suffix\"\"\"",
-      SyntaxKind::MULTI_LINE_STRING,
-      "backslashes must break a preceding quote run before a later terminator",
+  fn multiline_basic_strings_respect_escape_parity() -> Result<(), impl Debug> {
+    ensure_that(
+      [
+        kinds("\"\"\"value\\\\\"\"\""),
+        kinds("\"\"\"value\\\"\"\""),
+        kinds("\"\"\"prefix\"\"\\\\\"suffix\"\"\""),
+      ],
+      "multiline terminators must distinguish even and odd backslash runs",
+      |observed| {
+        let [ref even, ref odd, ref broken] = *observed;
+        *even == [SyntaxKind::MULTI_LINE_STRING] && odd.contains(&SyntaxKind::ERROR) && *broken == [SyntaxKind::MULTI_LINE_STRING]
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Accept legal content-quote runs and reject six-quote multiline terminators.
   #[test]
-  fn multiline_quote_runs_accept_only_toml_terminators() -> Result<(), TestFailure> {
-    ensure_single_kind(
-      "\"\"\"value\"\"\"\"\"",
-      SyntaxKind::MULTI_LINE_STRING,
-      "multiline basic strings may end with two content quotes before the terminator",
-    )?;
-    ensure_single_kind(
-      "'''value'''''",
-      SyntaxKind::MULTI_LINE_STRING_LITERAL,
-      "multiline literal strings may end with two content quotes before the terminator",
-    )?;
-    ensure(
-      kinds("\"\"\"value\"\"\"\"\"\"").contains(&SyntaxKind::ERROR),
-      "a six-quote multiline basic closing run must be rejected",
-    )?;
-    ensure(
-      kinds("\"\"\"value\"\"\"\"\"\"tail").contains(&SyntaxKind::ERROR),
-      "content after a six-quote multiline basic run must not turn the invalid run into a terminator",
-    )?;
-    ensure(
-      kinds("'''value''''''").contains(&SyntaxKind::ERROR),
-      "a six-quote multiline literal closing run must be rejected",
+  fn multiline_quote_runs_accept_only_toml_terminators() -> Result<(), impl Debug> {
+    ensure_that(
+      [
+        kinds("\"\"\"value\"\"\"\"\""),
+        kinds("'''value'''''"),
+        kinds("\"\"\"value\"\"\"\"\"\""),
+        kinds("\"\"\"value\"\"\"\"\"\"tail"),
+        kinds("'''value''''''"),
+      ],
+      "legal content quotes must remain strings while six-quote closing runs must be rejected",
+      |observed| {
+        let [ref basic, ref literal, ref too_many, ref followed, ref literal_many] = *observed;
+        *basic == [SyntaxKind::MULTI_LINE_STRING]
+          && *literal == [SyntaxKind::MULTI_LINE_STRING_LITERAL]
+          && [too_many, followed, literal_many]
+            .into_iter()
+            .all(|tokens| tokens.contains(&SyntaxKind::ERROR))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Produce error tokens for unterminated strings and unrecognized source bytes.
   #[test]
-  fn lexer_reports_unterminated_and_unrecognized_input() -> Result<(), TestFailure> {
-    let unterminated = kinds("value = \"unterminated\\");
-    ensure(
-      unterminated.contains(&SyntaxKind::ERROR),
-      "an unterminated escaped string must retain an error token",
-    )?;
-    ensure(
-      kinds("value = 'unterminated").contains(&SyntaxKind::ERROR),
-      "an unterminated literal string must retain an error token",
-    )?;
-    ensure(
-      kinds("value = \"\"\"unterminated").contains(&SyntaxKind::ERROR),
-      "an unterminated multiline basic string must retain an error token",
-    )?;
-    ensure(
-      kinds("value = '''unterminated").contains(&SyntaxKind::ERROR),
-      "an unterminated multiline literal string must retain an error token",
-    )?;
-    ensure(
-      kinds("value = @")
-        == [
-          SyntaxKind::IDENT,
-          SyntaxKind::WHITESPACE,
-          SyntaxKind::EQ,
-          SyntaxKind::WHITESPACE,
-          SyntaxKind::ERROR,
-        ],
-      "an unrecognized byte must map to the public error kind",
+  fn lexer_reports_unterminated_and_unrecognized_input() -> Result<(), impl Debug> {
+    let unterminated = [
+      "value = \"unterminated\\", "value = 'unterminated", "value = \"\"\"unterminated", "value = '''unterminated",
+    ]
+    .map(kinds);
+    let unrecognized = kinds("value = @");
+    ensure_that(
+      (unterminated, unrecognized),
+      "unterminated strings and unrecognized bytes must retain error tokens",
+      |observed| {
+        observed.0.iter().all(|tokens| tokens.contains(&SyntaxKind::ERROR))
+          && observed.1
+            == [
+              SyntaxKind::IDENT,
+              SyntaxKind::WHITESPACE,
+              SyntaxKind::EQ,
+              SyntaxKind::WHITESPACE,
+              SyntaxKind::ERROR,
+            ]
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

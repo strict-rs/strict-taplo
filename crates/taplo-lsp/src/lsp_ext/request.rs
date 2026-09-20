@@ -169,12 +169,10 @@ impl Request for AssociatedSchemaRequest {
 
 #[cfg(test)]
 mod tests {
+  use std::fmt::Debug;
+
   use lsp_types::Position;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_eq;
-  use strict_test_support::ensure_ok;
-  use strict_test_support::ensure_some;
+  use strict_test_support::ensure_that;
 
   use super::ModernDocumentSymbol;
   use super::Range;
@@ -182,7 +180,7 @@ mod tests {
   use super::SymbolTag;
 
   #[test]
-  fn modern_document_symbol_serializes_without_the_deprecated_field() -> Result<(), TestFailure> {
+  fn modern_document_symbol_serializes_without_the_deprecated_field() -> Result<(), impl Debug> {
     let child_range = Range::new(Position::new(1, 2), Position::new(1, 5));
     let symbol = ModernDocumentSymbol {
       name:            "root".into(),
@@ -202,25 +200,19 @@ mod tests {
       }]),
     };
 
-    let serialized = ensure_ok(serde_json::to_value(symbol), "the modern document-symbol DTO must serialize")?;
-    ensure(
-      serialized.get("deprecated").is_none(),
-      "the owned DTO must omit the deprecated LSP field",
-    )?;
-    let tags = ensure_some(serialized.get("tags"), "modern symbol tags must be present")?;
-    ensure_eq(
-      tags,
-      &serde_json::json!([1]),
-      "modern symbol tags must use the standard numeric wire shape",
-    )?;
-    let selection_line = ensure_some(
-      serialized.pointer("/children/0/selectionRange/start/line"),
-      "the nested selection-range start line must be present",
-    )?;
-    ensure_eq(
-      selection_line,
-      &serde_json::json!(1),
-      "nested symbols must retain the standard camel-case LSP range shape",
+    let serialized = serde_json::to_value(&symbol);
+    ensure_that(
+      (symbol, serialized),
+      "modern symbols must serialize tags and nested camel-case ranges while omitting the deprecated field",
+      |observed| {
+        observed.1.as_ref().is_ok_and(|value| {
+          value.get("deprecated").is_none()
+            && value.get("tags") == Some(&serde_json::json!([1]))
+            && value.pointer("/children/0/selectionRange/start/line") == Some(&serde_json::json!(1))
+        })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

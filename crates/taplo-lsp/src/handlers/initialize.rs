@@ -53,6 +53,7 @@ pub(super) enum InitializationError {
 }
 
 /// Successful initialization plus output deferred until after the response is written.
+#[derive(Debug)]
 pub(super) struct InitializationEffects {
   /// Standard LSP initialization response.
   pub(super) result:       InitializeResult,
@@ -113,6 +114,7 @@ define_lsp_execution_families!(
 );
 
 /// Validated initialization inputs independent of execution model.
+#[derive(Debug)]
 struct PreparedInitialization {
   /// Initialization configuration.
   init_config:     Arc<InitConfig>,
@@ -198,6 +200,7 @@ fn initialization_result() -> InitializeResult {
 
 #[cfg(test)]
 mod tests {
+  use std::fmt::Debug;
   use std::path::Path;
 
   use lsp_types::InitializeParams;
@@ -205,127 +208,105 @@ mod tests {
   use lsp_types::TextDocumentSyncCapability;
   use lsp_types::TextDocumentSyncKind;
   use serde_json::json;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
+  use strict_test_support::ResultFailure;
   use strict_test_support::ensure_ok;
+  use strict_test_support::ensure_that;
 
   use super::InitializationError;
   use super::initialization_result;
   use super::prepare_initialization;
 
   /// Decode initialization parameters through their real wire representation.
-  fn parameters(value: serde_json::Value) -> Result<InitializeParams, TestFailure> {
+  fn parameters(value: serde_json::Value) -> Result<InitializeParams, ResultFailure<serde_json::Error>> {
     ensure_ok(serde_json::from_value(value), "the initialization parameter fixture must decode")
   }
 
   #[test]
-  fn initialization_preparation_preserves_options_and_workspace_order() -> Result<(), TestFailure> {
-    let prepared = ensure_ok(
-      prepare_initialization(parameters(json!({
-        "processId": null,
-        "capabilities": {},
-        "initializationOptions": {
-          "cachePath": "/workspace/cache",
-          "configurationSection": "taplo"
-        },
-        "workspaceFolders": [
-          {"uri": "file:///workspace/first", "name": "first"},
-          {"uri": "file:///workspace/second", "name": "second"}
-        ]
-      }))?),
-      "valid initialization options and folders must prepare",
-    )?;
-    let workspace_roots = prepared.workspace_roots.iter().map(url::Url::as_str).collect::<Vec<_>>();
-    ensure(
-      (
-        prepared.init_config.cache_path.as_deref(),
-        prepared.init_config.configuration_section.as_str(),
-        workspace_roots,
-      ) == (Some(Path::new("/workspace/cache")), "taplo", vec![
-        "file:///workspace/first", "file:///workspace/second",
-      ]),
-      "initialization preparation must preserve host options and client workspace order",
-    )?;
-
-    let defaults = ensure_ok(
-      prepare_initialization(parameters(json!({
-        "processId": null,
-        "capabilities": {}
-      }))?),
-      "omitted initialization options and folders must use defaults",
-    )?;
-    ensure(
-      (
-        defaults.init_config.cache_path.as_ref(),
-        defaults.init_config.configuration_section.as_str(),
-        defaults.workspace_roots.is_empty(),
-      ) == (None, "evenBetterToml", true),
-      "omitted initialization values must retain the public defaults",
+  fn initialization_preparation_preserves_options_and_workspace_order() -> Result<(), impl Debug> {
+    let explicit = parameters(json!({
+      "processId": null, "capabilities": {},
+      "initializationOptions": { "cachePath": "/workspace/cache", "configurationSection": "taplo" },
+      "workspaceFolders": [
+        {"uri": "file:///workspace/first", "name": "first"},
+        {"uri": "file:///workspace/second", "name": "second"}
+      ]
+    }))
+    .map(prepare_initialization);
+    let defaults = parameters(json!({ "processId": null, "capabilities": {} })).map(prepare_initialization);
+    ensure_that(
+      (explicit, defaults),
+      "initialization must preserve explicit host options and workspace order or the complete public defaults",
+      |observed| {
+        observed
+          .0
+          .as_ref()
+          .ok()
+          .and_then(|result| result.as_ref().ok())
+          .is_some_and(|prepared| {
+            prepared.init_config.cache_path.as_deref() == Some(Path::new("/workspace/cache"))
+              && prepared.init_config.configuration_section == "taplo"
+              && prepared.workspace_roots.iter().map(url::Url::as_str).collect::<Vec<_>>()
+                == ["file:///workspace/first", "file:///workspace/second"]
+          })
+          && observed
+            .1
+            .as_ref()
+            .ok()
+            .and_then(|result| result.as_ref().ok())
+            .is_some_and(|prepared| {
+              prepared.init_config.cache_path.is_none()
+                && prepared.init_config.configuration_section == "evenBetterToml"
+                && prepared.workspace_roots.is_empty()
+            })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn initialization_preparation_rejects_invalid_options_and_relative_workspace_uris() -> Result<(), TestFailure> {
-    ensure(
-      matches!(
-        prepare_initialization(parameters(json!({
-          "processId": null,
-          "capabilities": {},
-          "initializationOptions": 7
-        }))?),
-        Err(InitializationError::Options { .. })
-      ),
-      "non-object initialization options must retain their typed decode source",
-    )?;
-    ensure(
-      matches!(
-        prepare_initialization(parameters(json!({
-          "processId": null,
-          "capabilities": {},
-          "workspaceFolders": [
-            {"uri": "workspace/relative", "name": "relative"}
-          ]
-        }))?),
-        Err(InitializationError::UnsupportedWorkspaceUri { .. })
-      ),
-      "a relative workspace URI reference must be rejected before world initialization",
+  fn initialization_preparation_rejects_invalid_options_and_relative_workspace_uris() -> Result<(), impl Debug> {
+    let options = parameters(json!({ "processId": null, "capabilities": {}, "initializationOptions": 7 })).map(prepare_initialization);
+    let relative = parameters(json!({
+      "processId": null, "capabilities": {},
+      "workspaceFolders": [{ "uri": "workspace/relative", "name": "relative" }]
+    }))
+    .map(prepare_initialization);
+    ensure_that(
+      (options, relative),
+      "invalid initialization options and relative workspace URIs must retain distinct typed failures before mutation",
+      |observed| {
+        matches!(observed.0, Ok(Err(InitializationError::Options { .. })))
+          && matches!(observed.1, Ok(Err(InitializationError::UnsupportedWorkspaceUri { .. })))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn initialization_capabilities_advertise_the_complete_shared_protocol() -> Result<(), TestFailure> {
-    let result = initialization_result();
-    let server_identity = result
-      .server_info
-      .as_ref()
-      .map(|server| (server.name.as_str(), server.version.as_deref()));
-    ensure(
-      server_identity == Some(("Taplo", Some(env!("CARGO_PKG_VERSION")))),
-      "initialization must identify the Taplo server and current package version",
-    )?;
-    ensure(
-      result.capabilities.text_document_sync == Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
-      "initialization must advertise full document synchronization",
-    )?;
-    let semantic_token_facts = match result.capabilities.semantic_tokens_provider {
-      Some(SemanticTokensServerCapabilities::SemanticTokensOptions(ref options)) => Some((
-        options.legend.token_modifiers.len(),
-        options.legend.token_types.len(),
-        options.range,
-      )),
-      Some(SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(_)) | None => None,
-    };
-    ensure(
-      semantic_token_facts == Some((0, 2, Some(false))),
-      "initialization must advertise exactly the implemented semantic token types without ghost modifiers",
-    )?;
-    ensure(
-      result
-        .capabilities
-        .workspace
-        .and_then(|workspace| workspace.workspace_folders)
-        .is_some_and(|folders| folders.supported == Some(true)),
-      "initialization must advertise dynamic workspace-folder support",
+  fn initialization_capabilities_advertise_the_complete_shared_protocol() -> Result<(), impl Debug> {
+    ensure_that(
+      initialization_result(),
+      "initialization must advertise Taplo identity, full sync, the implemented token legend and dynamic workspace folders",
+      |result| {
+        result
+          .server_info
+          .as_ref()
+          .is_some_and(|server| server.name == "Taplo" && server.version.as_deref() == Some(env!("CARGO_PKG_VERSION")))
+          && result.capabilities.text_document_sync == Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL))
+          && matches!(result.capabilities.semantic_tokens_provider,
+          Some(SemanticTokensServerCapabilities::SemanticTokensOptions(ref options))
+            if options.legend.token_modifiers.is_empty() && options.legend.token_types.len() == 2 && options.range == Some(false))
+          && result
+            .capabilities
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.workspace_folders.as_ref())
+            .is_some_and(|folders| folders.supported == Some(true))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

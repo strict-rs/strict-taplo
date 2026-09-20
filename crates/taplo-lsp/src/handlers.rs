@@ -223,27 +223,55 @@ mod test_support {
   use serde::de::DeserializeOwned;
   use serde_json::Value;
   use serde_json::json;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
+  use strict_test_support::ResultFailure;
   use strict_test_support::ensure_ok;
-  use strict_test_support::ensure_some;
+  use taplo::dom::error::QueryError;
   use taplo_common::schema::associations::AssociationRule;
   use taplo_common::schema::associations::SchemaAssociation;
   use taplo_common::schema::associations::priority;
   use taplo_common::schema::associations::source;
   use taplo_common::schema::transport::SchemaTransport;
+  use taplo_common::schema::transport::TransportError;
   use taplo_common::schema::transport::local_http_client;
+  use taplo_lsp_async::util::MappingError;
+  use thiserror::Error;
   use url::Url;
 
-  use crate::LocalTestFuture;
+  use crate::LocalFuture;
   #[cfg(not(target_arch = "wasm32"))]
   use crate::world::ConcurrentWorld;
   use crate::world::DocumentSnapshot;
   use crate::world::DocumentState;
+  use crate::world::DocumentUpdate;
   use crate::world::LocalWorld;
   use crate::world::TestEnvironment;
+  use crate::world::WorldError;
+
+  /// Native failures while constructing handler fixtures.
+  #[derive(Debug, Error)]
+  pub(super) enum FixtureFailure {
+    /// HTTP capability construction failed.
+    #[error(transparent)]
+    Http(#[from] Box<ResultFailure<TransportError>>),
+    /// World or document fixture construction failed.
+    #[error(transparent)]
+    World(#[from] Box<ResultFailure<WorldError>>),
+    /// A fixture URL was invalid.
+    #[error(transparent)]
+    Url(#[from] ResultFailure<url::ParseError>),
+    /// A protocol fixture could not be decoded.
+    #[error(transparent)]
+    Json(#[from] ResultFailure<serde_json::Error>),
+    /// Coordinate fixture construction failed.
+    #[error(transparent)]
+    Mapping(#[from] ResultFailure<MappingError>),
+    /// A semantic fixture path could not be decoded.
+    #[error(transparent)]
+    Query(#[from] ResultFailure<QueryError>),
+  }
 
   /// Canonical document and schema URLs for one schema-backed handler scenario.
+  #[derive(Debug)]
   pub(super) struct SchemaFixture {
     /// Document URL presented through the protocol.
     pub(super) document:   Url,
@@ -251,27 +279,34 @@ mod test_support {
     pub(super) schema_url: Url,
   }
 
+  /// Native source replacement outcome including every emitted document effect.
+  pub(super) type DocumentInstallation = Result<DocumentUpdate, Box<ResultFailure<WorldError>>>;
+
   /// Construct one fresh detached local world through the production crate façade.
-  pub(super) fn local_world() -> Result<LocalWorld<TestEnvironment>, TestFailure> {
-    let http = ensure_ok(local_http_client(), "the local handler-fixture HTTP client must construct")?;
+  pub(super) fn local_world() -> Result<LocalWorld<TestEnvironment>, FixtureFailure> {
+    let http = ensure_ok(local_http_client(), "the local handler-fixture HTTP client must construct").map_err(Box::new)?;
     ensure_ok(
       crate::create_local_world(TestEnvironment::default(), http),
       "the local handler-fixture world must construct",
     )
+    .map_err(Box::new)
+    .map_err(FixtureFailure::from)
   }
 
   /// Construct one fresh detached concurrent world through the production crate façade.
   #[cfg(not(target_arch = "wasm32"))]
-  pub(super) fn concurrent_world() -> Result<ConcurrentWorld<TestEnvironment>, TestFailure> {
-    let http = ensure_ok(local_http_client(), "the concurrent handler-fixture HTTP client must construct")?;
+  pub(super) fn concurrent_world() -> Result<ConcurrentWorld<TestEnvironment>, FixtureFailure> {
+    let http = ensure_ok(local_http_client(), "the concurrent handler-fixture HTTP client must construct").map_err(Box::new)?;
     ensure_ok(
       crate::create_concurrent_world(TestEnvironment::default(), http),
       "the concurrent handler-fixture world must construct",
     )
+    .map_err(Box::new)
+    .map_err(FixtureFailure::from)
   }
 
   /// Parse one absolute handler-fixture URL with a behavior-specific failure context.
-  pub(super) fn url(input: &str, context: &'static str) -> Result<Url, TestFailure> {
+  pub(super) fn url(input: &str, context: &'static str) -> Result<Url, ResultFailure<url::ParseError>> {
     ensure_ok(Url::parse(input), context)
   }
 
@@ -281,7 +316,7 @@ mod test_support {
     schema_url: &str,
     document_context: &'static str,
     schema_context: &'static str,
-  ) -> Result<SchemaFixture, TestFailure> {
+  ) -> Result<SchemaFixture, ResultFailure<url::ParseError>> {
     Ok(SchemaFixture {
       document:   url(document, document_context)?,
       schema_url: url(schema_url, schema_context)?,
@@ -295,7 +330,7 @@ mod test_support {
     character: u32,
     new_name: Option<&str>,
     context: &'static str,
-  ) -> Result<P, TestFailure> {
+  ) -> Result<P, ResultFailure<serde_json::Error>> {
     let mut request = serde_json::Map::new();
     drop(request.insert(
       "textDocument".into(),
@@ -322,7 +357,7 @@ mod test_support {
     line: u32,
     character: u32,
     context: &'static str,
-  ) -> Result<P, TestFailure> {
+  ) -> Result<P, ResultFailure<serde_json::Error>> {
     positioned_params(document, line, character, None, context)
   }
 
@@ -338,7 +373,7 @@ mod test_support {
     character: u32,
     new_name: &str,
     context: &'static str,
-  ) -> Result<P, TestFailure> {
+  ) -> Result<P, ResultFailure<serde_json::Error>> {
     positioned_params(document, line, character, Some(new_name), context)
   }
 
@@ -348,11 +383,8 @@ mod test_support {
     document: &'operation Url,
     source: &'operation str,
     context: &'static str,
-  ) -> LocalTestFuture<'operation, ()> {
-    Box::pin(async move {
-      drop(ensure_ok(world.replace_document(document, source).await, context)?);
-      Ok(())
-    })
+  ) -> LocalFuture<'operation, DocumentInstallation> {
+    Box::pin(async move { ensure_ok(world.replace_document(document, source).await, context).map_err(Box::new) })
   }
 
   /// Install one source revision in a concurrent handler world.
@@ -362,14 +394,13 @@ mod test_support {
     document: &Url,
     source: &str,
     context: &'static str,
-  ) -> Result<(), TestFailure> {
-    drop(ensure_ok(world.replace_document_concurrent(document, source).await, context)?);
-    Ok(())
+  ) -> DocumentInstallation {
+    ensure_ok(world.replace_document_concurrent(document, source).await, context).map_err(Box::new)
   }
 
   /// Parse one immutable document fixture through the production document boundary.
-  pub(super) fn parse_document(source: &str, context: &'static str) -> Result<DocumentState, TestFailure> {
-    ensure_ok(DocumentState::parse(source), context)
+  pub(super) fn parse_document(source: &str, context: &'static str) -> Result<DocumentState, Box<ResultFailure<WorldError>>> {
+    ensure_ok(DocumentState::parse(source), context).map_err(Box::new)
   }
 
   /// Install one exact manual association and its complete in-memory schema.
@@ -390,24 +421,25 @@ mod test_support {
     snapshot.schemas.add_schema(schema_url, Arc::new(schema));
   }
 
+  /// Complete document replacement and schema-bearing snapshot retained by a fixture.
+  pub(super) type SchemaInstallation<T> = (DocumentInstallation, Option<DocumentSnapshot<T>>);
+
   /// Commit one source replacement, then install its schema into the resulting snapshot.
   pub(super) async fn install_schema_document<T: SchemaTransport>(
-    replacement: impl Future<Output = Result<(), TestFailure>>,
+    pending_replacement: impl Future<Output = DocumentInstallation>,
     pending_snapshot: impl Future<Output = Option<DocumentSnapshot<T>>>,
     document: &Url,
     schema_url: &Url,
     schema: Value,
-    snapshot_context: &'static str,
-  ) -> Result<(), TestFailure> {
-    replacement.await?;
-    let snapshot = ensure_some(pending_snapshot.await, snapshot_context)?;
-    install_schema(&snapshot, document, schema_url, schema);
-    Ok(())
-  }
-
-  /// Require one committed handler transition to emit no schema or diagnostic effects.
-  pub(super) fn ensure_no_client_effects<A, D>(associations: &[A], diagnostics: &[D], context: &'static str) -> Result<(), TestFailure> {
-    ensure((associations.len(), diagnostics.len()) == (0, 0), context)
+  ) -> SchemaInstallation<T> {
+    let replacement = pending_replacement.await;
+    let snapshot = pending_snapshot.await;
+    if replacement.is_ok()
+      && let Some(ref current) = snapshot
+    {
+      install_schema(current, document, schema_url, schema);
+    }
+    (replacement, snapshot)
   }
 }
 
@@ -521,7 +553,7 @@ pub fn create_concurrent_server<E: ConcurrentEnvironment>() -> ConcurrentServer<
 
 #[cfg(test)]
 mod tests {
-  use std::future::Future;
+  use std::fmt::Debug;
   use std::str::FromStr as _;
 
   use futures::executor::block_on;
@@ -534,13 +566,9 @@ mod tests {
   use lsp_types::Uri;
   use serde::de::DeserializeOwned;
   use serde_json::json;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_eq;
+  use strict_test_support::ResultFailure;
   use strict_test_support::ensure_ok;
-  use strict_test_support::ensure_some;
-  use taplo_common::schema::transport::LocalSchemaTransport;
-  use taplo_common::schema::transport::local_http_client;
+  use strict_test_support::ensure_that;
   use taplo_lsp_async::Params;
   use taplo_lsp_async::rpc::RpcError;
   use url::Url;
@@ -554,21 +582,23 @@ mod tests {
   use super::semantic_tokens::semantic_tokens_concurrent;
   use super::semantic_tokens::semantic_tokens_local;
   use super::uri;
-  use crate::LocalTestFuture;
+  use crate::LocalFuture;
+  use crate::handlers::test_support::DocumentInstallation;
+  use crate::handlers::test_support::FixtureFailure;
   use crate::handlers::test_support::concurrent_world;
-  use crate::handlers::test_support::local_world as handler_local_world;
+  use crate::handlers::test_support::local_world;
   use crate::handlers::test_support::replace_concurrent_document;
   use crate::handlers::test_support::replace_local_document;
   use crate::handlers::test_support::url as fixture_url;
   use crate::world::ConcurrentWorld;
   use crate::world::LocalWorld;
   use crate::world::TestEnvironment;
-  use crate::world::WorldState;
 
   /// Source shared by the direct document-projection handler scenarios.
   const PROJECTION_SOURCE: &str = "# first\n# second\nitems = [\n  1,\n  2,\n]\ninline = { nested = true }\n[table]\nvalue = 1\n";
 
-  /// Open local and concurrent worlds for one document-projection scenario.
+  /// Open local and concurrent worlds and their native document-installation outcomes.
+  #[derive(Debug)]
   struct ProjectionFixture {
     /// Canonical document URL installed in both worlds.
     document:   Url,
@@ -576,64 +606,17 @@ mod tests {
     local:      LocalWorld<TestEnvironment>,
     /// Cross-thread world holding the same source.
     concurrent: ConcurrentWorld<TestEnvironment>,
-  }
-
-  /// Resolve one document projection through both generated handler families.
-  async fn projection_pair<R>(
-    pending_local: impl Future<Output = Result<Option<R>, RpcError>>,
-    pending_concurrent: impl Future<Output = Result<Option<R>, RpcError>>,
-    local_execution: &'static str,
-    local_presence: &'static str,
-    concurrent_execution: &'static str,
-    concurrent_presence: &'static str,
-  ) -> Result<(R, R), TestFailure> {
-    let local = ensure_some(ensure_ok(pending_local.await, local_execution)?, local_presence)?;
-    let concurrent = ensure_some(ensure_ok(pending_concurrent.await, concurrent_execution)?, concurrent_presence)?;
-    Ok((local, concurrent))
-  }
-
-  /// Execute a complete set of document projections through both generated families.
-  macro_rules! projection_pairs {
-    ($fixture:ident; $(($params:ty, $local:path, $concurrent:path, $local_execution:literal, $local_presence:literal, $concurrent_execution:literal, $concurrent_presence:literal)),+ $(,)?) => {
-      (
-        $(
-          projection_pair(
-            $local(
-              &$fixture.local,
-              Params::from(Some(document_params::<$params>(&$fixture.document)?)),
-            ),
-            $concurrent(
-              &$fixture.concurrent,
-              Params::from(Some(document_params::<$params>(&$fixture.document)?)),
-            ),
-            $local_execution,
-            $local_presence,
-            $concurrent_execution,
-            $concurrent_presence,
-          ).await?
-        ),+
-      )
-    };
+    /// Complete local and concurrent document installation outcomes.
+    installed:  [DocumentInstallation; 2],
   }
 
   /// Parse one handler fixture URL.
-  fn document_url() -> Result<Url, TestFailure> {
+  fn document_url() -> Result<Url, ResultFailure<url::ParseError>> {
     fixture_url("file:///workspace/document.toml", "the handler fixture URL must parse")
   }
 
-  /// Construct one local handler world whose HTTP capability is not exercised.
-  fn local_world() -> Result<WorldState<TestEnvironment, LocalSchemaTransport<TestEnvironment>>, TestFailure> {
-    let environment = TestEnvironment::default();
-    let client = ensure_ok(local_http_client(), "the local schema client must construct")?;
-    let transport = LocalSchemaTransport::new(environment.clone(), client);
-    ensure_ok(
-      WorldState::with_transport(environment, transport),
-      "the local handler world must construct",
-    )
-  }
-
   /// Decode one document-only request through its public wire shape.
-  fn document_params<P: DeserializeOwned>(document: &Url) -> Result<P, TestFailure> {
+  fn document_params<P: DeserializeOwned>(document: &Url) -> Result<P, ResultFailure<serde_json::Error>> {
     ensure_ok(
       serde_json::from_value(json!({
         "textDocument": {
@@ -645,160 +628,170 @@ mod tests {
   }
 
   /// Install the same projection source through both public world execution families.
-  fn projection_fixture() -> LocalTestFuture<'static, ProjectionFixture> {
+  fn projection_fixture() -> LocalFuture<'static, Result<ProjectionFixture, FixtureFailure>> {
     Box::pin(async {
       let document = document_url()?;
-      let local = handler_local_world()?;
-      replace_local_document(&local, &document, PROJECTION_SOURCE, "the local projection document must install").await?;
+      let local = local_world()?;
       let concurrent = concurrent_world()?;
-      replace_concurrent_document(
+      let local_installation =
+        replace_local_document(&local, &document, PROJECTION_SOURCE, "the local projection document must install").await;
+      let concurrent_installation = replace_concurrent_document(
         &concurrent,
         &document,
         PROJECTION_SOURCE,
         "the concurrent projection document must install",
       )
-      .await?;
+      .await;
       Ok(ProjectionFixture {
         document,
         local,
         concurrent,
+        installed: [local_installation, concurrent_installation],
       })
     })
   }
 
   #[test]
-  fn generation_dependent_responses_accept_current_and_reject_stale_snapshots() -> Result<(), TestFailure> {
-    block_on(async {
+  fn generation_dependent_responses_accept_current_and_reject_stale_snapshots() -> Result<(), impl Debug> {
+    let observation = block_on(async {
       let world = local_world()?;
       let document = document_url()?;
-      drop(ensure_ok(
-        world.replace_document(&document, "value = 1\n").await,
-        "the initial handler document must install",
-      )?);
-      let snapshot = ensure_some(
-        world.document_snapshot(&document).await,
-        "the handler document must expose a snapshot",
-      )?;
-      let current = ensure_ok(
-        current_snapshot_response(&world, &document, &snapshot, Some(7_u8)).await,
-        "a response captured from current state must be accepted",
-      )?;
-      let response_payload = ensure_some(current, "snapshot validation must preserve a present response payload")?;
-      ensure_eq(&response_payload, &7_u8, "snapshot validation must preserve the response payload")?;
-
-      drop(ensure_ok(
-        world.replace_document(&document, "value = 2\n").await,
-        "the replacement handler document must install",
-      )?);
-      let stale = current_snapshot_response(&world, &document, &snapshot, Option::<u8>::None).await;
-      let error = ensure_some(
-        stale.err(),
-        "even an empty response must be rejected after its snapshot becomes stale",
-      )?;
-      ensure_eq(
-        &error,
-        &RpcError::content_modified(),
-        "stale handler output must use the standard LSP content-modified error",
-      )
-    })
+      let initial = world.replace_document(&document, "value = 1\n").await;
+      let snapshot = world.document_snapshot(&document).await;
+      let current = if let Some(ref captured) = snapshot {
+        Some(current_snapshot_response(&world, &document, captured, Some(7_u8)).await)
+      } else {
+        None
+      };
+      let replacement = world.replace_document(&document, "value = 2\n").await;
+      let stale = if let Some(ref captured) = snapshot {
+        Some(current_snapshot_response(&world, &document, captured, Option::<u8>::None).await)
+      } else {
+        None
+      };
+      Ok::<_, FixtureFailure>((world, document, initial, snapshot, current, replacement, stale))
+    });
+    ensure_that(
+      observation,
+      "current responses preserve their payload and stale empty responses return content-modified",
+      |subject| {
+        let Ok(ref scenario) = *subject else {
+          return false;
+        };
+        scenario.2.is_ok()
+          && scenario.3.is_some()
+          && scenario.4 == Some(Ok(Some(7_u8)))
+          && scenario.5.is_ok()
+          && scenario.6 == Some(Err(RpcError::content_modified()))
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn document_snapshot_loader_rejects_unresolvable_inputs_and_returns_current_state() -> Result<(), TestFailure> {
-    block_on(async {
+  fn document_snapshot_loader_rejects_unresolvable_inputs_and_returns_current_state() -> Result<(), impl Debug> {
+    let observation = block_on(async {
       let world = local_world()?;
-      let relative = ensure_ok(
-        Uri::from_str("workspace/document.toml"),
-        "the relative handler URI fixture must parse",
-      )?;
-      ensure(
-        document_snapshot_for_uri(&world, &relative).await.is_none(),
-        "a relative wire URI must not resolve to an internal document",
-      )?;
-
+      let relative = Uri::from_str("workspace/document.toml");
+      let relative_lookup = if let Ok(ref wire) = relative {
+        Some(document_snapshot_for_uri(&world, wire).await)
+      } else {
+        None
+      };
       let document = document_url()?;
-      let document_uri = ensure_some(uri::to_uri(&document), "the absolute handler document URL must map to a wire URI")?;
-      ensure(
-        document_snapshot_for_uri(&world, &document_uri).await.is_none(),
-        "an absolute URI without an open document must not fabricate a snapshot",
-      )?;
-
-      drop(ensure_ok(
-        world.replace_document(&document, "value = 1\n").await,
-        "the handler document must install before snapshot loading",
-      )?);
-      let (resolved, snapshot) = ensure_some(
-        document_snapshot_for_uri(&world, &document_uri).await,
-        "an open absolute document must resolve to its immutable snapshot",
-      )?;
-      ensure_eq(&resolved, &document, "snapshot loading must preserve the canonical document URL")?;
-      ensure(
-        snapshot.document.mapper.all_range() == Range::new(Position::new(0, 0), Position::new(1, 0)),
-        "snapshot loading must preserve the complete source coordinate range",
-      )
-    })
+      let document_uri = uri::to_uri(&document);
+      let missing = if let Some(ref wire) = document_uri {
+        Some(document_snapshot_for_uri(&world, wire).await)
+      } else {
+        None
+      };
+      let installed = world.replace_document(&document, "value = 1\n").await;
+      let current = if let Some(ref wire) = document_uri {
+        Some(document_snapshot_for_uri(&world, wire).await)
+      } else {
+        None
+      };
+      Ok::<_, FixtureFailure>((
+        world, relative, relative_lookup, document, document_uri, missing, installed, current,
+      ))
+    });
+    ensure_that(
+      observation,
+      "snapshot lookup rejects relative and unopened URIs while preserving an open document's identity and coordinates",
+      |subject| {
+        let Ok(ref scenario) = *subject else {
+          return false;
+        };
+        scenario.1.is_ok()
+          && matches!(scenario.2, Some(None))
+          && scenario.4.is_some()
+          && matches!(scenario.5, Some(None))
+          && scenario.6.is_ok()
+          && scenario.7.as_ref().and_then(Option::as_ref).is_some_and(|captured| {
+            captured.0 == scenario.3 && captured.1.document.mapper.all_range() == Range::new(Position::new(0, 0), Position::new(1, 0))
+          })
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn document_projection_handlers_match_across_execution_families() -> Result<(), TestFailure> {
-    block_on(async {
+  fn document_projection_handlers_match_across_execution_families() -> Result<(), impl Debug> {
+    let observation = block_on(async {
       let fixture = projection_fixture().await?;
-      let ((local_tokens, concurrent_tokens), (local_symbols, concurrent_symbols), (local_folds, concurrent_folds)) = projection_pairs!(
-        fixture;
-        (
-          SemanticTokensParams,
-          semantic_tokens_local,
-          semantic_tokens_concurrent,
-          "local semantic-token projection must execute",
-          "enabled local semantic tokens must return a concrete response",
-          "concurrent semantic-token projection must execute",
-          "enabled concurrent semantic tokens must return a concrete response"
-        ),
-        (
-          DocumentSymbolParams,
-          document_symbols_local,
-          document_symbols_concurrent,
-          "local document-symbol projection must execute",
-          "an open local document must return a concrete symbol collection",
-          "concurrent document-symbol projection must execute",
-          "an open concurrent document must return a concrete symbol collection"
-        ),
-        (
-          FoldingRangeParams,
-          folding_ranges_local,
-          folding_ranges_concurrent,
-          "local folding-range projection must execute",
-          "an open local document must return a concrete folding-range collection",
-          "concurrent folding-range projection must execute",
-          "an open concurrent document must return a concrete folding-range collection"
-        ),
-      );
-      ensure(
-        local_tokens == concurrent_tokens,
-        "local and concurrent semantic-token projections must be identical",
-      )?;
-      ensure(
-        matches!(
-          &local_tokens,
-          SemanticTokensResult::Tokens(tokens) if tokens.data.len() == 2
-        ),
-        "array and inline-table keys must produce the two advertised custom semantic tokens",
-      )?;
-      ensure(
-        (local_symbols.len(), &concurrent_symbols) == (3, &local_symbols),
-        "local and concurrent symbols must preserve the same three root declarations and nested structure",
-      )?;
-      ensure(
-        local_folds == concurrent_folds && local_folds.len() >= 3,
-        "local and concurrent folding ranges must preserve every multiline comment, array, and table region",
-      )
-    })
+      let tokens = document_params::<SemanticTokensParams>(&fixture.document)?;
+      let symbols = document_params::<DocumentSymbolParams>(&fixture.document)?;
+      let folds = document_params::<FoldingRangeParams>(&fixture.document)?;
+      let local_tokens = semantic_tokens_local(&fixture.local, Params::from(Some(tokens.clone()))).await;
+      let concurrent_tokens = semantic_tokens_concurrent(&fixture.concurrent, Params::from(Some(tokens))).await;
+      let local_symbols = document_symbols_local(&fixture.local, Params::from(Some(symbols.clone()))).await;
+      let concurrent_symbols = document_symbols_concurrent(&fixture.concurrent, Params::from(Some(symbols))).await;
+      let local_folds = folding_ranges_local(&fixture.local, Params::from(Some(folds.clone()))).await;
+      let concurrent_folds = folding_ranges_concurrent(&fixture.concurrent, Params::from(Some(folds))).await;
+      Ok::<_, FixtureFailure>((fixture, [local_tokens, concurrent_tokens], [local_symbols, concurrent_symbols], [
+        local_folds, concurrent_folds,
+      ]))
+    });
+    ensure_that(
+      observation,
+      "local and concurrent projections preserve complete matching tokens, symbols, and folding ranges",
+      |subject| {
+        let Ok(ref scenario) = *subject else {
+          return false;
+        };
+        let [ref local_tokens, ref concurrent_tokens] = scenario.1;
+        let [ref local_symbols, ref concurrent_symbols] = scenario.2;
+        let [ref local_folds, ref concurrent_folds] = scenario.3;
+        scenario.0.installed.iter().all(Result::is_ok)
+          && local_tokens == concurrent_tokens
+          && matches!(local_tokens, Ok(Some(SemanticTokensResult::Tokens(tokens))) if tokens.data.len() == 2)
+          && local_symbols == concurrent_symbols
+          && local_symbols
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .is_some_and(|symbols| symbols.len() == 3)
+          && local_folds == concurrent_folds
+          && local_folds
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .is_some_and(|folds| folds.len() >= 3)
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn document_projection_guards_suppress_disabled_features_and_missing_documents() -> Result<(), TestFailure> {
-    block_on(async {
+  fn document_projection_guards_suppress_disabled_features_and_missing_documents() -> Result<(), impl Debug> {
+    let observation = block_on(async {
       let fixture = projection_fixture().await?;
+      let missing_document = fixture_url("file:///workspace/missing.toml", "the missing projection document URL must parse")?;
+      let tokens = document_params::<SemanticTokensParams>(&fixture.document)?;
+      let symbols = document_params::<DocumentSymbolParams>(&missing_document)?;
       let disabled = json!({
         "schema": {
           "catalogs": []
@@ -807,35 +800,25 @@ mod tests {
           "semanticTokens": false
         }
       });
-      drop(ensure_ok(
-        fixture.local.apply_configuration_values_local(Some(&disabled), &[]).await,
-        "the semantic-token-disabled configuration must commit",
-      )?);
-      ensure(
-        ensure_ok(
-          semantic_tokens_local(
-            &fixture.local,
-            Params::from(Some(document_params::<SemanticTokensParams>(&fixture.document)?)),
-          )
-          .await,
-          "disabled semantic-token projection must remain an absent success",
-        )?
-        .is_none(),
-        "the semantic-token feature guard must suppress protocol output when disabled",
-      )?;
-      let missing_document = fixture_url("file:///workspace/missing.toml", "the missing projection document URL must parse")?;
-      ensure(
-        ensure_ok(
-          document_symbols_local(
-            &fixture.local,
-            Params::from(Some(document_params::<DocumentSymbolParams>(&missing_document)?)),
-          )
-          .await,
-          "document symbols for an unopened document must remain an absent success",
-        )?
-        .is_none(),
-        "document-symbol projection must not fabricate state for an unopened document",
-      )
-    })
+      let configuration = fixture.local.apply_configuration_values_local(Some(&disabled), &[]).await;
+      let disabled_tokens = semantic_tokens_local(&fixture.local, Params::from(Some(tokens))).await;
+      let missing_symbols = document_symbols_local(&fixture.local, Params::from(Some(symbols))).await;
+      Ok::<_, FixtureFailure>((fixture, disabled, configuration, disabled_tokens, missing_document, missing_symbols))
+    });
+    ensure_that(
+      observation,
+      "disabled semantic tokens and unopened document symbols remain absent successful responses",
+      |subject| {
+        let Ok(ref scenario) = *subject else {
+          return false;
+        };
+        scenario.0.installed.iter().all(Result::is_ok)
+          && scenario.2.is_ok()
+          && matches!(scenario.3, Ok(None))
+          && matches!(scenario.5, Ok(None))
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

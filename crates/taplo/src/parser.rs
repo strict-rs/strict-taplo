@@ -1259,16 +1259,20 @@ impl Parse {
 #[cfg(test)]
 /// Recovery, losslessness, progress, and deep composite parser contracts.
 mod tests {
+  use core::fmt::Debug;
+
   use rowan::TextRange;
   use rowan::TextSize;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
+  use strict_test_support::PredicateFailure;
   use strict_test_support::ensure_eq;
-  use strict_test_support::ensure_ok;
+  use strict_test_support::ensure_that;
 
   use super::Diagnostic;
+  use super::Parse;
+  use super::ParseFailure;
   use super::Parser;
   use super::ParserControl;
+  use super::ParserResult;
   use super::parse;
   use crate::dom::Node;
   use crate::syntax::SyntaxKind;
@@ -1283,180 +1287,166 @@ mod tests {
   use crate::syntax::kind::TIME;
   use crate::syntax::kind::VALUE;
 
-  /// Count diagnostics with one exact message.
-  fn diagnostic_count(source: &str, message: &str) -> Result<usize, TestFailure> {
-    let parsed = ensure_ok(parse(source), "the parser must construct the diagnostic fixture tree")?;
-    Ok(
-      parsed
-        .diagnostics()
-        .iter()
-        .filter(|diagnostic| diagnostic.message() == message)
-        .count(),
-    )
+  /// Complete parse outcomes retained across one parser scenario.
+  type ParsedCases<const N: usize> = [Result<Parse, ParseFailure>; N];
+  /// A parser scenario's native predicate failure.
+  type ParseCheck<const N: usize> = Box<PredicateFailure<ParsedCases<N>>>;
+  /// Source, parse, and frozen DOM retained across deep-tree validation.
+  ///
+  /// The parse precedes the DOM so its green root drops while the arena's
+  /// parent-before-child syntax guards still exist.
+  type DeepParse = (String, Result<(Parse, Node), ParseFailure>);
+  /// Concrete native failure retaining the complete deep-tree observation.
+  type DeepParseFailure = Box<PredicateFailure<DeepParse>>;
+  /// Native recovery results and diagnostics after a repeated failure.
+  type RecoveryProgress = (
+    ParserResult<SyntaxKind>,
+    [ParserResult<()>; 2],
+    Vec<Diagnostic>,
+    ParserResult<SyntaxKind>,
+  );
+
+  /// Count diagnostics without consuming their owning parse.
+  fn diagnostic_count(parsed: &Parse, message: &str) -> usize {
+    parsed
+      .diagnostics()
+      .iter()
+      .filter(|diagnostic| diagnostic.message() == message)
+      .count()
   }
 
-  /// Count syntax nodes and tokens of one kind.
-  fn syntax_kind_count(source: &str, kind: SyntaxKind) -> Result<usize, TestFailure> {
-    let parsed = ensure_ok(parse(source), "the parser must construct the syntax-kind fixture tree")?;
-    Ok(
-      parsed
-        .into_syntax()
-        .descendants_with_tokens()
-        .filter(|element| element.kind() == kind)
-        .count(),
-    )
+  /// Count syntax elements without consuming the complete parsed observation.
+  fn syntax_kind_count(parsed: &Parse, kind: SyntaxKind) -> usize {
+    parsed
+      .clone()
+      .into_syntax()
+      .descendants_with_tokens()
+      .filter(|element| element.kind() == kind)
+      .count()
   }
 
-  /// Verify one missing composite separator while retaining the following item.
+  /// Verify missing-separator recovery while retaining both complete parse outcomes.
   fn ensure_missing_separator_recovery(
     invalid: &str,
     valid: &str,
     diagnostic: &str,
     retained_kind: SyntaxKind,
     retained_count: usize,
-  ) -> Result<(), TestFailure> {
-    ensure_eq(
-      &diagnostic_count(invalid, diagnostic)?,
-      &1,
-      "one missing composite separator must be reported",
-    )?;
-    ensure_eq(
-      &syntax_kind_count(invalid, retained_kind)?,
-      &retained_count,
-      "the containing value and every following composite item must remain parsed",
-    )?;
-    ensure_eq(
-      &diagnostic_count(valid, diagnostic)?,
-      &0,
-      "a valid composite separator must not be diagnosed",
+  ) -> Result<ParsedCases<2>, ParseCheck<2>> {
+    ensure_that(
+      [parse(invalid), parse(valid)],
+      "a missing separator must be diagnosed once without losing its following item",
+      |observed| {
+        let [ref invalid_parse, ref valid_parse] = *observed;
+        invalid_parse
+          .as_ref()
+          .is_ok_and(|parsed| diagnostic_count(parsed, diagnostic) == 1 && syntax_kind_count(parsed, retained_kind) == retained_count)
+          && valid_parse
+            .as_ref()
+            .is_ok_and(|parsed| diagnostic_count(parsed, diagnostic) == 0)
+      },
     )
+    .map_err(Box::new)
   }
 
   /// Preserve both array values while diagnosing a missing separator exactly once.
   #[test]
-  fn missing_array_comma_preserves_following_value() -> Result<(), TestFailure> {
-    ensure_missing_separator_recovery("a = [1 2]", "a = [1, 2]", r#"expected ",""#, VALUE, 3)
+  fn missing_array_comma_preserves_following_value() -> Result<(), ParseCheck<2>> {
+    ensure_missing_separator_recovery("a = [1 2]", "a = [1, 2]", r#"expected ",""#, VALUE, 3).map(drop)
   }
 
   /// Preserve both inline entries while diagnosing a missing separator exactly once.
   #[test]
-  fn missing_inline_table_comma_preserves_following_entry() -> Result<(), TestFailure> {
-    ensure_missing_separator_recovery("a = { b = 1 c = 2 }", "a = { b = 1, c = 2 }", r#"expected "," or "}""#, ENTRY, 3)
+  fn missing_inline_table_comma_preserves_following_entry() -> Result<(), ParseCheck<2>> {
+    ensure_missing_separator_recovery("a = { b = 1 c = 2 }", "a = { b = 1, c = 2 }", r#"expected "," or "}""#, ENTRY, 3).map(drop)
   }
 
   /// Consume only an extra comma and retain the following array value or inline entry.
   #[test]
-  fn consecutive_commas_consume_only_the_offending_delimiter() -> Result<(), TestFailure> {
-    let array = "a = [1,,2]";
-    ensure_eq(
-      &syntax_kind_count(array, ERROR)?,
-      &1,
-      "one consecutive array comma must become one error token",
-    )?;
-    ensure_eq(
-      &syntax_kind_count(array, VALUE)?,
-      &3,
-      "the value following the bad array comma must remain parsed",
-    )?;
-
-    let inline = "a = { b = 1,, c = 2 }";
-    ensure_eq(
-      &syntax_kind_count(inline, ERROR)?,
-      &1,
-      "one consecutive inline-table comma must become one error token",
-    )?;
-    ensure_eq(
-      &syntax_kind_count(inline, ENTRY)?,
-      &3,
-      "the entry following the bad inline-table comma must remain parsed",
+  fn consecutive_commas_consume_only_the_offending_delimiter() -> Result<(), ParseCheck<2>> {
+    ensure_that(
+      [parse("a = [1,,2]"), parse("a = { b = 1,, c = 2 }")],
+      "consecutive commas must consume only the offending delimiter",
+      |observed| {
+        let [ref array, ref inline] = *observed;
+        array
+          .as_ref()
+          .is_ok_and(|parsed| syntax_kind_count(parsed, ERROR) == 1 && syntax_kind_count(parsed, VALUE) == 3)
+          && inline
+            .as_ref()
+            .is_ok_and(|parsed| syntax_kind_count(parsed, ERROR) == 1 && syntax_kind_count(parsed, ENTRY) == 3)
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Preserve structural delimiters and subsequent entries when a value is missing or invalid.
   #[test]
-  fn recovery_boundaries_survive_missing_values() -> Result<(), TestFailure> {
-    let closing_boundary = "a = { b = }\nc = 2";
-    let closing_syntax = ensure_ok(parse(closing_boundary), "the closing-boundary fixture tree must construct")?.into_syntax();
-    ensure(
-      closing_syntax.to_string().contains("}\nc = 2"),
-      "a closing brace and following entry must survive value recovery",
-    )?;
-    ensure_eq(
-      &closing_syntax
-        .descendants_with_tokens()
-        .filter(|element| element.kind() == ERROR)
-        .count(),
-      &0,
-      "a structural recovery boundary must not be rewritten as an error token",
-    )?;
-
-    let invalid_value = "a = nope\nb = 2";
-    ensure_eq(
-      &syntax_kind_count(invalid_value, ERROR)?,
-      &1,
-      "a bare identifier in value position must become an error token",
-    )?;
-    ensure_eq(
-      &syntax_kind_count(invalid_value, ENTRY)?,
-      &2,
-      "a non-boundary invalid value must not consume the following entry",
+  fn recovery_boundaries_survive_missing_values() -> Result<(), ParseCheck<2>> {
+    ensure_that(
+      [parse("a = { b = }\nc = 2"), parse("a = nope\nb = 2")],
+      "value recovery must preserve delimiters and following entries",
+      |observed| {
+        let [ref boundary, ref invalid] = *observed;
+        boundary
+          .as_ref()
+          .is_ok_and(|parsed| parsed.green().to_string().contains("}\nc = 2") && syntax_kind_count(parsed, ERROR) == 0)
+          && invalid
+            .as_ref()
+            .is_ok_and(|parsed| syntax_kind_count(parsed, ERROR) == 1 && syntax_kind_count(parsed, ENTRY) == 2)
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Restore nested recovery-token scopes by length without deleting an outer duplicate.
   #[test]
-  fn nested_recovery_scopes_restore_outer_tokens() -> Result<(), TestFailure> {
+  fn nested_recovery_scopes_restore_outer_tokens() -> Result<(), impl Debug> {
     let mut parser = Parser::new("");
-    parser.with_recovery_tokens(&[COMMA], |outer| -> Result<(), TestFailure> {
-      ensure(outer.is_recovery_token(COMMA), "the outer recovery token must be active")?;
-      outer.with_recovery_tokens(&[COMMA, NEWLINE], |inner| -> Result<(), TestFailure> {
-        ensure(inner.is_recovery_token(COMMA), "a duplicate inner recovery token must be active")?;
-        ensure(inner.is_recovery_token(NEWLINE), "the inner-only recovery token must be active")
-      })?;
-      ensure(
-        outer.is_recovery_token(COMMA),
-        "leaving the inner scope must retain the outer duplicate",
-      )?;
-      ensure(
-        !outer.is_recovery_token(NEWLINE),
-        "leaving the inner scope must remove its unique token",
-      )
-    })?;
-    ensure(
-      !parser.is_recovery_token(COMMA),
-      "leaving the outer scope must restore the empty recovery stack",
+    let before = parser.recovery_tokens.clone();
+    let (outer_before, inner, outer_after) = parser.with_recovery_tokens(&[COMMA], |outer| {
+      let entered = outer.recovery_tokens.clone();
+      let nested = outer.with_recovery_tokens(&[COMMA, NEWLINE], |inner| inner.recovery_tokens.clone());
+      (entered, nested, outer.recovery_tokens.clone())
+    });
+    ensure_eq(
+      [before, outer_before, inner, outer_after, parser.recovery_tokens],
+      [vec![], vec![COMMA], vec![COMMA, COMMA, NEWLINE], vec![COMMA], vec![]],
+      "nested scopes must retain outer duplicates and restore the exact prior recovery stack",
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Force token progress after an identical recoverable failure repeats at one range.
   #[test]
-  fn repeated_same_range_recovery_forces_progress() -> Result<(), TestFailure> {
+  fn repeated_same_range_recovery_forces_progress() -> Result<(), Box<PredicateFailure<RecoveryProgress>>> {
     let mut parser = Parser::new("]");
     parser.builder.start_node(ROOT);
-    let token = parser.get_token().ok();
-    ensure(token == Some(BRACKET_END), "the fixture must lex as a closing delimiter")?;
-
-    parser.with_recovery_tokens(&[BRACKET_END], |scoped| -> Result<(), TestFailure> {
-      ensure(
-        matches!(scoped.error("expected value"), Err(ParserControl::Syntax)),
-        "the first failure must remain recoverable at the active boundary",
-      )?;
-      ensure(
-        matches!(scoped.error("expected value"), Err(ParserControl::Syntax)),
-        "the repeated failure must remain recoverable after forcing progress",
-      )
-    })?;
-
-    ensure_eq(&parser.diagnostics.len(), &1, "the same range and message must be recorded once")?;
-    ensure(
-      parser.get_token().is_err(),
-      "the second same-range failure must consume the boundary and advance",
+    let token = parser.get_token();
+    let failures = parser.with_recovery_tokens(&[BRACKET_END], |scoped| {
+      [scoped.error("expected value"), scoped.error("expected value")]
+    });
+    let next = parser.get_token();
+    ensure_that(
+      (token, failures, parser.diagnostics, next),
+      "a repeated recoverable failure must consume its boundary and retain one diagnostic",
+      |observed| {
+        matches!(observed.0, Ok(BRACKET_END))
+          && observed.1.iter().all(|failure| matches!(failure, Err(ParserControl::Syntax)))
+          && observed.2.len() == 1
+          && observed.3.is_err()
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Suppress only adjacent diagnostics whose range and message are both identical.
   #[test]
-  fn error_collection_suppresses_only_exact_adjacent_duplicates() -> Result<(), TestFailure> {
+  fn error_collection_suppresses_only_exact_adjacent_duplicates() -> Result<(), impl Debug> {
     let mut parser = Parser::new("");
     let first = Diagnostic {
       range:   TextRange::new(TextSize::new(0), TextSize::new(1)),
@@ -1470,198 +1460,163 @@ mod tests {
       range:   TextRange::new(TextSize::new(1), TextSize::new(2)),
       message: "first".into(),
     };
-
     parser.add_diagnostic(&first);
     parser.add_diagnostic(&first);
     parser.add_diagnostic(&distinct_message);
     parser.add_diagnostic(&distinct_range);
-
-    ensure(
-      parser.diagnostics == [first, distinct_message, distinct_range],
+    ensure_eq(
+      parser.diagnostics,
+      [first, distinct_message, distinct_range],
       "only an exact adjacent duplicate may be suppressed",
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Normalize every supported query-key segment and reject malformed boundaries.
   #[test]
-  fn query_key_parsing_normalizes_globs_brackets_and_float_shaped_segments() -> Result<(), TestFailure> {
-    let parsed = ensure_ok(
-      Parser::new("root.*[0].1.2").parse_key_only(),
-      "a mixed query-key path must construct a syntax tree",
-    )?;
-    ensure(
-      parsed.diagnostics().is_empty(),
-      "glob, bracket, numeric, and float-shaped query-key segments must all be accepted",
-    )?;
-    let identifiers = parsed
-      .into_syntax()
-      .descendants_with_tokens()
-      .filter(|element| element.kind() == IDENT)
-      .map(|element| element.to_string())
-      .collect::<Vec<_>>();
-    ensure(
-      identifiers == ["root", "*", "0", "1", "2"],
-      "query-only syntax must normalize every semantic segment into ordered identifiers",
-    )?;
-
-    let adjacent_periods = ensure_ok(
-      Parser::new("root..child").parse_key_only(),
-      "an adjacent-period query key must remain a recoverable parse",
-    )?;
-    ensure_eq(
-      &adjacent_periods
-        .diagnostics()
-        .iter()
-        .filter(|diagnostic| diagnostic.message() == r#"unexpected ".""#)
-        .count(),
-      &1,
-      "adjacent periods must produce one exact boundary diagnostic",
-    )?;
-
-    let malformed_bracket = ensure_ok(
-      Parser::new("root[0.child").parse_key_only(),
-      "a malformed bracket query key must remain a recoverable parse",
-    )?;
-    ensure(
-      malformed_bracket
-        .diagnostics()
-        .iter()
-        .any(|diagnostic| diagnostic.message() == r#"expected "]""#),
-      "a bracket segment without its closing delimiter must be rejected",
-    )?;
-
-    for (source, message) in [
-      ("root.", "unexpected end of input"),
-      ("root[]", "expected identifier"),
-      ("root child", "unexpected identifier"),
-      ("+1", "expected identifier"),
-      ("+1.2", "expected identifier"),
-    ] {
-      let rejected = ensure_ok(
-        Parser::new(source).parse_key_only(),
-        "an invalid query-key boundary must remain a recoverable parse",
-      )?;
-      ensure(
-        rejected.diagnostics().iter().any(|diagnostic| diagnostic.message() == message),
-        "each invalid query-key boundary must retain its specific diagnostic",
-      )?;
-    }
-
-    let zero_padded = ensure_ok(
-      Parser::new("01.2").parse_key_only(),
-      "a zero-padded float-shaped key must remain a recoverable parse",
-    )?;
-    ensure(
-      zero_padded
-        .diagnostics()
-        .iter()
-        .any(|diagnostic| diagnostic.message() == "zero-padded numbers are not allowed"),
-      "zero-padded float-shaped keys must not be normalized into semantic path segments",
+  fn query_key_parsing_normalizes_globs_brackets_and_float_shaped_segments() -> Result<(), ParseCheck<9>> {
+    let sources = [
+      "root.*[0].1.2", "root..child", "root[0.child", "root.", "root[]", "root child", "+1", "+1.2", "01.2",
+    ];
+    ensure_that(
+      sources.map(|source| Parser::new(source).parse_key_only()),
+      "query-key parsing must retain normalized segments and each boundary diagnostic",
+      |observed| {
+        let [
+          ref accepted,
+          ref periods,
+          ref bracket,
+          ref end,
+          ref empty,
+          ref adjacent,
+          ref integer,
+          ref float,
+          ref padded,
+        ] = *observed;
+        accepted.as_ref().is_ok_and(|parsed| {
+          parsed.diagnostics().is_empty()
+            && parsed
+              .clone()
+              .into_syntax()
+              .descendants_with_tokens()
+              .filter(|element| element.kind() == IDENT)
+              .map(|element| element.to_string())
+              .collect::<Vec<_>>()
+              == ["root", "*", "0", "1", "2"]
+        }) && periods
+          .as_ref()
+          .is_ok_and(|parsed| diagnostic_count(parsed, r#"unexpected ".""#) == 1)
+          && [
+            (bracket, r#"expected "]""#),
+            (end, "unexpected end of input"),
+            (empty, "expected identifier"),
+            (adjacent, "unexpected identifier"),
+            (integer, "expected identifier"),
+            (float, "expected identifier"),
+            (padded, "zero-padded numbers are not allowed"),
+          ]
+          .into_iter()
+          .all(|(result, message)| result.as_ref().is_ok_and(|parsed| diagnostic_count(parsed, message) > 0))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Preserve valid header/value classification while diagnosing malformed structural boundaries.
   #[test]
-  fn headers_and_lexical_overlaps_preserve_structure_and_diagnostics() -> Result<(), TestFailure> {
-    let valid = "date = 1979-05-27\ntime = 07:32:00.5\n[[items]]\nname = \"first\"\n";
-    ensure_eq(
-      &diagnostic_count(valid, "expected new line")?,
-      &0,
-      "valid entries and array-table headers must retain their line boundaries",
-    )?;
-    ensure_eq(
-      &syntax_kind_count(valid, DATE)?,
-      &1,
-      "a local date value must retain its date syntax kind",
-    )?;
-    ensure_eq(
-      &syntax_kind_count(valid, TIME)?,
-      &1,
-      "a fractional local time value must retain its time syntax kind",
-    )?;
-
-    ensure(
-      diagnostic_count("value = 1 [table]\n", "expected new line")? > 0,
-      "a header following an entry on the same line must be rejected at the line boundary",
-    )?;
-    ensure_eq(
-      &diagnostic_count("[[items]\n", r#"expected "]]"#)?,
-      &1,
-      "an array-table header must require its second closing bracket",
-    )?;
-
-    let invalid_numbers = "decimal = 01\nfloat = 01.5\npositive = +01\nnegative = -01\nhex = 0x_1\nbinary = 0b1__0\n";
-    ensure_eq(
-      &diagnostic_count(invalid_numbers, "zero-padded integers are not allowed")?,
-      &3,
-      "unsigned and signed zero-padded integers must share the integer-specific diagnostic",
-    )?;
-    ensure_eq(
-      &diagnostic_count(invalid_numbers, "zero-padded numbers are not allowed")?,
-      &1,
-      "a zero-padded float must retain its numeric diagnostic",
-    )?;
-    ensure_eq(
-      &diagnostic_count(invalid_numbers, "invalid underscores")?,
-      &2,
-      "radix values must reject leading and adjacent underscores independently",
-    )?;
-    ensure_eq(
-      &diagnostic_count("positive = +0\nnegative = -0\n", "zero-padded integers are not allowed")?,
-      &0,
-      "the exact signed zero values must remain valid rather than being mistaken for padding",
+  fn headers_and_lexical_overlaps_preserve_structure_and_diagnostics() -> Result<(), ParseCheck<5>> {
+    ensure_that(
+      [
+        parse("date = 1979-05-27\ntime = 07:32:00.5\n[[items]]\nname = \"first\"\n"),
+        parse("value = 1 [table]\n"),
+        parse("[[items]\n"),
+        parse("decimal = 01\nfloat = 01.5\npositive = +01\nnegative = -01\nhex = 0x_1\nbinary = 0b1__0\n"),
+        parse("positive = +0\nnegative = -0\n"),
+      ],
+      "headers and lexical overlaps must retain their independent syntax and diagnostic contracts",
+      |observed| {
+        let [ref valid, ref header, ref closing, ref numbers, ref zero] = *observed;
+        valid.as_ref().is_ok_and(|parsed| {
+          diagnostic_count(parsed, "expected new line") == 0 && syntax_kind_count(parsed, DATE) == 1 && syntax_kind_count(parsed, TIME) == 1
+        }) && header
+          .as_ref()
+          .is_ok_and(|parsed| diagnostic_count(parsed, "expected new line") > 0)
+          && closing
+            .as_ref()
+            .is_ok_and(|parsed| diagnostic_count(parsed, r#"expected "]]"#) == 1)
+          && numbers.as_ref().is_ok_and(|parsed| {
+            diagnostic_count(parsed, "zero-padded integers are not allowed") == 3
+              && diagnostic_count(parsed, "zero-padded numbers are not allowed") == 1
+              && diagnostic_count(parsed, "invalid underscores") == 2
+          })
+          && zero
+            .as_ref()
+            .is_ok_and(|parsed| diagnostic_count(parsed, "zero-padded integers are not allowed") == 0)
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Parse, preserve, and freeze one deeply nested valid or invalid composite.
-  fn ensure_deep_composite(source: &str, valid: bool, expected_node: impl FnOnce(&Node) -> bool) -> Result<(), TestFailure> {
-    let parsed = ensure_ok(parse(source), "a deeply nested composite must construct a recoverable tree")?;
-    ensure(
-      parsed.diagnostics().is_empty() == valid,
-      "deep-composite diagnostics must distinguish valid and unterminated input",
-    )?;
-    let rendered = parsed.green().to_string();
-    ensure_eq(
-      &rendered.as_str(),
-      &source,
-      "iterative deep-composite parsing and recovery must remain lossless",
-    )?;
-    let dom = parsed.into_dom();
-    ensure(
-      dom.get_key("value").is_some_and(|value| expected_node(&value)),
-      "deep-composite parsing must freeze into the expected tolerant DOM kind",
+  fn ensure_deep_composite(source: String, valid: bool, expected_node: impl FnOnce(&Node) -> bool) -> Result<DeepParse, DeepParseFailure> {
+    let parsed = parse(&source).map(|value| {
+      let root = value.clone().into_dom();
+      (value, root)
+    });
+    ensure_that(
+      (source, parsed),
+      "deep composites must retain diagnostic polarity, exact source, and tolerant DOM kind",
+      |observed| {
+        let Ok((ref value, ref root)) = observed.1 else {
+          return false;
+        };
+
+        value.diagnostics().is_empty() == valid
+          && value.green().to_string() == observed.0
+          && root.get_key("value").is_some_and(|node| expected_node(&node))
+      },
     )
+    .map_err(Box::new)
   }
 
   /// Parse and freeze a deeply nested valid array through heap-owned frames.
   #[test]
-  fn deeply_nested_arrays_use_heap_frames() -> Result<(), TestFailure> {
+  fn deeply_nested_arrays_use_heap_frames() -> Result<(), DeepParseFailure> {
     let depth = 10_000;
-    let source = format!("value = {}0{}\n", "[".repeat(depth), "]".repeat(depth));
-    ensure_deep_composite(&source, true, Node::is_array)
+    ensure_deep_composite(
+      format!("value = {}0{}\n", "[".repeat(depth), "]".repeat(depth)),
+      true,
+      Node::is_array,
+    )
+    .map(drop)
   }
 
   /// Terminate and freeze a deeply nested unterminated array with ordered diagnostics.
   #[test]
-  fn deeply_nested_invalid_arrays_terminate_with_diagnostics() -> Result<(), TestFailure> {
+  fn deeply_nested_invalid_arrays_terminate_with_diagnostics() -> Result<(), DeepParseFailure> {
     let depth = 10_000;
-    let source = format!("value = {}0\n", "[".repeat(depth));
-    ensure_deep_composite(&source, false, Node::is_array)
+    ensure_deep_composite(format!("value = {}0\n", "[".repeat(depth)), false, Node::is_array).map(drop)
   }
 
   /// Parse and freeze deeply nested inline tables without call-stack recursion.
   #[test]
-  fn deeply_nested_inline_tables_use_heap_frames_and_freeze() -> Result<(), TestFailure> {
+  fn deeply_nested_inline_tables_use_heap_frames_and_freeze() -> Result<(), DeepParseFailure> {
     let depth = 10_000;
-    let source = format!("value = {}0{}\n", "{ nested = ".repeat(depth), " }".repeat(depth));
-    ensure_deep_composite(&source, true, Node::is_table)
+    ensure_deep_composite(
+      format!("value = {}0{}\n", "{ nested = ".repeat(depth), " }".repeat(depth)),
+      true,
+      Node::is_table,
+    )
+    .map(drop)
   }
 
   /// Recover and freeze deeply nested unterminated inline tables without stalling.
   #[test]
-  fn deeply_nested_invalid_inline_tables_terminate_and_freeze() -> Result<(), TestFailure> {
+  fn deeply_nested_invalid_inline_tables_terminate_and_freeze() -> Result<(), DeepParseFailure> {
     let depth = 10_000;
-    let source = format!("value = {}0\n", "{ nested = ".repeat(depth));
-    ensure_deep_composite(&source, false, Node::is_table)
+    ensure_deep_composite(format!("value = {}0\n", "{ nested = ".repeat(depth)), false, Node::is_table).map(drop)
   }
 }

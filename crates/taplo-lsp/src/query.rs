@@ -436,15 +436,18 @@ fn full_range(keys: &Keys, node: &Node) -> Option<TextRange> {
 
 #[cfg(test)]
 mod tests {
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_eq;
+  use std::fmt::Debug;
+  use std::num::TryFromIntError;
+
+  use strict_test_support::OptionFailure;
+  use strict_test_support::ResultFailure;
   use strict_test_support::ensure_ok;
   use strict_test_support::ensure_some;
-  use taplo::dom::Keys;
+  use strict_test_support::ensure_that;
   use taplo::dom::Node;
   use taplo::parser;
   use taplo::parser::Parse;
+  use taplo::parser::ParseFailure;
   use taplo::rowan::TextSize;
   use taplo::rowan::TokenAtOffset;
   use taplo::syntax::SyntaxElement;
@@ -453,334 +456,275 @@ mod tests {
   use taplo::syntax::kind::IDENT;
   use taplo::syntax::kind::INTEGER;
   use taplo::syntax::kind::PERIOD;
+  use thiserror::Error;
 
   use super::Query;
   use super::lookup_keys;
 
+  /// Native failures while locating a cursor in a parsed fixture.
+  #[derive(Debug, Error)]
+  enum QueryFixtureFailure {
+    /// Lossless syntax construction failed.
+    #[error(transparent)]
+    Parse(#[from] ResultFailure<ParseFailure>),
+    /// The fragment or checked offset was absent.
+    #[error(transparent)]
+    Offset(#[from] OptionFailure<usize>),
+    /// The located byte offset exceeded Rowan's coordinate type.
+    #[error(transparent)]
+    Coordinate(#[from] ResultFailure<TryFromIntError>),
+  }
+
   /// Parse one source fixture into its tolerant DOM.
-  fn dom(source: &str) -> Result<Node, TestFailure> {
+  fn dom(source: &str) -> Result<Node, ResultFailure<ParseFailure>> {
     ensure_ok(parser::parse(source), "the query fixture tree must build").map(Parse::into_dom)
   }
 
-  /// Resolve one cursor offset relative to a unique source fragment.
-  #[allow(
-    clippy::single_call_fn,
-    reason = "the named resolver keeps cursor fixtures anchored to readable source fragments instead of hardcoded byte offsets, and \
-              confines the checked conversions into Rowan coordinates to one place"
-  )]
-  fn source_offset(source: &str, fragment: &str, relative: usize) -> Result<TextSize, TestFailure> {
+  /// Query one source at a checked offset relative to a unique fragment.
+  fn query_fixture(source: &str, fragment: &str, relative: usize) -> Result<(Node, Query), QueryFixtureFailure> {
     let fragment_start = ensure_some(source.find(fragment), "the query fixture fragment must exist")?;
     let offset = ensure_some(
       fragment_start.checked_add(relative),
       "the query fixture offset must remain representable",
     )?;
     let raw = ensure_ok(u32::try_from(offset), "the query fixture offset must fit Rowan coordinates")?;
-    Ok(TextSize::from(raw))
-  }
-
-  /// Query one parsed fixture at an offset relative to a unique source fragment.
-  fn query_at_fragment(root: &Node, source: &str, fragment: &str, relative: usize) -> Result<Query, TestFailure> {
-    Ok(Query::at(root, source_offset(source, fragment, relative)?))
-  }
-
-  /// Parse one source and query it at an offset relative to a unique fragment.
-  fn query_fixture(source: &str, fragment: &str, relative: usize) -> Result<(Node, Query), TestFailure> {
     let root = dom(source)?;
-    let query = query_at_fragment(&root, source, fragment, relative)?;
+    let query = Query::at(&root, TextSize::from(raw));
     Ok((root, query))
   }
 
   #[test]
-  fn cursor_selection_prefers_before_then_falls_back_after() -> Result<(), TestFailure> {
-    let before_dom = dom("key = 1\n")?;
-    let before_query = Query::at(&before_dom, TextSize::from(3));
-    let before = ensure_some(
-      before_query.first_matching(|position| position.syntax.kind() == IDENT),
-      "an identifier immediately before the cursor must match",
-    )?;
-    ensure_eq(&before.syntax.text(), &"key", "the before candidate must take precedence")?;
-
-    let after_dom = dom(" key = 1\n")?;
-    let after_query = Query::at(&after_dom, TextSize::from(1));
-    ensure(
-      after_query
-        .before
-        .as_ref()
-        .is_some_and(|position| position.syntax.kind() != IDENT),
-      "the fallback fixture must have a nonmatching before token",
-    )?;
-    let after = ensure_some(
-      after_query.first_matching(|position| position.syntax.kind() == IDENT),
-      "a matching after token must be selected when before does not match",
-    )?;
-    ensure_eq(&after.syntax.text(), &"key", "the after candidate must retain its identifier")?;
-    ensure(
-      after_query.first_matching(|position| position.syntax.kind() == BOOL).is_none(),
-      "cursor-adjacent nonboolean syntax must produce no boolean candidate",
+  fn cursor_selection_prefers_before_then_falls_back_after() -> Result<(), impl Debug> {
+    let before = query_fixture("key = 1\n", "key", 3);
+    let after = query_fixture(" key = 1\n", "key", 0);
+    ensure_that(
+      (before, after),
+      "cursor selection must prefer a matching before token and otherwise try after",
+      |observed| {
+        observed.0.as_ref().is_ok_and(|fixture| {
+          fixture
+            .1
+            .first_matching(|position| position.syntax.kind() == IDENT)
+            .is_some_and(|position| position.syntax.text() == "key")
+        }) && observed.1.as_ref().is_ok_and(|fixture| {
+          fixture
+            .1
+            .before
+            .as_ref()
+            .is_some_and(|position| position.syntax.kind() != IDENT)
+            && fixture
+              .1
+              .first_matching(|position| position.syntax.kind() == IDENT)
+              .is_some_and(|position| position.syntax.text() == "key")
+            && fixture.1.first_matching(|position| position.syntax.kind() == BOOL).is_none()
+        })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn entry_lookup_and_header_identifier_index_are_total() -> Result<(), TestFailure> {
-    let entry_dom = dom("alpha = 1\n")?;
-    let entry_query = Query::at(&entry_dom, TextSize::from(8));
-    let key = ensure_some(entry_query.entry_key(), "an entry query must find its key")?;
-    let value = ensure_some(entry_query.entry_value(), "an entry query must find its value")?;
-    ensure(
-      key.kind() == SyntaxKind::KEY,
-      "the entry key helper must return the key node rather than an identifier token",
-    )?;
-    ensure_eq(
-      &entry_query.entry_keys().to_string().as_str(),
-      &"alpha",
-      "entry keys must normalize layout trivia away",
-    )?;
-    ensure_eq(
-      &value.to_string().trim(),
-      &"1",
-      "entry value child text must retain its primitive value",
-    )?;
-
-    let header_dom = dom("[alpha.beta]\n")?;
-    let header_query = Query::at(&header_dom, TextSize::from(8));
-    let beta = ensure_some(
-      header_query.first_matching(|position| position.syntax.text() == "beta"),
-      "the dotted header fixture must expose its second identifier",
-    )?;
-    ensure(
-      Query::header_identifier_index(&beta.syntax) == Some(1),
-      "the second dotted identifier must have index one",
-    )?;
-
-    let header_syntax = ensure_some(
-      header_dom.syntax().and_then(|syntax| syntax.as_node()),
-      "the parsed header must retain root syntax",
-    )?;
-    let period = ensure_some(
-      header_syntax
-        .descendants_with_tokens()
-        .filter_map(SyntaxElement::into_token)
-        .find(|token| token.kind() == PERIOD),
-      "the dotted header must contain a period token",
-    )?;
-    ensure(
-      Query::header_identifier_index(&period).is_none(),
-      "a nonidentifier header token must not receive a segment index",
-    )?;
-
-    let entry_syntax = ensure_some(
-      entry_dom.syntax().and_then(|syntax| syntax.as_node()),
-      "the parsed entry must retain root syntax",
-    )?;
-    let entry_identifier = match ensure_ok(
-      entry_syntax.token_at_offset(TextSize::from(1)),
-      "the entry identifier offset must be valid",
-    )? {
-      TokenAtOffset::Single(token) | TokenAtOffset::Between(_, token) => Some(token),
-      TokenAtOffset::None => None,
-    };
-    ensure(
-      ensure_some(entry_identifier, "the entry identifier must be addressable")?.kind() == IDENT,
-      "the out-of-header fixture must use an identifier token",
-    )?;
-    ensure(
-      Query::header_identifier_index(&ensure_some(
-        match ensure_ok(
-          entry_syntax.token_at_offset(TextSize::from(1)),
-          "the repeated entry identifier offset must be valid",
-        )? {
-          TokenAtOffset::Single(token) | TokenAtOffset::Between(_, token) => Some(token),
-          TokenAtOffset::None => None,
-        },
-        "the entry identifier must remain addressable",
-      )?)
-      .is_none(),
-      "an identifier outside a table header must not receive a header index",
-    )?;
-
-    let outside_entry = Query::at(&header_dom, TextSize::from(2));
-    ensure(
-      [outside_entry.entry_key().is_none(), outside_entry.entry_value().is_none()] == [true, true],
-      "a table header query must not invent entry children",
-    )?;
-    ensure(
-      value.kind() == SyntaxKind::VALUE,
-      "the entry value helper must return the value node rather than its primitive token",
-    )?;
-    ensure(
-      entry_query
-        .first_matching(|position| position.syntax.kind() == INTEGER)
-        .is_some(),
-      "the value-side cursor must still expose its integer token",
+  fn entry_lookup_and_header_identifier_index_are_total() -> Result<(), impl Debug> {
+    let entry = query_fixture("alpha = 1\n", "1", 0);
+    let header = query_fixture("[alpha.beta]\n", "beta", 1);
+    ensure_that(
+      (entry, header),
+      "entry children and header segment indices must preserve syntax kinds and reject unrelated tokens",
+      |observed| {
+        let Ok(ref entry_fixture) = observed.0 else {
+          return false;
+        };
+        let Ok(ref header_fixture) = observed.1 else {
+          return false;
+        };
+        let Some(entry_syntax) = entry_fixture.0.syntax().and_then(|syntax| syntax.as_node()) else {
+          return false;
+        };
+        let Ok(entry_tokens) = entry_syntax.token_at_offset(TextSize::from(1)) else {
+          return false;
+        };
+        entry_fixture.1.entry_key().is_some_and(|key| key.kind() == SyntaxKind::KEY)
+          && entry_fixture.1.entry_keys().to_string() == "alpha"
+          && entry_fixture
+            .1
+            .entry_value()
+            .is_some_and(|value| value.kind() == SyntaxKind::VALUE && value.to_string().trim() == "1")
+          && entry_fixture
+            .1
+            .first_matching(|position| position.syntax.kind() == INTEGER)
+            .is_some()
+          && matches!(entry_tokens, TokenAtOffset::Single(ref token) | TokenAtOffset::Between(_, ref token)
+            if token.kind() == IDENT && Query::header_identifier_index(token).is_none())
+          && header_fixture
+            .1
+            .first_matching(|position| position.syntax.text() == "beta")
+            .is_some_and(|position| Query::header_identifier_index(&position.syntax) == Some(1))
+          && header_fixture
+            .0
+            .syntax()
+            .and_then(|syntax| syntax.as_node())
+            .and_then(|syntax| {
+              syntax
+                .descendants_with_tokens()
+                .filter_map(SyntaxElement::into_token)
+                .find(|token| token.kind() == PERIOD)
+            })
+            .is_some_and(|period| Query::header_identifier_index(&period).is_none())
+          && header_fixture.1.entry_key().is_none()
+          && header_fixture.1.entry_value().is_none()
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn syntaxless_and_out_of_range_queries_return_empty_fallbacks() -> Result<(), TestFailure> {
-    let syntaxless: Node = ensure_ok(
-      serde_json::from_value(serde_json::json!({ "value": 1 })),
-      "the syntaxless DOM fixture must deserialize",
-    )?;
-    let syntaxless_query = Query::at(&syntaxless, TextSize::from(0));
-    ensure(
-      [syntaxless_query.before.is_none(), syntaxless_query.after.is_none()] == [true, true],
-      "syntaxless DOM input must return an empty query",
-    )?;
-    let (keys, parent) = syntaxless_query.parent_table_or_array_table(&syntaxless);
-    ensure(keys.is_empty(), "syntaxless parent lookup must use empty keys")?;
-    ensure_eq(
-      &ensure_ok(serde_json::to_value(parent), "the fallback parent DOM must serialize")?,
-      &serde_json::json!({ "value": 1 }),
-      "syntaxless parent lookup must return the supplied root",
-    )?;
-
-    let parsed = dom("value = 1\n")?;
-    let outside = Query::at(&parsed, TextSize::new(u32::MAX));
-    ensure(
-      [outside.before.is_none(), outside.after.is_none()] == [true, true],
-      "an unusable offset must return an empty query instead of panicking",
+  fn syntaxless_and_out_of_range_queries_return_empty_fallbacks() -> Result<(), impl Debug> {
+    let syntaxless = serde_json::from_value::<Node>(serde_json::json!({ "value": 1 })).map(|root| {
+      let query = Query::at(&root, TextSize::from(0));
+      let parent = query.parent_table_or_array_table(&root);
+      let serialized = serde_json::to_value(&parent.1);
+      (root, query, parent, serialized)
+    });
+    let outside = dom("value = 1\n").map(|root| {
+      let query = Query::at(&root, TextSize::new(u32::MAX));
+      (root, query)
+    });
+    ensure_that(
+      (syntaxless, outside),
+      "syntaxless and out-of-range cursors must remain empty with the original parent fallback",
+      |observed| {
+        observed.0.as_ref().is_ok_and(|fixture| {
+          fixture.1.before.is_none()
+            && fixture.1.after.is_none()
+            && fixture.2.0.is_empty()
+            && fixture
+              .3
+              .as_ref()
+              .is_ok_and(|value| *value == serde_json::json!({ "value": 1 }))
+        }) && observed
+          .1
+          .as_ref()
+          .is_ok_and(|fixture| fixture.1.before.is_none() && fixture.1.after.is_none())
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn cursor_predicates_classify_headers_entries_and_quoting_polarities() -> Result<(), TestFailure> {
-    let header_source = "[alpha.beta]\n[[records]]\n";
-    let (header_dom, table_header) = query_fixture(header_source, "alpha.beta", 3)?;
-    ensure(
-      (
-        table_header.in_table_header(),
-        table_header.in_table_array_header(),
-        table_header.header_keys().to_string(),
-        table_header.entry_key().is_none(),
-      ) == (true, false, "alpha.beta".into(), true),
-      "a standard table-header cursor must expose only its complete normalized header path",
-    )?;
-
-    let array_header = query_at_fragment(&header_dom, header_source, "records", 3)?;
-    ensure(
-      (
-        array_header.in_table_header(),
-        array_header.in_table_array_header(),
-        array_header.header_keys().to_string(),
-      ) == (false, true, "records".into()),
-      "an array-table cursor must expose its array-header category and normalized path",
-    )?;
-
-    let literal_source = "alpha = 'literal'\n";
-    let literal_dom = dom(literal_source)?;
-    let key_query = query_at_fragment(&literal_dom, literal_source, "alpha", 3)?;
-    ensure(
-      (
-        key_query.in_entry_keys(),
-        key_query.entry_has_eq(),
-        key_query.in_entry_value(),
-        key_query.is_single_quote_value(),
-      ) == (true, true, false, true),
-      "an assigned literal-string key must retain key position, equals-sign, and quoting facts",
-    )?;
-    let value_query = query_at_fragment(&literal_dom, literal_source, "'literal'", 5)?;
-    ensure(
-      (
-        value_query.in_entry_keys(),
-        value_query.in_entry_value(),
-        value_query.is_single_quote_value(),
-        value_query.dom_node().is_some(),
-      ) == (false, true, true, true),
-      "a literal-string value cursor must expose value position, literal quoting, and its semantic node",
-    )?;
-
-    let basic_source = "alpha = \"basic\"\n";
-    let basic_dom = dom(basic_source)?;
-    let basic_query = query_at_fragment(&basic_dom, basic_source, "\"basic\"", 4)?;
-    ensure(
-      basic_query.in_entry_value() && !basic_query.is_single_quote_value(),
-      "a basic string must remain a value without being classified as literal-string quoting",
-    )?;
-
-    let incomplete_source = "alpha";
-    let incomplete_dom = dom(incomplete_source)?;
-    let incomplete_query = query_at_fragment(&incomplete_dom, incomplete_source, "alpha", 3)?;
-    ensure(
-      incomplete_query.in_entry_keys() && !incomplete_query.entry_has_eq(),
-      "an incomplete entry key must not fabricate an equals-sign contract",
+  fn cursor_predicates_classify_headers_entries_and_quoting_polarities() -> Result<(), impl Debug> {
+    let observed = [
+      query_fixture("[alpha.beta]\n[[records]]\n", "alpha.beta", 3),
+      query_fixture("[alpha.beta]\n[[records]]\n", "records", 3),
+      query_fixture("alpha = 'literal'\n", "alpha", 3),
+      query_fixture("alpha = 'literal'\n", "'literal'", 5),
+      query_fixture("alpha = \"basic\"\n", "\"basic\"", 4),
+      query_fixture("alpha", "alpha", 3),
+    ];
+    ensure_that(
+      observed,
+      "cursor predicates must distinguish table kinds, entry positions, assignment and string quoting",
+      |fixtures| {
+        let [ref table, ref array, ref key, ref literal, ref basic, ref incomplete] = *fixtures;
+        table.as_ref().is_ok_and(|fixture| {
+          fixture.1.in_table_header()
+            && !fixture.1.in_table_array_header()
+            && fixture.1.header_keys().to_string() == "alpha.beta"
+            && fixture.1.entry_key().is_none()
+        }) && array.as_ref().is_ok_and(|fixture| {
+          !fixture.1.in_table_header() && fixture.1.in_table_array_header() && fixture.1.header_keys().to_string() == "records"
+        }) && key.as_ref().is_ok_and(|fixture| {
+          fixture.1.in_entry_keys() && fixture.1.entry_has_eq() && !fixture.1.in_entry_value() && fixture.1.is_single_quote_value()
+        }) && literal.as_ref().is_ok_and(|fixture| {
+          !fixture.1.in_entry_keys() && fixture.1.in_entry_value() && fixture.1.is_single_quote_value() && fixture.1.dom_node().is_some()
+        }) && basic
+          .as_ref()
+          .is_ok_and(|fixture| fixture.1.in_entry_value() && !fixture.1.is_single_quote_value())
+          && incomplete
+            .as_ref()
+            .is_ok_and(|fixture| fixture.1.in_entry_keys() && !fixture.1.entry_has_eq())
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn line_and_container_queries_preserve_inside_outside_boundaries() -> Result<(), TestFailure> {
+  fn line_and_container_queries_preserve_inside_outside_boundaries() -> Result<(), impl Debug> {
     let line_source = "first = 1\n  \nsecond = 2\n";
-    let line_dom = dom(line_source)?;
-    let blank_line = query_at_fragment(&line_dom, line_source, "  \n", 1)?;
-    let content_line = query_at_fragment(&line_dom, line_source, "first", 2)?;
-    ensure(
-      (blank_line.empty_line(), content_line.empty_line()) == (true, false),
-      "trivia-only lines must be distinguished from lines containing entry syntax",
-    )?;
-
     let container_source = "table = { nested = 1 }\narray = [ 1 ]\n";
-    let container_dom = dom(container_source)?;
-    let inline_inside = query_at_fragment(&container_dom, container_source, "{ ", 1)?;
-    let inline_after = query_at_fragment(&container_dom, container_source, "}\n", 1)?;
-    let array_inside = query_at_fragment(&container_dom, container_source, "[ ", 1)?;
-    let array_after = query_at_fragment(&container_dom, container_source, "]\n", 1)?;
-    ensure(
-      (
-        inline_inside.is_inline(),
-        inline_inside.in_inline_table(),
-        inline_inside.in_array(),
-        inline_after.in_inline_table(),
-        array_inside.is_inline(),
-        array_inside.in_inline_table(),
-        array_inside.in_array(),
-        array_after.in_array(),
-      ) == (true, true, false, false, true, false, true, false),
-      "inline tables and arrays must report their own interior while rejecting the opposite container and post-closing cursor",
+    let observed = [
+      query_fixture(line_source, "  \n", 1),
+      query_fixture(line_source, "first", 2),
+      query_fixture(container_source, "{ ", 1),
+      query_fixture(container_source, "}\n", 1),
+      query_fixture(container_source, "[ ", 1),
+      query_fixture(container_source, "]\n", 1),
+    ];
+    ensure_that(
+      observed,
+      "line and container queries must distinguish trivia, content, interiors and post-closing positions",
+      |fixtures| {
+        let [ref blank, ref content, ref inline, ref after_inline, ref array, ref after_array] = *fixtures;
+        blank.as_ref().is_ok_and(|fixture| fixture.1.empty_line())
+          && content.as_ref().is_ok_and(|fixture| !fixture.1.empty_line())
+          && inline
+            .as_ref()
+            .is_ok_and(|fixture| fixture.1.is_inline() && fixture.1.in_inline_table() && !fixture.1.in_array())
+          && after_inline.as_ref().is_ok_and(|fixture| !fixture.1.in_inline_table())
+          && array
+            .as_ref()
+            .is_ok_and(|fixture| fixture.1.is_inline() && !fixture.1.in_inline_table() && fixture.1.in_array())
+          && after_array.as_ref().is_ok_and(|fixture| !fixture.1.in_array())
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn parent_and_lookup_paths_preserve_table_and_array_semantics() -> Result<(), TestFailure> {
+  fn parent_and_lookup_paths_preserve_table_and_array_semantics() -> Result<(), impl Debug> {
     let table_source = "root = 0\n[parent]\nvalue = 1\n";
-    let (table_dom, parent_query) = query_fixture(table_source, "value", 3)?;
-    let (parent_keys, parent_node) = parent_query.parent_table_or_array_table(&table_dom);
-    ensure_eq(
-      &parent_keys.to_string().as_str(),
-      &"parent",
-      "a table entry must resolve the preceding semantic table path",
-    )?;
-    ensure_eq(
-      &ensure_ok(serde_json::to_value(parent_node), "the resolved parent table must serialize")?,
-      &serde_json::json!({
-        "value": 1
-      }),
-      "a table entry must resolve the table node rather than the document root",
-    )?;
-
-    let root_query = query_at_fragment(&table_dom, table_source, "root", 2)?;
-    ensure(
-      root_query.parent_table_or_array_table(&table_dom).0.is_empty(),
-      "an entry before the first header must remain rooted at the document path",
-    )?;
-
-    let populated_array = dom("items = [{ name = \"first\" }, { name = \"second\" }]\n")?;
-    let items = ensure_ok("items".parse::<Keys>(), "the array lookup path must parse")?;
-    ensure_eq(
-      &lookup_keys(populated_array, &items).to_string().as_str(),
-      &"items.1",
-      "schema lookup must target the last concrete item of a populated array",
-    )?;
-    let empty_array = dom("items = []\n")?;
-    ensure_eq(
-      &lookup_keys(empty_array, &items).to_string().as_str(),
-      &"items.0",
-      "schema lookup must use the first prospective item of an empty array without underflow",
-    )?;
-    let scalar = dom("name = \"value\"\n")?;
-    let name = ensure_ok("name".parse::<Keys>(), "the scalar lookup path must parse")?;
-    ensure_eq(
-      &lookup_keys(scalar, &name).to_string().as_str(),
-      &"name",
-      "schema lookup must leave non-array paths unchanged",
+    let parent = query_fixture(table_source, "value", 3).map(|fixture| {
+      let parent = fixture.1.parent_table_or_array_table(&fixture.0);
+      let serialized = serde_json::to_value(&parent.1);
+      (fixture, parent, serialized)
+    });
+    let root = query_fixture(table_source, "root", 2);
+    let arrays = [
+      query_fixture("items = [{ name = \"first\" }, { name = \"second\" }]\n", "items", 2),
+      query_fixture("items = []\n", "items", 2),
+      query_fixture("name = \"value\"\n", "name", 2),
+    ];
+    ensure_that(
+      (parent, root, arrays),
+      "parent and schema lookup paths must preserve table ownership and concrete or prospective array indices",
+      |observed| {
+        let [ref populated, ref empty, ref scalar] = observed.2;
+        observed.0.as_ref().is_ok_and(|fixture| {
+          fixture.1.0.to_string() == "parent"
+            && fixture
+              .2
+              .as_ref()
+              .is_ok_and(|value| *value == serde_json::json!({ "value": 1 }))
+        }) && observed
+          .1
+          .as_ref()
+          .is_ok_and(|fixture| fixture.1.parent_table_or_array_table(&fixture.0).0.is_empty())
+          && populated
+            .as_ref()
+            .is_ok_and(|fixture| lookup_keys(fixture.0.clone(), &fixture.1.entry_keys()).to_string() == "items.1")
+          && empty
+            .as_ref()
+            .is_ok_and(|fixture| lookup_keys(fixture.0.clone(), &fixture.1.entry_keys()).to_string() == "items.0")
+          && scalar
+            .as_ref()
+            .is_ok_and(|fixture| lookup_keys(fixture.0.clone(), &fixture.1.entry_keys()).to_string() == "name")
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

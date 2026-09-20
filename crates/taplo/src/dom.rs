@@ -788,16 +788,14 @@ fn decode_comment(text: &str) -> CommentValue {
 #[cfg(test)]
 /// Semantic path identity and hashing contracts.
 mod tests {
+  use core::fmt::Debug;
   use std::collections::HashSet;
   use std::str::FromStr as _;
 
   use rowan::TextRange;
   use rowan::TextSize;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_eq;
-  use strict_test_support::ensure_ok;
-  use strict_test_support::ensure_some;
+  use strict_test_support::ResultFailure;
+  use strict_test_support::ensure_that;
 
   use super::Comment;
   use super::Entries;
@@ -805,289 +803,270 @@ mod tests {
   use super::KeyOrIndex;
   use super::Keys;
   use super::Node;
+  use super::RenderError;
+  use crate::parser::ParseFailure;
   use crate::test_support::parse_dom;
 
-  /// Parse the document shared by immutable table-entry and array-item view contracts.
-  fn collection_document() -> Result<Node, TestFailure> {
+  /// Parse the document shared by immutable collection-view contracts.
+  fn collection_document() -> Result<Node, ResultFailure<ParseFailure>> {
     parse_dom(
       "first = 1\nsecond = 2\nvalues = [3, 4, 5]\n",
       "the immutable collection-view fixture must parse",
     )
   }
 
+  /// Retain an array handle together with its native rendering result.
+  fn rendered_item(node: Node) -> (Node, Result<String, RenderError>) {
+    let rendered = node.to_toml(false, false);
+    (node, rendered)
+  }
+
   /// Distinguish a numeric table key from an array index in equality and hashing.
   #[test]
-  fn path_identity_preserves_segment_kind() -> Result<(), TestFailure> {
+  fn path_identity_preserves_segment_kind() -> Result<(), impl Debug> {
     let numeric_key = Keys::single(Key::new("0"));
     let array_index = Keys::single(0_usize);
-    ensure(
-      numeric_key != array_index,
-      "a table key that renders as a number must not equal an array index",
-    )?;
-
-    let distinct = HashSet::from([numeric_key, array_index]);
-    ensure_eq(
-      &distinct.len(),
-      &2,
-      "path hashing must preserve the same key-versus-index distinction as equality",
+    let distinct = HashSet::from([numeric_key.clone(), array_index.clone()]);
+    ensure_that(
+      (numeric_key, array_index, distinct),
+      "equality and hashing must distinguish numeric keys from array indices",
+      |observed| observed.0 != observed.1 && observed.2.len() == 2,
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn path_segments_preserve_key_and_index_identity() -> Result<(), TestFailure> {
-    let key = KeyOrIndex::from(Key::new("alpha"));
-    let index = KeyOrIndex::from(2_usize);
-    ensure(
-      (
-        key.is_key(),
-        key.is_index(),
-        key.as_key().map(Key::value),
-        key.as_index(),
-        <KeyOrIndex as PartialEq<str>>::eq(&key, "alpha"),
-        key.to_string(),
-      ) == (true, false, Some("alpha"), None, true, String::from("alpha")),
-      "a key segment must expose only key identity and its decoded display value",
-    )?;
-    ensure(
-      (
-        index.is_index(),
-        index.is_key(),
-        index.as_index(),
-        index.as_key().map(Key::value),
-        <KeyOrIndex as PartialEq<str>>::eq(&index, "2"),
-        index.to_string(),
-      ) == (true, false, Some(&2_usize), None, false, String::from("2")),
-      "an index segment must expose only numeric identity without comparing equal to a numeric key",
+  fn path_segments_preserve_key_and_index_identity() -> Result<(), impl Debug> {
+    let segments = [KeyOrIndex::from(Key::new("alpha")), KeyOrIndex::from(2_usize)].map(|segment| {
+      let rendered = segment.to_string();
+      (segment, rendered)
+    });
+    ensure_that(
+      segments,
+      "key and index segments must retain exclusive native identity and display",
+      |observed| {
+        let [(ref key, ref key_rendered), (ref index, ref index_rendered)] = *observed;
+        key.is_key()
+          && !key.is_index()
+          && key.as_key().is_some_and(|value| value.value() == "alpha")
+          && key.as_index().is_none()
+          && <KeyOrIndex as PartialEq<str>>::eq(key, "alpha")
+          && key_rendered == "alpha"
+          && index.is_index()
+          && !index.is_key()
+          && index.as_index() == Some(&2_usize)
+          && index.as_key().is_none()
+          && !<KeyOrIndex as PartialEq<str>>::eq(index, "2")
+          && index_rendered == "2"
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn path_operations_preserve_order_prefixes_and_source_identity() -> Result<(), TestFailure> {
-    let empty = Keys::empty();
-    let parent = Keys::single(Key::new("parent"));
-    let child = parent.join(Key::new("child"));
-    let indexed = child.extend([0_usize, 1_usize]);
-    ensure(
+  fn path_operations_preserve_order_prefixes_and_source_identity() -> Result<(), impl Debug> {
+    let fixture_empty = Keys::empty();
+    let fixture_parent = Keys::single(Key::new("parent"));
+    let fixture_child = fixture_parent.join(Key::new("child"));
+    let fixture_indexed = fixture_child.extend([0_usize, 1_usize]);
+    let empty_count = fixture_empty.len();
+    ensure_that(
       (
-        empty.is_empty(),
-        empty.len(),
-        parent.dotted(),
-        child.dotted(),
-        indexed.dotted(),
-        indexed.len(),
-      ) == (true, 0, "parent", "parent.child", "parent.child.0.1", 4),
-      "path construction must preserve typed segment order and the matching dotted representation",
-    )?;
-    ensure(
-      (
-        indexed.common_prefix_count(&child),
-        indexed.contains(&child),
-        child.part_of(&indexed),
-        child.contains(&indexed),
-        indexed.skip_left(2),
-        indexed.skip_right(2),
-        indexed.skip_left(99).is_empty(),
-        indexed.skip_right(99).is_empty(),
-      ) == (
-        2,
-        true,
-        true,
-        false,
-        Keys::new([KeyOrIndex::from(0_usize), KeyOrIndex::from(1_usize)].into_iter()),
-        child.clone(),
-        true,
-        true,
+        fixture_empty,
+        fixture_parent,
+        fixture_child,
+        fixture_indexed,
+        Keys::from_str("parent.\"child\""),
+        Keys::from_str("parent."),
+        Keys::single(Key::new("detached")),
+        empty_count,
       ),
-      "path prefix and slicing operations must distinguish containment direction and saturate at empty",
-    )?;
-    ensure(
-      (
-        indexed.clone().into_iter().collect::<Vec<_>>(),
-        indexed.iter().cloned().collect::<Vec<_>>(),
-        indexed.iter().next().map(KeyOrIndex::is_key),
-        indexed.iter().next_back().map(KeyOrIndex::is_index),
-      ) == (
-        indexed.iter().cloned().collect::<Vec<_>>(),
-        indexed.iter().cloned().collect::<Vec<_>>(),
-        Some(true),
-        Some(true),
-      ),
-      "owned and borrowed path iteration must preserve the same double-ended segment order",
-    )?;
-
-    let source_backed = ensure_ok(Keys::from_str("parent.\"child\""), "a valid dotted key path must parse")?;
-    ensure(
-      (source_backed.all_text_range(), Keys::single(Key::new("detached")).all_text_range())
-        == (Some(TextRange::new(TextSize::new(0), TextSize::new(14))), None),
-      "source-backed paths must cover every key segment while detached paths retain no fabricated range",
-    )?;
-    ensure(
-      Keys::from_str("parent.").is_err(),
-      "an incomplete dotted key path must retain its typed parse failure",
+      "path operations must preserve typed order, prefix direction, source identity, and malformed-path rejection",
+      |observed| {
+        let (ref empty, ref parent, ref child, ref indexed, ref sourced, ref rejected, ref detached, count) = *observed;
+        empty.is_empty()
+          && count == 0
+          && parent.dotted() == "parent"
+          && child.dotted() == "parent.child"
+          && indexed.dotted() == "parent.child.0.1"
+          && indexed.len() == 4
+          && indexed.common_prefix_count(child) == 2
+          && indexed.contains(child)
+          && child.part_of(indexed)
+          && !child.contains(indexed)
+          && indexed.skip_left(2) == Keys::new([KeyOrIndex::from(0_usize), KeyOrIndex::from(1_usize)].into_iter())
+          && indexed.skip_right(2) == *child
+          && indexed.skip_left(99).is_empty()
+          && indexed.skip_right(99).is_empty()
+          && indexed.clone().into_iter().collect::<Vec<_>>() == indexed.iter().cloned().collect::<Vec<_>>()
+          && indexed.iter().next().is_some_and(KeyOrIndex::is_key)
+          && indexed.iter().next_back().is_some_and(KeyOrIndex::is_index)
+          && sourced
+            .as_ref()
+            .is_ok_and(|keys| keys.all_text_range() == Some(TextRange::new(TextSize::new(0), TextSize::new(14))))
+          && detached.all_text_range().is_none()
+          && rejected.is_err()
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn immutable_entry_views_iterate_from_both_ends_without_losing_identity() -> Result<(), TestFailure> {
-    let root = collection_document()?;
-    let table = ensure_some(root.as_table(), "the collection-view root must remain a table")?;
-    let entries = table.entries();
-    let entry_names = (&entries)
-      .into_iter()
-      .map(|entry| entry.0.value().to_owned())
-      .collect::<Vec<_>>();
-    ensure(
-      (entries.len(), entries.is_empty(), format!("{entries:?}"), entry_names)
-        == (
-          3,
-          false,
-          String::from("Entries { len: 3 }"),
-          ["first", "second", "values"].map(str::to_owned).to_vec(),
-        ),
-      "entry views must expose exact cardinality, debug summary, and source insertion order",
-    )?;
-    let mut entry_iter = entries.iter();
-    let entry_size = entry_iter.size_hint();
-    let front = entry_iter.next().map(|entry| entry.0.value().to_owned());
-    let back = entry_iter.next_back().map(|entry| entry.0.value().to_owned());
-    ensure(
-      (entry_size, front, back, entry_iter.len()) == ((3, Some(3)), Some(String::from("first")), Some(String::from("values")), 1),
-      "entry iterators must preserve size and independent front/back traversal",
-    )?;
-    let empty_entries = Entries::default();
-    ensure(
-      (
-        empty_entries.is_empty(),
-        empty_entries.len(),
-        empty_entries.iter().next().is_none(),
-        empty_entries.iter().next_back().is_none(),
-      ) == (true, 0, true, true),
-      "the default entry view must be a complete empty double-ended collection",
+  fn immutable_entry_views_iterate_from_both_ends_without_losing_identity() -> Result<(), impl Debug> {
+    let observed = collection_document().map(|root| {
+      let view = root.as_table().map(|table| {
+        let entries = table.entries();
+        let all = (&entries).into_iter().collect::<Vec<_>>();
+        let mut iterator = entries.iter();
+        let size = iterator.size_hint();
+        let front = iterator.next();
+        let back = iterator.next_back();
+        let remaining = iterator.collect::<Vec<_>>();
+        (entries, all, size, front, back, remaining)
+      });
+      let empty = Entries::default();
+      let count = empty.len();
+      (root, view, empty, count)
+    });
+    ensure_that(
+      observed,
+      "entry views must retain exact cardinality, debug summary, order, and independent front/back traversal",
+      |fixture| {
+        let Ok(ref value) = *fixture else {
+          return false;
+        };
+
+        value.1.as_ref().is_some_and(|entries| {
+          entries.0.len() == 3
+            && !entries.0.is_empty()
+            && format!("{:?}", entries.0) == "Entries { len: 3 }"
+            && entries.1.iter().map(|entry| entry.0.value()).collect::<Vec<_>>() == ["first", "second", "values"]
+            && entries.2 == (3, Some(3))
+            && entries.3.as_ref().is_some_and(|entry| entry.0.value() == "first")
+            && entries.4.as_ref().is_some_and(|entry| entry.0.value() == "values")
+            && entries.5.len() == 1
+        }) && value.2.is_empty()
+          && value.3 == 0
+          && value.2.iter().next().is_none()
+          && value.2.iter().next_back().is_none()
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn immutable_array_views_iterate_from_both_ends_without_losing_identity() -> Result<(), TestFailure> {
-    let root = collection_document()?;
-    let values = ensure_some(root.get_key("values"), "the array-view fixture must exist")?;
-    let items = ensure_some(values.as_array(), "the array-view fixture must remain an array")?.items();
-    let first = ensure_some(items.first(), "the first immutable array item must exist")?;
-    let last = ensure_some(items.get(2), "the final immutable array item must exist")?;
-    let first_text = ensure_ok(first.to_toml(false, false), "the first immutable array item must render")?;
-    let last_text = ensure_ok(last.to_toml(false, false), "the final immutable array item must render")?;
-    ensure(
-      (
-        items.len(),
-        items.is_empty(),
-        first_text,
-        last_text,
-        items.get(3).is_none(),
-        format!("{items:?}"),
-      ) == (
-        3,
-        false,
-        String::from("3"),
-        String::from("5"),
-        true,
-        String::from("ArrayItems { len: 3 }"),
-      ),
-      "array views must expose ordered bounds-checked children and a stable cardinality summary",
-    )?;
-    let mut borrowed = items.iter();
-    let borrowed_size = borrowed.size_hint();
-    let borrowed_first = ensure_some(borrowed.next(), "borrowed iteration must yield its first item")?;
-    let borrowed_last = ensure_some(borrowed.next_back(), "borrowed iteration must yield its final item")?;
-    ensure(
-      (
-        borrowed_size,
-        ensure_ok(borrowed_first.to_toml(false, false), "the first borrowed array item must render")?,
-        ensure_ok(borrowed_last.to_toml(false, false), "the final borrowed array item must render")?,
-        borrowed.len(),
-      ) == ((3, Some(3)), String::from("3"), String::from("5"), 1),
-      "borrowed array iteration must preserve size and independent front/back traversal",
-    )?;
-    let mut owned = items.clone().into_iter();
-    let owned_size = owned.size_hint();
-    let owned_first = ensure_some(owned.next(), "owned iteration must yield its first item")?;
-    let owned_last = ensure_some(owned.next_back(), "owned iteration must yield its final item")?;
-    ensure(
-      (
-        owned_size,
-        ensure_ok(owned_first.to_toml(false, false), "the first owned array item must render")?,
-        ensure_ok(owned_last.to_toml(false, false), "the final owned array item must render")?,
-        owned.len(),
-        (&items).into_iter().count(),
-      ) == ((3, Some(3)), String::from("3"), String::from("5"), 1, 3),
-      "owned and borrowed array iteration must materialize the same immutable child identities",
+  fn immutable_array_views_iterate_from_both_ends_without_losing_identity() -> Result<(), impl Debug> {
+    let observed = collection_document().map(|root| {
+      let node = root.get_key("values");
+      let view = node.as_ref().and_then(|item| {
+        let array = item.as_array()?;
+        let items = array.items();
+        let bounds = [
+          items.first().map(rendered_item),
+          items.get(2).map(rendered_item),
+          items.get(3).map(rendered_item),
+        ];
+        let mut borrowed = items.iter();
+        let borrowed_size = borrowed.size_hint();
+        let borrowed_ends = [borrowed.next().map(rendered_item), borrowed.next_back().map(rendered_item)];
+        let borrowed_remaining = borrowed.collect::<Vec<_>>();
+        let mut owned = items.clone().into_iter();
+        let owned_size = owned.size_hint();
+        let owned_ends = [owned.next().map(rendered_item), owned.next_back().map(rendered_item)];
+        let owned_remaining = owned.collect::<Vec<_>>();
+        let all = (&items).into_iter().collect::<Vec<_>>();
+        Some((
+          items, bounds, borrowed_size, borrowed_ends, borrowed_remaining, owned_size, owned_ends, owned_remaining, all,
+        ))
+      });
+      (root, node, view)
+    });
+    ensure_that(
+      observed,
+      "array views must retain bounds, complete handles, exact renderings, and independent iterator state",
+      |fixture| {
+        let &Ok((_, Some(_), Some(ref view))) = fixture else {
+          return false;
+        };
+        let [ref first, ref last, ref missing] = view.1;
+        view.0.len() == 3
+          && !view.0.is_empty()
+          && format!("{:?}", view.0) == "ArrayItems { len: 3 }"
+          && missing.is_none()
+          && view.2 == (3, Some(3))
+          && view.4.len() == 1
+          && view.5 == (3, Some(3))
+          && view.7.len() == 1
+          && view.8.len() == 3
+          && [first, last]
+            .into_iter()
+            .chain(view.3.iter())
+            .chain(view.6.iter())
+            .zip(["3", "5", "3", "5", "3", "5"])
+            .all(|(item, expected)| matches!(item, Some((_, Ok(text))) if text == expected))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn detached_and_source_comments_preserve_directive_and_header_polarities() -> Result<(), TestFailure> {
-    let ordinary = Comment::new(" ordinary");
-    let directive = Comment::new_directive("schema", "memory://fixture");
-    let empty = Comment::default();
-    ensure(
-      (
-        ordinary.syntax(),
-        ordinary.is_directive(),
-        ordinary.directive(),
-        ordinary.value(),
-        ordinary.to_string(),
-        empty.to_string(),
-      ) == (None, false, None, " ordinary", String::from("# ordinary"), String::from("#")),
-      "detached ordinary comments must preserve their text without fabricating directive metadata or source",
-    )?;
-    ensure(
-      (
-        directive.syntax(),
-        directive.is_directive(),
-        directive.directive(),
-        directive.value(),
-        directive.to_string(),
-      ) == (
-        None,
-        true,
-        Some("schema"),
-        "memory://fixture",
-        String::from("#:schema memory://fixture"),
-      ),
-      "detached directives must preserve name, payload, and canonical rendering",
-    )?;
-
-    let root = parse_dom(
+  fn detached_and_source_comments_preserve_directive_and_header_polarities() -> Result<(), impl Debug> {
+    let detached = (
+      Comment::new(" ordinary"),
+      Comment::new_directive("schema", "memory://fixture"),
+      Comment::default(),
+    );
+    let sourced = parse_dom(
       "# header\n#:schema memory://fixture\nvalue = 1 # trailing\n",
       "the source-comment fixture must parse",
-    )?;
-    let comments = root.comments().collect::<Vec<_>>();
-    let headers = root.header_comments().collect::<Vec<_>>();
-    let first = ensure_some(comments.first(), "the first source comment must exist")?;
-    let source_directive = ensure_some(comments.get(1), "the source directive must exist")?;
-    let trailing = ensure_some(comments.last(), "the trailing source comment must exist")?;
-    ensure(
-      (
-        comments.len(),
-        headers.len(),
-        comments.iter().map(|comment| comment.syntax().is_some()).collect::<Vec<_>>(),
-        (first.is_directive(), first.value(), first.to_string()),
-        (
-          source_directive.is_directive(),
-          source_directive.directive(),
-          source_directive.value(),
-          source_directive.to_string(),
-        ),
-        trailing.value(),
-        headers.iter().map(Comment::to_string).collect::<Vec<_>>(),
-      ) == (
-        3,
-        2,
-        vec![true, true, true],
-        (false, " header", String::from("# header")),
-        (true, Some("schema"), "memory://fixture", String::from("#:schema memory://fixture")),
-        " trailing",
-        vec![String::from("# header"), String::from("#:schema memory://fixture")],
-      ),
-      "source comments must retain exact token rendering while header selection excludes trailing comments",
     )
+    .map(|root| {
+      let comments = root.comments().collect::<Vec<_>>();
+      let headers = root.header_comments().collect::<Vec<_>>();
+      (root, comments, headers)
+    });
+    ensure_that(
+      (detached, sourced),
+      "detached and source comments must retain payloads, directives, rendering, and header polarity",
+      |observed| {
+        let (ref ordinary, ref directive, ref empty) = observed.0;
+        let Ok(ref source) = observed.1 else {
+          return false;
+        };
+        ordinary.syntax().is_none()
+          && !ordinary.is_directive()
+          && ordinary.directive().is_none()
+          && ordinary.value() == " ordinary"
+          && ordinary.to_string() == "# ordinary"
+          && empty.to_string() == "#"
+          && directive.syntax().is_none()
+          && directive.is_directive()
+          && directive.directive() == Some("schema")
+          && directive.value() == "memory://fixture"
+          && directive.to_string() == "#:schema memory://fixture"
+          && source.1.len() == 3
+          && source.2.len() == 2
+          && source.1.iter().all(|comment| comment.syntax().is_some())
+          && source
+            .1
+            .first()
+            .is_some_and(|comment| !comment.is_directive() && comment.value() == " header" && comment.to_string() == "# header")
+          && source.1.get(1).is_some_and(|comment| {
+            comment.is_directive()
+              && comment.directive() == Some("schema")
+              && comment.value() == "memory://fixture"
+              && comment.to_string() == "#:schema memory://fixture"
+          })
+          && source.1.last().is_some_and(|comment| comment.value() == " trailing")
+          && source.2.iter().map(Comment::to_string).collect::<Vec<_>>() == ["# header", "#:schema memory://fixture"]
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

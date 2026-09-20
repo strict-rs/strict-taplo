@@ -451,83 +451,97 @@ fn write_float(formatter: &mut impl Write, number: f64) -> Result<(), Formatting
 #[cfg(test)]
 /// Rendering contracts for source-backed, detached, invalid, and destination-failure cases.
 mod tests {
+  use core::fmt::Debug;
   use std::fmt::Error as FormattingError;
   use std::fmt::Result as FormattingResult;
   use std::fmt::Write;
   use std::sync::Arc;
 
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_eq;
-  use strict_test_support::ensure_ok;
-  use strict_test_support::ensure_some;
+  use strict_test_support::ensure_that;
 
   use super::RenderError;
   use crate::dom::Keys;
   use crate::dom::Node;
+  use crate::dom::QueryError;
   use crate::dom::node::FloatInner;
   use crate::dom::node::IntegerInner;
   use crate::dom::node::IntegerRepr;
   use crate::dom::node::IntegerValue;
   use crate::dom::node::StrInner;
+  use crate::parser::Parse;
+  use crate::parser::ParseFailure;
   use crate::parser::parse;
 
-  /// Parse one syntax-clean DOM fixture.
-  fn clean_dom(source: &str) -> Result<Node, TestFailure> {
-    let parsed = ensure_ok(parse(source), "the renderer fixture tree must construct")?;
-    ensure(parsed.diagnostics().is_empty(), "the renderer fixture syntax must be clean")?;
-    Ok(parsed.into_dom())
+  /// Retain both syntax diagnostics and the semantic root of a renderer fixture.
+  fn dom_fixture(source: &str) -> Result<(Parse, Node), ParseFailure> {
+    parse(source).map(|parsed| {
+      let root = parsed.clone().into_dom();
+      (parsed, root)
+    })
   }
 
-  /// Resolve the source-backed scalar targeted by a renderer behavior test.
-  #[allow(
-    clippy::single_call_fn,
-    reason = "the helper keeps fixture-path parsing and absence reporting out of the quote-preservation assertion"
-  )]
-  fn path(root: &Node, dotted: &str) -> Result<Node, TestFailure> {
-    let keys = ensure_ok(dotted.parse::<Keys>(), "the renderer fixture path must parse")?;
-    ensure_some(root.path(&keys), "the renderer fixture path must exist")
+  /// Retain the parsed semantic path and its optional source-backed target.
+  fn path(root: &Node, dotted: &str) -> Result<(Keys, Option<Node>), QueryError> {
+    dotted.parse::<Keys>().map(|keys| {
+      let node = root.path(&keys);
+      (keys, node)
+    })
   }
 
   /// Preserve the exact quoting form retained by a source-backed scalar.
   #[test]
-  fn source_backed_scalar_preserves_its_representation() -> Result<(), TestFailure> {
-    let root = clean_dom("value = 'literal'\n")?;
-    let rendered = ensure_ok(path(&root, "value")?.to_toml(true, false), "a valid scalar must render")?;
-    ensure_eq(
-      &rendered,
-      &"'literal'".to_owned(),
-      "a source-backed scalar must preserve its exact quote representation",
-    )
+  fn source_backed_scalar_preserves_its_representation() -> Result<(), impl Debug> {
+    let observed = dom_fixture("value = 'literal'\n").map(|(parsed, root)| {
+      let target = path(&root, "value").map(|(keys, node)| {
+        let rendered = node.as_ref().map(|value| value.to_toml(true, false));
+        (keys, node, rendered)
+      });
+      (parsed, root, target)
+    });
+    ensure_that(observed, "source-backed scalars must preserve exact quoting", |fixture| {
+      let &Ok((ref parsed, _, Ok((_, _, Some(Ok(ref text)))))) = fixture else {
+        return false;
+      };
+      parsed.diagnostics().is_empty() && text == "'literal'"
+    })
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Render and destroy a deeply nested inline table without consuming call-stack depth.
   #[test]
-  fn deeply_nested_inline_table_renders_and_drops_iteratively() -> Result<(), TestFailure> {
-    let shallow_source = "value = { nested = 0 }\n";
-    let shallow = clean_dom(shallow_source)?;
-    ensure_eq(
-      &ensure_ok(shallow.to_toml(false, false), "a shallow inline table must render")?,
-      &shallow_source.to_owned(),
-      "the iterative renderer must retain the ordinary inline-table representation",
-    )?;
-
+  fn deeply_nested_inline_table_renders_and_drops_iteratively() -> Result<(), impl Debug> {
     let depth = 10_000;
-    let source = format!("value = {}0{}\n", "{ nested = ".repeat(depth), " }".repeat(depth));
-    let root = clean_dom(&source)?;
-    let rendered = ensure_ok(
-      root.to_toml(false, false),
-      "a deeply nested semantic tree must render without recursive calls",
-    )?;
-    ensure(
-      rendered == source,
-      "depth-independent rendering must preserve the complete nested inline-table value",
+    let observed = [
+      String::from("value = { nested = 0 }\n"),
+      format!("value = {}0{}\n", "{ nested = ".repeat(depth), " }".repeat(depth)),
+    ]
+    .map(|source| {
+      let fixture = dom_fixture(&source).map(|(parsed, root)| {
+        let rendered = root.to_toml(false, false);
+        (parsed, root, rendered)
+      });
+      (source, fixture)
+    });
+    ensure_that(
+      observed,
+      "shallow and deeply nested inline tables must retain exact source through iterative rendering",
+      |fixtures| {
+        fixtures.iter().all(|fixture| {
+          fixture
+            .1
+            .as_ref()
+            .is_ok_and(|value| value.0.diagnostics().is_empty() && value.2.as_ref().is_ok_and(|rendered| rendered == &fixture.0))
+        })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Keep inline-table assignments local and separated inside consecutive array-table elements.
   #[test]
-  fn array_table_inline_children_render_as_local_assignments() -> Result<(), TestFailure> {
+  fn array_table_inline_children_render_as_local_assignments() -> Result<(), impl Debug> {
     let source = "\
 [[products]]
 name = \"hammer\"
@@ -545,145 +559,166 @@ dimensions = { length = 12, width = 4 }
 name = \"nail\"
 dimensions = { length = 2, width = 1 }
 ";
-    let rendered = ensure_ok(
-      clean_dom(source)?.to_toml(false, false),
-      "array-table elements with inline children must render",
-    )?;
-    ensure_eq(
-      &rendered,
-      &expected.to_owned(),
-      "inline children must use local assignment keys with a terminating newline",
-    )?;
-    let reparsed = ensure_ok(parse(&rendered), "rendered consecutive array-table elements must reparse")?;
-    ensure(
-      [reparsed.diagnostics().is_empty(), reparsed.into_dom().validate().is_ok()] == [true, true],
-      "rendered consecutive array-table elements must remain valid TOML",
+    let observed = dom_fixture(source).map(|(parsed, root)| {
+      let rendered = root.to_toml(false, false).map(|text| {
+        let reparsed = dom_fixture(&text);
+        (text, reparsed)
+      });
+      (parsed, root, rendered)
+    });
+    ensure_that(
+      observed,
+      "array-table inline children must retain local assignments and reparse as valid TOML",
+      |fixture| {
+        let &Ok((ref parsed, _, Ok((ref text, Ok((ref reparsed, ref root)))))) = fixture else {
+          return false;
+        };
+        parsed.diagnostics().is_empty() && text == expected && reparsed.diagnostics().is_empty() && root.validate().is_ok()
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Keep a child usable after the caller releases its original root handle.
   #[test]
-  fn child_handle_survives_root_drop() -> Result<(), TestFailure> {
-    let root = clean_dom("parent = { child = 7 }\n")?;
-    let child = path(&root, "parent.child")?;
-    drop(root);
-    let rendered = ensure_ok(
-      child.to_toml(true, false),
-      "a child handle must retain the immutable arena after its root is released",
-    )?;
-    ensure_eq(
-      &rendered,
-      &"7".to_owned(),
-      "a surviving child handle must retain its decoded value and source spelling",
+  fn child_handle_survives_root_drop() -> Result<(), impl Debug> {
+    let observed = dom_fixture("parent = { child = 7 }\n").map(|(parsed, root)| {
+      let queried_child = path(&root, "parent.child");
+      drop(root);
+      let child = queried_child.map(|(keys, node)| {
+        let rendered = node.as_ref().map(|value| value.to_toml(true, false));
+        (keys, node, rendered)
+      });
+      (parsed, child)
+    });
+    ensure_that(
+      observed,
+      "a child handle must retain its arena and exact scalar spelling after root release",
+      |fixture| {
+        let &Ok((ref parsed, Ok((_, _, Some(Ok(ref text)))))) = fixture else {
+          return false;
+        };
+        parsed.diagnostics().is_empty() && text == "7"
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Select literal or basic quoting for detached strings without producing invalid TOML.
   #[test]
-  fn detached_string_uses_only_valid_quote_forms() -> Result<(), TestFailure> {
-    let string = |value: &str| {
-      Node::from(StrInner {
+  fn detached_string_uses_only_valid_quote_forms() -> Result<(), impl Debug> {
+    let observed = ["simple", "can't"].map(|value| {
+      let node = Node::from(StrInner {
         diagnostics: Arc::default(),
         syntax:      None,
         value:       Arc::from(value),
-      })
-    };
-
-    ensure_eq(
-      &ensure_ok(string("simple").to_toml(true, true), "a simple detached string must render")?,
-      &"'simple'".to_owned(),
-      "single quotes may be preferred when the literal remains valid",
-    )?;
-    ensure_eq(
-      &ensure_ok(
-        string("can't").to_toml(true, true),
-        "an apostrophe-containing detached string must render",
-      )?,
-      &r#""can't""#.to_owned(),
-      "an apostrophe must force basic-string quoting",
+      });
+      let rendered = node.to_toml(true, true);
+      (node, rendered)
+    });
+    ensure_that(
+      observed,
+      "literal preference must preserve simple strings and force valid basic quoting for apostrophes",
+      |values| {
+        let [ref simple, ref apostrophe] = *values;
+        simple.1.as_ref().is_ok_and(|text| text == "'simple'") && apostrophe.1.as_ref().is_ok_and(|text| text == r#""can't""#)
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Render detached finite and special floats with unambiguous TOML floating-point syntax.
   #[test]
-  fn detached_floats_retain_float_syntax() -> Result<(), TestFailure> {
-    let float = |value| {
-      Node::from(FloatInner {
-        diagnostics: Arc::default(),
-        syntax: None,
-        value,
-      })
-    };
-
-    for (value, expected) in [
+  fn detached_floats_retain_float_syntax() -> Result<(), impl Debug> {
+    let observed = [
       (1.0, "1.0"),
       (-0.0, "-0.0"),
       (f64::INFINITY, "inf"),
       (f64::NEG_INFINITY, "-inf"),
       (f64::NAN, "nan"),
-    ] {
-      ensure_eq(
-        &ensure_ok(float(value).to_toml(true, false), "a detached float must render")?,
-        &expected.to_owned(),
-        "detached floating-point values must retain TOML floating-point syntax",
-      )?;
-    }
-    Ok(())
+    ]
+    .map(|(number, expected)| {
+      let node = Node::from(FloatInner {
+        diagnostics: Arc::default(),
+        syntax:      None,
+        value:       number,
+      });
+      let rendered = node.to_toml(true, false);
+      (node, expected, rendered)
+    });
+    ensure_that(
+      observed,
+      "detached finite and special floats must retain TOML float syntax",
+      |values| values.iter().all(|value| value.2.as_ref().is_ok_and(|text| text == value.1)),
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Surface malformed nodes, incompatible integer representations, and conflicts as typed errors.
   #[test]
-  fn malformed_source_and_unsupported_integer_are_typed_errors() -> Result<(), TestFailure> {
-    let invalid = clean_dom("value = 999999999999999999999999999999\n")?;
-    ensure(
-      matches!(invalid.to_toml(false, false), Err(RenderError::InvalidNode { .. })),
-      "malformed source must not be omitted or rendered with a fabricated value",
-    )?;
-
+  fn malformed_source_and_unsupported_integer_are_typed_errors() -> Result<(), impl Debug> {
+    let source_cases = ["value = 999999999999999999999999999999\n", "value = 1\nvalue = 2\n"].map(|source| {
+      dom_fixture(source).map(|(parsed, root)| {
+        let rendered = root.to_toml(false, false);
+        (parsed, root, rendered)
+      })
+    });
     let negative_hex = Node::from(IntegerInner {
       diagnostics: Arc::default(),
       syntax:      None,
       repr:        IntegerRepr::Hex,
       value:       IntegerValue::Negative(-1),
     });
-    ensure(
-      matches!(
-        negative_hex.to_toml(true, false),
-        Err(RenderError::NegativeNonDecimal {
-          representation: IntegerRepr::Hex,
-        })
-      ),
-      "a negative detached non-decimal integer must be rejected explicitly",
-    )?;
-
-    let conflicting = clean_dom("value = 1\nvalue = 2\n")?;
-    ensure(
-      matches!(
-        conflicting.to_toml(false, false),
-        Err(RenderError::SemanticDiagnostics {
-          count
-        }) if count > 0
-      ),
-      "ambiguous semantic state must be rejected before TOML emission",
+    let negative_result = negative_hex.to_toml(true, false);
+    ensure_that(
+      (source_cases, negative_hex, negative_result),
+      "malformed, ambiguous, and incompatible integer values must retain typed render failures",
+      |observed| {
+        let [ref malformed, ref conflicting] = observed.0;
+        malformed
+          .as_ref()
+          .is_ok_and(|value| value.0.diagnostics().is_empty() && matches!(value.2, Err(RenderError::InvalidNode { .. })))
+          && conflicting.as_ref().is_ok_and(|value| {
+            value.0.diagnostics().is_empty() && matches!(value.2, Err(RenderError::SemanticDiagnostics { count }) if count > 0)
+          })
+          && observed.2
+            == Err(RenderError::NegativeNonDecimal {
+              representation: IntegerRepr::Hex,
+            })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Preserve a destination writer failure as the renderer's typed formatting error.
   #[test]
-  fn destination_failure_is_not_erased() -> Result<(), TestFailure> {
+  fn destination_failure_is_not_erased() -> Result<(), impl Debug> {
     /// Writer fixture that rejects every attempted output byte.
     struct RejectingWriter;
-
     impl Write for RejectingWriter {
       fn write_str(&mut self, _: &str) -> FormattingResult {
         Err(FormattingError)
       }
     }
-
-    let root = clean_dom("value = true\n")?;
-    ensure(
-      matches!(root.to_toml_fmt(&mut RejectingWriter, false, false), Err(RenderError::Formatting)),
-      "the caller must receive a typed destination failure",
+    let observed = dom_fixture("value = true\n").map(|(parsed, root)| {
+      let rendered = root.to_toml_fmt(&mut RejectingWriter, false, false);
+      (parsed, root, rendered)
+    });
+    ensure_that(
+      observed,
+      "the destination failure must remain a typed formatting error",
+      |fixture| {
+        fixture
+          .as_ref()
+          .is_ok_and(|value| value.0.diagnostics().is_empty() && value.2 == Err(RenderError::Formatting))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

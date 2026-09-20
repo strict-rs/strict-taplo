@@ -1205,14 +1205,12 @@ pub enum InvalidReason {
 #[cfg(test)]
 /// Immutable DOM construction, traversal, identity, and thread-safety contracts.
 mod tests {
+  use core::cmp::Ordering;
+  use core::fmt::Debug;
   use std::collections::HashSet;
   use std::sync::Arc;
 
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_eq;
-  use strict_test_support::ensure_ok;
-  use strict_test_support::ensure_some;
+  use strict_test_support::ensure_that;
 
   use super::ArrayKind;
   use super::BoolInner;
@@ -1240,373 +1238,418 @@ mod tests {
   /// Require the intended immutable core values to be transferable and shareable.
   fn require_send_sync<T: Send + Sync>() {}
 
-  /// Parse a fixture whose syntax is expected to be clean.
-  fn clean_dom(source: &str) -> Result<Node, TestFailure> {
-    let parsed = ensure_ok(parse(source), "the DOM fixture tree must construct")?;
-    ensure(parsed.diagnostics().is_empty(), "the DOM fixture syntax must be clean")?;
-    Ok(parsed.into_dom())
+  /// Complete parse, semantic root, and validation evidence for a DOM fixture.
+  type DomFixture = (Parse, Node, Result<(), Vec<Diagnostic>>);
+
+  /// Parse a fixture without erasing either diagnostic channel.
+  fn dom_fixture(source: &str) -> Result<DomFixture, ParseFailure> {
+    parse(source).map(|parsed| {
+      let root = parsed.clone().into_dom();
+      let validation = root.validate();
+      (parsed, root, validation)
+    })
   }
 
-  /// Resolve one expected dotted path.
-  fn path(root: &Node, dotted: &str) -> Result<Node, TestFailure> {
-    let keys = ensure_ok(dotted.parse::<Keys>(), "the fixture path must be valid dotted keys")?;
-    ensure_some(root.path(&keys), "the expected DOM path must exist")
-  }
-
-  /// Count conflicting-key diagnostics in a complete DOM.
-  fn conflict_count(root: &Node) -> usize {
-    match root.validate() {
-      Ok(()) => 0,
-      Err(diagnostics) => diagnostics
+  /// Count key conflicts by borrowing complete semantic validation evidence.
+  fn conflict_count(validation: &Result<(), Vec<Diagnostic>>) -> usize {
+    validation.as_ref().err().map_or(0, |diagnostics| {
+      diagnostics
         .iter()
         .filter(|diagnostic| matches!(diagnostic, Diagnostic::ConflictingKeys { .. }))
-        .count(),
-    }
+        .count()
+    })
   }
 
   /// Merge compatible pseudo tables while retaining every contributing source range.
   #[test]
-  fn shared_pseudo_tables_merge_entries_and_source_ranges() -> Result<(), TestFailure> {
-    let root = clean_dom("a.b.c = 1\na.b.d = 2\n")?;
-    ensure(
-      matches!(path(&root, "a.b.c")?, Node::Integer(_)),
-      "the first dotted-key leaf must survive the pseudo-table merge",
-    )?;
-    ensure(
-      matches!(path(&root, "a.b.d")?, Node::Integer(_)),
-      "the second dotted-key leaf must survive the pseudo-table merge",
-    )?;
-
-    let Node::Table(ref root_table) = root else {
-      return ensure(false, "a parsed document root must be a table");
-    };
-    let root_key = ensure_some(
-      root_table.entries().iter().next().map(|(key, _)| key),
-      "the root pseudo-table key must exist",
-    )?;
-    ensure_eq(
-      &root_key.text_ranges().count(),
-      &2,
-      "the shared root key must retain both source occurrences",
-    )?;
-
-    let Node::Table(a_table) = path(&root, "a")? else {
-      return ensure(false, "the shared root path must remain a table");
-    };
-    let nested_key = ensure_some(
-      a_table.entries().iter().next().map(|(key, _)| key),
-      "the nested pseudo-table key must exist",
-    )?;
-    ensure_eq(
-      &nested_key.text_ranges().count(),
-      &2,
-      "the shared nested key must retain both source occurrences",
-    )?;
-    ensure_eq(&conflict_count(&root), &0, "compatible pseudo tables must not create conflicts")
+  fn shared_pseudo_tables_merge_entries_and_source_ranges() -> Result<(), impl Debug> {
+    ensure_that(
+      dom_fixture("a.b.c = 1\na.b.d = 2\n"),
+      "pseudo-table merges must preserve both leaves, source ranges, and clean semantics",
+      |fixture| {
+        let &Ok((ref parsed, ref root, ref validation)) = fixture else {
+          return false;
+        };
+        let Some(table) = root.as_table() else {
+          return false;
+        };
+        let Some(outer) = root.get_key("a") else {
+          return false;
+        };
+        let Some(outer_table) = outer.as_table() else {
+          return false;
+        };
+        let Some(inner) = outer.get_key("b") else {
+          return false;
+        };
+        parsed.diagnostics().is_empty()
+          && conflict_count(validation) == 0
+          && table
+            .entries()
+            .iter()
+            .next()
+            .is_some_and(|entry| entry.0.text_ranges().count() == 2)
+          && outer_table
+            .entries()
+            .iter()
+            .next()
+            .is_some_and(|entry| entry.0.text_ranges().count() == 2)
+          && ["c", "d"]
+            .into_iter()
+            .all(|key| inner.get_key(key).is_some_and(|node| node.is_integer()))
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Report incompatible collisions without deleting either historical entry.
   #[test]
-  fn incompatible_source_collisions_report_conflicts_and_keep_history() -> Result<(), TestFailure> {
-    for source in ["a.b = 1\na = 2\n", "a = 1\n[a]\nb = 2\n", "a = 1\na = 2\n"] {
-      let root = clean_dom(source)?;
-      ensure(
-        conflict_count(&root) > 0,
-        "every incompatible source collision must report a key conflict",
-      )?;
-      let Node::Table(root_table) = root else {
-        return ensure(false, "a parsed document root must be a table");
-      };
-      ensure_eq(
-        &root_table.entries().len(),
-        &2,
-        "a collision must retain insertion history alongside the lookup winner",
-      )?;
-    }
-    Ok(())
+  fn incompatible_source_collisions_report_conflicts_and_keep_history() -> Result<(), impl Debug> {
+    ensure_that(
+      ["a.b = 1\na = 2\n", "a = 1\n[a]\nb = 2\n", "a = 1\na = 2\n"].map(dom_fixture),
+      "incompatible collisions must retain conflicts and both historical entries",
+      |fixtures| {
+        fixtures.iter().all(|fixture| {
+          matches!(*fixture, Ok(ref value) if value.0.diagnostics().is_empty()
+          && conflict_count(&value.2) > 0 && value.1.as_table().is_some_and(|table| table.entries().len() == 2))
+        })
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Preserve conflict history in both iterator directions while lookup selects the final value.
   #[test]
-  fn conflicting_entries_preserve_order_while_lookup_uses_the_latest_value() -> Result<(), TestFailure> {
-    let root = clean_dom("value = 1\nvalue = 2\nvalue = 3\n")?;
-    let table = ensure_some(root.as_table(), "the conflicting-entry fixture root must be a table")?;
-    let forward = ensure_some(
-      table
-        .entries()
-        .iter()
-        .map(|(_, node)| node.as_integer().map(super::Integer::value))
-        .collect::<Option<Vec<_>>>(),
-      "every conflicting historical value must remain an integer",
-    )?;
-    let reverse = ensure_some(
-      table
-        .entries()
-        .iter()
-        .rev()
-        .map(|(_, node)| node.as_integer().map(super::Integer::value))
-        .collect::<Option<Vec<_>>>(),
-      "reverse iteration must retain every conflicting historical integer",
-    )?;
-    ensure(
-      forward == vec![IntegerValue::Positive(1), IntegerValue::Positive(2), IntegerValue::Positive(3)],
-      "forward iteration must retain conflicting values in source order",
-    )?;
-    ensure(
-      reverse == vec![IntegerValue::Positive(3), IntegerValue::Positive(2), IntegerValue::Positive(1)],
-      "reverse iteration must retain the exact opposite historical order",
-    )?;
+  fn conflicting_entries_preserve_order_while_lookup_uses_the_latest_value() -> Result<(), impl Debug> {
+    let observed = dom_fixture("value = 1\nvalue = 2\nvalue = 3\n").map(|fixture| {
+      let entries = fixture.1.as_table().map(|table| {
+        (
+          table.entries().iter().collect::<Vec<_>>(),
+          table.entries().iter().rev().collect::<Vec<_>>(),
+        )
+      });
+      let winner = fixture.1.get_key("value");
+      (fixture, entries, winner)
+    });
+    ensure_that(
+      observed,
+      "conflict history must retain both iterator orders while lookup chooses the latest value",
+      |fixture| {
+        let Ok(ref value) = *fixture else {
+          return false;
+        };
 
-    let winner = ensure_some(root.get_key("value"), "decoded-key lookup must retain a conflict winner")?;
-    let winner_value = ensure_some(winner.as_integer(), "the winning conflicting value must remain an integer")?.value();
-    ensure_eq(
-      &winner_value,
-      &IntegerValue::Positive(3),
-      "decoded-key lookup must return the final source occurrence",
+        value.0.0.diagnostics().is_empty()
+          && value.1.as_ref().is_some_and(|entries| {
+            entries
+              .0
+              .iter()
+              .map(|entry| entry.1.as_integer().map(super::Integer::value))
+              .collect::<Vec<_>>()
+              == [
+                Some(IntegerValue::Positive(1)),
+                Some(IntegerValue::Positive(2)),
+                Some(IntegerValue::Positive(3)),
+              ]
+              && entries
+                .1
+                .iter()
+                .map(|entry| entry.1.as_integer().map(super::Integer::value))
+                .collect::<Vec<_>>()
+                == [
+                  Some(IntegerValue::Positive(3)),
+                  Some(IntegerValue::Positive(2)),
+                  Some(IntegerValue::Positive(1)),
+                ]
+          })
+          && value.2.as_ref().is_some_and(|node| {
+            node
+              .as_integer()
+              .is_some_and(|integer| integer.value() == IntegerValue::Positive(3))
+          })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Permit one explicit definition of a table previously implied by a descendant header.
   #[test]
-  fn implicit_header_can_be_defined_once() -> Result<(), TestFailure> {
-    let root = clean_dom("[a.b]\nvalue = 1\n[a]\nother = 2\n")?;
-    ensure_eq(
-      &conflict_count(&root),
-      &0,
-      "a super-table implied by an earlier header may be explicitly defined once",
-    )?;
-    let Node::Table(table) = path(&root, "a")? else {
-      return ensure(false, "the defined super-table must remain a table");
-    };
-    ensure(
-      table.kind() == TableKind::Regular,
-      "an explicitly defined super-table must no longer remain pseudo",
-    )?;
-    ensure(
-      [path(&root, "a.b.value")?.is_integer(), path(&root, "a.other")?.is_integer()] == [true, true],
-      "defining the super-table must preserve earlier children and accept later entries",
+  fn implicit_header_can_be_defined_once() -> Result<(), impl Debug> {
+    ensure_that(
+      dom_fixture("[a.b]\nvalue = 1\n[a]\nother = 2\n"),
+      "one explicit super-table definition must preserve earlier children and accept later entries without conflicts",
+      |fixture| {
+        let Ok(ref value) = *fixture else {
+          return false;
+        };
+
+        value.0.diagnostics().is_empty()
+          && conflict_count(&value.2) == 0
+          && value.1.get_key("a").is_some_and(|node| {
+            node.as_table().is_some_and(|table| table.kind() == TableKind::Regular)
+              && node
+                .get_key("b")
+                .and_then(|child| child.get_key("value"))
+                .is_some_and(|child| child.is_integer())
+              && node.get_key("other").is_some_and(|child| child.is_integer())
+          })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Diagnose a second explicit definition after an implicit table has been materialized.
   #[test]
-  fn implicit_header_redefinition_is_a_conflict() -> Result<(), TestFailure> {
-    let root = clean_dom("[a.b]\nvalue = 1\n[a]\nfirst = 2\n[a]\nsecond = 3\n")?;
-    ensure_eq(
-      &conflict_count(&root),
-      &1,
-      "an implicit super-table becomes explicitly defined after its first header",
+  fn implicit_header_redefinition_is_a_conflict() -> Result<(), impl Debug> {
+    ensure_that(
+      dom_fixture("[a.b]\nvalue = 1\n[a]\nfirst = 2\n[a]\nsecond = 3\n"),
+      "a second explicit super-table definition must produce exactly one conflict",
+      |fixture| {
+        fixture
+          .as_ref()
+          .is_ok_and(|value| value.0.diagnostics().is_empty() && conflict_count(&value.2) == 1)
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Resolve array-table intermediates while diagnosing incompatible inline container prefixes.
   #[test]
-  fn intermediate_headers_preserve_container_compatibility_contracts() -> Result<(), TestFailure> {
-    let inline_table = clean_dom("a = { value = 1 }\n[a.b]\nchild = 2\n")?;
-    let inline_table_errors = ensure_some(
-      inline_table.validate().err(),
-      "an inline-table prefix must reject a descendant regular header",
-    )?;
-    ensure(
-      inline_table_errors
-        .iter()
-        .any(|diagnostic| matches!(diagnostic, Diagnostic::ExpectedTable { .. })),
-      "an inline-table prefix must retain the expected-table diagnostic family",
-    )?;
-
-    let inline_array = clean_dom("a = [1]\n[a.b]\nchild = 2\n")?;
-    let inline_array_errors = ensure_some(
-      inline_array.validate().err(),
-      "an inline-array prefix must reject a descendant regular header",
-    )?;
-    ensure(
-      inline_array_errors
-        .iter()
-        .any(|diagnostic| matches!(diagnostic, Diagnostic::ExpectedArrayOfTables { .. })),
-      "an inline-array prefix must retain the expected-array-of-tables diagnostic family",
-    )?;
-
-    let array_tables = clean_dom("[[a]]\nvalue = 1\n[a.b]\nchild = 2\n")?;
-    ensure(
-      array_tables.validate().is_ok(),
-      "a descendant header must attach to the latest array-table element",
-    )?;
-    let array = ensure_some(
-      array_tables.get_key("a").and_then(|node| node.as_array().cloned()),
-      "the compatible array-table root must remain an array",
-    )?;
-    let item = ensure_some(
-      array.items().first(),
-      "the compatible array-table root must retain its first element",
-    )?;
-    let child = ensure_some(
-      item.get_key("b").and_then(|table| table.get_key("child")),
-      "the descendant header must remain beneath the concrete array-table element",
-    )?;
-    ensure(child.is_integer(), "the compatible array-table descendant must remain addressable")
+  fn intermediate_headers_preserve_container_compatibility_contracts() -> Result<(), impl Debug> {
+    ensure_that(
+      [
+        "a = { value = 1 }\n[a.b]\nchild = 2\n",
+        "a = [1]\n[a.b]\nchild = 2\n",
+        "[[a]]\nvalue = 1\n[a.b]\nchild = 2\n",
+      ]
+      .map(dom_fixture),
+      "headers must reject incompatible inline prefixes and attach beneath the latest array-table element",
+      |fixtures| {
+        let &[Ok(ref table), Ok(ref array), Ok(ref tables)] = fixtures else {
+          return false;
+        };
+        table.0.diagnostics().is_empty()
+          && array.0.diagnostics().is_empty()
+          && tables.0.diagnostics().is_empty()
+          && table
+            .2
+            .as_ref()
+            .is_err_and(|errors| errors.iter().any(|error| matches!(error, Diagnostic::ExpectedTable { .. })))
+          && array.2.as_ref().is_err_and(|errors| {
+            errors
+              .iter()
+              .any(|error| matches!(error, Diagnostic::ExpectedArrayOfTables { .. }))
+          })
+          && tables.2.is_ok()
+          && tables
+            .1
+            .get_key("a")
+            .and_then(|node| node.get_index(0))
+            .and_then(|node| node.get_key("b"))
+            .and_then(|node| node.get_key("child"))
+            .is_some_and(|node| node.is_integer())
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Keep distinct decoded keys addressable without semantic conflicts.
   #[test]
-  fn nonconflicting_insertion_is_clean() -> Result<(), TestFailure> {
-    let root = clean_dom("a = 1\nb = 2\n")?;
-    ensure_eq(&conflict_count(&root), &0, "distinct keys must not create a conflict")?;
-    ensure(
-      [path(&root, "a")?.is_integer(), path(&root, "b")?.is_integer()] == [true, true],
-      "both distinct entries must remain addressable",
+  fn nonconflicting_insertion_is_clean() -> Result<(), impl Debug> {
+    ensure_that(
+      dom_fixture("a = 1\nb = 2\n"),
+      "distinct keys must remain addressable without conflicts",
+      |fixture| {
+        let Ok(ref value) = *fixture else {
+          return false;
+        };
+
+        value.0.diagnostics().is_empty()
+          && conflict_count(&value.2) == 0
+          && ["a", "b"]
+            .into_iter()
+            .all(|key| value.1.get_key(key).is_some_and(|node| node.is_integer()))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Expose exact forward and reverse source order from immutable entries.
   #[test]
-  fn ordered_entries_iterate_forward_and_backward() -> Result<(), TestFailure> {
-    let root = clean_dom("first = 1\nsecond = 2\nthird = 3\n")?;
-    let table = ensure_some(root.as_table(), "a parsed document root must expose its table")?;
-    let forward = table
-      .entries()
-      .iter()
-      .map(|(key, _)| key.value().to_owned())
-      .collect::<Vec<_>>();
-    let backward = table
-      .entries()
-      .iter()
-      .rev()
-      .map(|(key, _)| key.value().to_owned())
-      .collect::<Vec<_>>();
+  fn ordered_entries_iterate_forward_and_backward() -> Result<(), impl Debug> {
+    let observed = dom_fixture("first = 1\nsecond = 2\nthird = 3\n").map(|fixture| {
+      let entries = fixture.1.as_table().map(|table| {
+        (
+          table.entries().iter().collect::<Vec<_>>(),
+          table.entries().iter().rev().collect::<Vec<_>>(),
+        )
+      });
+      (fixture, entries)
+    });
+    ensure_that(
+      observed,
+      "immutable entries must retain exact forward and reverse source order",
+      |fixture| {
+        let Ok(ref value) = *fixture else {
+          return false;
+        };
 
-    ensure(
-      forward == vec!["first".to_owned(), "second".to_owned(), "third".to_owned()],
-      "forward entry iteration must retain source insertion order",
-    )?;
-    ensure(
-      backward == vec!["third".to_owned(), "second".to_owned(), "first".to_owned()],
-      "reverse entry iteration must expose the exact opposite insertion order",
+        value.0.0.diagnostics().is_empty()
+          && value.1.as_ref().is_some_and(|entries| {
+            entries.0.iter().map(|entry| entry.0.value()).collect::<Vec<_>>() == ["first", "second", "third"]
+              && entries.1.iter().map(|entry| entry.0.value()).collect::<Vec<_>>() == ["third", "second", "first"]
+          })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Convert a missing value into a tolerant invalid node without consuming its successor.
   #[test]
-  fn missing_entry_value_becomes_invalid_without_consuming_the_next_entry() -> Result<(), TestFailure> {
-    let parsed = ensure_ok(
-      parse("missing =\nnext = 1\n"),
-      "the malformed entry fixture tree must still construct",
-    )?;
-    ensure(
-      !parsed.diagnostics().is_empty(),
-      "a missing entry value must retain a recoverable syntax diagnostic",
-    )?;
-    let root = parsed.into_dom();
+  fn missing_entry_value_becomes_invalid_without_consuming_the_next_entry() -> Result<(), impl Debug> {
+    ensure_that(
+      dom_fixture("missing =\nnext = 1\n"),
+      "missing values must retain syntax diagnostics and an invalid node without consuming the next entry",
+      |fixture| {
+        let Ok(ref value) = *fixture else {
+          return false;
+        };
 
-    ensure(
-      path(&root, "missing")?.is_invalid(),
-      "a missing entry value must become an invalid semantic node",
-    )?;
-    ensure(
-      path(&root, "next")?.is_integer(),
-      "entry recovery must preserve the following valid scalar",
+        !value.0.diagnostics().is_empty()
+          && value.1.get_key("missing").is_some_and(|node| node.is_invalid())
+          && value.1.get_key("next").is_some_and(|node| node.is_integer())
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Preserve the intended scalar kind and decode failure on malformed numeric source.
   #[test]
-  fn malformed_scalar_becomes_typed_invalid_node() -> Result<(), TestFailure> {
-    let root = clean_dom("value = 999999999999999999999999999999\n")?;
-    let Node::Invalid(invalid) = path(&root, "value")? else {
-      return ensure(false, "an out-of-range integer must become an invalid node");
-    };
-    ensure(
-      matches!(
-        invalid.reason(),
-        InvalidReason::MalformedScalar(malformed) if malformed.kind() == ScalarKind::Integer
-      ),
-      "the invalid node must retain its intended integer kind and decode failure",
-    )?;
-    ensure(
-      invalid
-        .errors()
-        .iter()
-        .any(|diagnostic| matches!(diagnostic, Diagnostic::MalformedScalar(_))),
-      "the malformed scalar must publish a semantic diagnostic",
+  fn malformed_scalar_becomes_typed_invalid_node() -> Result<(), impl Debug> {
+    ensure_that(
+      dom_fixture("value = 999999999999999999999999999999\n"),
+      "out-of-range integers must retain their typed invalid reason and semantic diagnostic",
+      |fixture| {
+        let &Ok((ref parsed, ref root, _)) = fixture else {
+          return false;
+        };
+        let Some(node) = root.get_key("value") else {
+          return false;
+        };
+        let Some(invalid) = node.as_invalid() else {
+          return false;
+        };
+        parsed.diagnostics().is_empty()
+          && matches!(invalid.reason(), InvalidReason::MalformedScalar(malformed) if malformed.kind() == ScalarKind::Integer)
+          && invalid
+            .errors()
+            .iter()
+            .any(|error| matches!(error, Diagnostic::MalformedScalar(_)))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
-  /// Represent lookup absence as `None` and match globs against actual decoded keys.
+  /// Represent lookup absence as None and match globs against actual decoded keys.
   #[test]
-  fn missing_lookup_is_none_and_glob_matches_real_keys() -> Result<(), TestFailure> {
-    let root = clean_dom("alpha = 1\nbeta = 2\n")?;
-    ensure(
-      root.get_key("missing").is_none(),
-      "lookup absence must not manufacture an invalid node",
-    )?;
-    let matches = ensure_ok(root.get_matches("a*"), "the glob query must compile")?.collect::<Vec<_>>();
-    ensure_eq(&matches.len(), &1, "the glob must match only the actual alpha key")?;
-    ensure(
-      matches
-        .first()
-        .is_some_and(|matched| matched.0.as_key().is_some_and(|matched_key| matched_key.value() == "alpha")),
-      "the matched key must be alpha rather than the pattern itself",
+  fn missing_lookup_is_none_and_glob_matches_real_keys() -> Result<(), impl Debug> {
+    let observed = dom_fixture("alpha = 1\nbeta = 2\n").map(|fixture| {
+      let matched = fixture.1.get_matches("a*").map(Iterator::collect::<Vec<_>>);
+      (fixture, matched)
+    });
+    ensure_that(
+      observed,
+      "missing lookup must remain absent and globs must return actual decoded keys",
+      |fixture| {
+        let Ok(ref value) = *fixture else {
+          return false;
+        };
+
+        value.0.0.diagnostics().is_empty()
+          && value.0.1.get_key("missing").is_none()
+          && value.1.as_ref().is_ok_and(|matched| {
+            matched.len() == 1
+              && matched
+                .first()
+                .is_some_and(|entry| entry.0.as_key().is_some_and(|key| key.value() == "alpha"))
+          })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Validate glob syntax independently of document contents and honor exact-depth queries.
   #[test]
-  fn path_globs_are_validated_before_traversal_and_respect_depth() -> Result<(), TestFailure> {
-    let empty = clean_dom("")?;
-    ensure(
-      matches!(
-        empty.find_all_matches(&Keys::single(Key::new("[")), false),
-        Err(QueryError::InvalidGlob(_))
-      ),
-      "an invalid glob must be rejected even when the document has no descendants",
-    )?;
-
-    let root = clean_dom("a.b = 1\na.c.d = 2\n")?;
-    let query = Keys::single(Key::new("a"));
-    let exact_count = ensure_ok(root.find_all_matches(&query, false), "the exact-depth query must compile")?.len();
-    ensure_eq(&exact_count, &1, "an exact-depth query must return only the matched table")?;
-
-    let descendant_count = ensure_ok(root.find_all_matches(&query, true), "the prefix query must compile")?.len();
-    ensure_eq(
-      &descendant_count,
-      &4,
-      "a prefix query must include the matched table and all of its descendants",
+  fn path_globs_are_validated_before_traversal_and_respect_depth() -> Result<(), impl Debug> {
+    let empty = dom_fixture("").map(|fixture| {
+      let rejected = fixture
+        .1
+        .find_all_matches(&Keys::single(Key::new("[")), false)
+        .map(Iterator::collect::<Vec<_>>);
+      (fixture, rejected)
+    });
+    let nested = dom_fixture("a.b = 1\na.c.d = 2\n").map(|fixture| {
+      let query = Keys::single(Key::new("a"));
+      let exact = fixture.1.find_all_matches(&query, false).map(Iterator::collect::<Vec<_>>);
+      let descendants = fixture.1.find_all_matches(&query, true).map(Iterator::collect::<Vec<_>>);
+      (fixture, query, exact, descendants)
+    });
+    ensure_that(
+      (empty, nested),
+      "invalid globs must fail before traversal while exact and prefix queries retain their depths",
+      |observed| {
+        observed
+          .0
+          .as_ref()
+          .is_ok_and(|value| value.0.0.diagnostics().is_empty() && matches!(value.1, Err(QueryError::InvalidGlob(_))))
+          && observed.1.as_ref().is_ok_and(|value| {
+            value.0.0.diagnostics().is_empty()
+              && value.2.as_ref().is_ok_and(|matched| matched.len() == 1)
+              && value.3.as_ref().is_ok_and(|matched| matched.len() == 4)
+          })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Keep detached semantic values free of fabricated source provenance.
   #[test]
-  fn detached_nodes_do_not_fabricate_source_ranges() -> Result<(), TestFailure> {
+  fn detached_nodes_do_not_fabricate_source_ranges() -> Result<(), impl Debug> {
     let detached: Node = BoolInner {
       diagnostics: Arc::default(),
       syntax:      None,
       value:       true,
     }
     .into();
-
-    ensure_eq(
-      &detached.text_ranges(true).count(),
-      &0,
-      "a detached semantic value must not claim the source origin range",
+    let ranges = detached.text_ranges(true).collect::<Vec<_>>();
+    ensure_that(
+      (detached, ranges),
+      "detached semantic nodes must not fabricate source ranges",
+      |observed| observed.1.is_empty(),
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Preserve valid detached-key rendering and identity-based equality for invalid keys.
   #[test]
-  fn detached_and_invalid_keys_preserve_valid_rendering_and_equality() -> Result<(), TestFailure> {
+  fn detached_and_invalid_keys_preserve_valid_rendering_and_equality() -> Result<(), impl Debug> {
     let parent = Key::new("parent");
-    ensure(parent.as_ref() == "parent", "a key must expose its decoded value through `AsRef`")?;
     let joined = parent.join(Key::new("child"));
-    let expected = Keys::new([KeyOrIndex::Key(parent), KeyOrIndex::Key(Key::new("child"))].into_iter());
-    ensure(
-      joined == expected,
-      "joining a key must retain the parent and append exactly one child segment",
-    )?;
-    ensure_eq(
-      &Key::new("can't\n").to_string(),
-      &"\"can't\\n\"".to_owned(),
-      "a detached non-bare key must use escaped basic-key syntax",
-    )?;
-
+    let expected = Keys::new([KeyOrIndex::Key(parent.clone()), KeyOrIndex::Key(Key::new("child"))].into_iter());
+    let escaped = Key::new("can't\n");
     let invalid = KeyInner {
       diagnostics:         Arc::default(),
       syntax:              None,
@@ -1624,17 +1667,24 @@ mod tests {
       additional_syntaxes: Arc::default(),
     }
     .wrap();
-    ensure(invalid == same, "clones of one invalid key must remain reflexively equal")?;
-    ensure(
-      invalid != distinct,
-      "separate invalid keys must not collapse into one semantic lookup identity",
-    )?;
     let mut invalid_keys = HashSet::new();
-    ensure(invalid_keys.insert(invalid), "the first invalid key identity must be insertable")?;
-    ensure(
-      (invalid_keys.contains(&same), invalid_keys.contains(&distinct)) == (true, false),
-      "invalid-key hashing must preserve clone identity without conflating distinct invalid keys",
+    let inserted = invalid_keys.insert(invalid.clone());
+    ensure_that(
+      (parent, joined, expected, escaped, invalid, same, distinct, invalid_keys, inserted),
+      "detached rendering and invalid-key hashing must retain semantic and allocation identity",
+      |observed| {
+        observed.0.as_ref() == "parent"
+          && observed.1 == observed.2
+          && observed.3.to_string() == "\"can't\\n\""
+          && observed.4 == observed.5
+          && observed.4 != observed.6
+          && observed.8
+          && observed.7.contains(&observed.5)
+          && !observed.7.contains(&observed.6)
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Require every published immutable DOM and rewrite value to remain `Send + Sync`.
@@ -1673,65 +1723,63 @@ mod tests {
 
   /// Share one frozen document comment index across enum and concrete node wrappers.
   #[test]
-  fn frozen_comments_are_shared_from_the_document_root() -> Result<(), TestFailure> {
-    let root = clean_dom("# header\n#:schema memory://fixture\nvalue = 1 # trailing\n")?;
-    let scalar = path(&root, "value")?;
-    let table = ensure_some(root.as_table(), "the document root must expose its concrete table")?;
-    let integer = ensure_some(scalar.as_integer(), "the scalar fixture must expose its concrete integer wrapper")?;
-    let root_comments = root
-      .comments()
-      .map(|comment| (comment.directive().map(ToOwned::to_owned), comment.value().to_owned()))
-      .collect::<Vec<_>>();
-    let scalar_comments = scalar
-      .comments()
-      .map(|comment| (comment.directive().map(ToOwned::to_owned), comment.value().to_owned()))
-      .collect::<Vec<_>>();
-    let table_comments = table
-      .comments()
-      .map(|comment| (comment.directive().map(ToOwned::to_owned), comment.value().to_owned()))
-      .collect::<Vec<_>>();
-    let integer_comments = integer
-      .comments()
-      .map(|comment| (comment.directive().map(ToOwned::to_owned), comment.value().to_owned()))
-      .collect::<Vec<_>>();
-    ensure(
-      scalar_comments == root_comments,
-      "every frozen node must share the document-wide immutable comment index",
-    )?;
-    ensure(
-      table_comments == root_comments,
-      "a concrete table wrapper must share the document-wide immutable comment index",
-    )?;
-    ensure(
-      integer_comments == root_comments,
-      "a concrete scalar wrapper must share the document-wide immutable comment index",
-    )?;
-    ensure(
-      root_comments
-        == vec![
-          (None, " header".to_owned()),
-          (Some("schema".to_owned()), "memory://fixture".to_owned()),
-          (None, " trailing".to_owned()),
-        ],
-      "ordinary and directive comments must decode once in source order",
-    )?;
-
-    let node_headers = scalar
-      .header_comments()
-      .map(|comment| comment.value().to_owned())
-      .collect::<Vec<_>>();
-    let concrete_headers = integer
-      .header_comments()
-      .map(|comment| comment.value().to_owned())
-      .collect::<Vec<_>>();
-    ensure(
-      node_headers == vec![" header".to_owned(), "memory://fixture".to_owned()],
-      "header comments must exclude comments attached after the first document item",
-    )?;
-    ensure(
-      concrete_headers == node_headers,
-      "concrete and enum wrappers must expose the same frozen header comments",
+  fn frozen_comments_are_shared_from_the_document_root() -> Result<(), impl Debug> {
+    let observed = dom_fixture("# header\n#:schema memory://fixture\nvalue = 1 # trailing\n").map(|fixture| {
+      let root_comments = fixture.1.comments().collect::<Vec<_>>();
+      let table_comments = fixture.1.as_table().map(|table| table.comments().collect::<Vec<_>>());
+      let scalar = fixture.1.get_key("value").map(|node| {
+        let comments = node.comments().collect::<Vec<_>>();
+        let headers = node.header_comments().collect::<Vec<_>>();
+        (node, comments, headers)
+      });
+      let concrete = scalar
+        .as_ref()
+        .and_then(|scalar_parts| scalar_parts.0.as_integer())
+        .map(|integer| {
+          (
+            integer.comments().collect::<Vec<_>>(),
+            integer.header_comments().collect::<Vec<_>>(),
+          )
+        });
+      (fixture, root_comments, table_comments, scalar, concrete)
+    });
+    ensure_that(
+      observed,
+      "all frozen node wrappers must share complete ordinary/directive comments and header selection",
+      |fixture| {
+        let &Ok((
+          ref value,
+          ref comments,
+          Some(ref table_comments),
+          Some((_, ref scalar_comments, ref scalar_headers)),
+          Some((ref concrete_comments, ref concrete_headers)),
+        )) = fixture
+        else {
+          return false;
+        };
+        value.0.diagnostics().is_empty()
+          && comments
+            .iter()
+            .map(|comment| (comment.directive(), comment.value()))
+            .collect::<Vec<_>>()
+            == [(None, " header"), (Some("schema"), "memory://fixture"), (None, " trailing")]
+          && table_comments.iter().map(Comment::to_string).collect::<Vec<_>>()
+            == comments.iter().map(Comment::to_string).collect::<Vec<_>>()
+          && scalar_comments.iter().map(Comment::to_string).collect::<Vec<_>>()
+            == comments.iter().map(Comment::to_string).collect::<Vec<_>>()
+          && scalar_headers.len() == 2
+          && scalar_headers
+            .iter()
+            .zip([" header", "memory://fixture"])
+            .all(|(comment, expected)| comment.value() == expected)
+          && concrete_comments.iter().map(Comment::to_string).collect::<Vec<_>>()
+            == comments.iter().map(Comment::to_string).collect::<Vec<_>>()
+          && concrete_headers.iter().map(Comment::to_string).collect::<Vec<_>>()
+            == scalar_headers.iter().map(Comment::to_string).collect::<Vec<_>>()
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Complete source fixture shared by the concrete wrapper contract tests.
@@ -1739,11 +1787,6 @@ mod tests {
     "# document\nboolean = true\nstring = \"value\"\nnegative = -2\npositive = 3\nbinary = 0b10\noctal = 0o10\nhexadecimal = 0x10\nfloat \
      = 1.5\noffset = 1979-05-27T07:32:00Z\nlocal = 1979-05-27T07:32:00\nlocal_fraction = 1979-05-27T07:32:00.5\ndate = 1979-05-27\ntime = \
      07:32:00\ntime_fraction = 07:32:00.5\narray = [1]\ninvalid = 999999999999999999999999999999\n[[tables]]\nname = \"first\"\n";
-
-  /// Parse the complete concrete wrapper fixture.
-  fn concrete_wrapper_dom() -> Result<Node, TestFailure> {
-    clean_dom(CONCRETE_WRAPPER_SOURCE)
-  }
 
   /// Project source metadata shared by every concrete node wrapper.
   fn source_facts(node: &Node) -> (bool, usize, bool, usize, usize) {
@@ -1756,245 +1799,229 @@ mod tests {
     )
   }
 
-  /// Require one source-backed wrapper to retain shared fixture metadata.
-  fn ensure_source_backed_wrapper(node: &Node, debug_name_present: bool, context: &'static str) -> Result<(), TestFailure> {
-    ensure((source_facts(node), debug_name_present) == ((true, 0, true, 1, 1), true), context)
-  }
-
   /// Expose source metadata and decoded values through table, Boolean, and string wrappers.
   #[test]
-  fn table_boolean_and_string_wrappers_preserve_source_contracts() -> Result<(), TestFailure> {
-    let root = concrete_wrapper_dom()?;
-    let table = ensure_some(root.as_table(), "the wrapper fixture root must be a table")?;
-    ensure(
-      (
-        table.syntax().is_some(),
-        table.errors().len(),
-        table.is_valid_node(),
-        table.kind(),
-        table.header_comments().count(),
-        format!("{table:?}").contains("Table"),
-      ) == (true, 0, true, TableKind::Regular, 1, true),
-      "the root table wrapper must retain source metadata, comments, kind, and stable debug identity",
-    )?;
-
-    let boolean_node = path(&root, "boolean")?;
-    let boolean = ensure_some(boolean_node.as_bool(), "the Boolean path must expose its concrete wrapper")?;
-    let string_node = path(&root, "string")?;
-    let string = ensure_some(string_node.as_str(), "the string path must expose its concrete wrapper")?;
-    ensure_eq(&boolean.value(), &true, "the Boolean wrapper must expose its decoded value")?;
-    ensure_eq(&string.value(), &"value", "the string wrapper must expose its decoded value")?;
-    ensure(
-      [
-        (source_facts(&boolean_node), format!("{boolean:?}").contains("Bool")),
-        (source_facts(&string_node), format!("{string:?}").contains("Str")),
-      ] == [((true, 0, true, 1, 1), true), ((true, 0, true, 1, 1), true)],
-      "Boolean and string wrappers must expose shared source metadata and stable debug identities",
+  fn table_boolean_and_string_wrappers_preserve_source_contracts() -> Result<(), impl Debug> {
+    ensure_that(
+      dom_fixture(CONCRETE_WRAPPER_SOURCE),
+      "table, Boolean, and string wrappers must retain decoded values, metadata, comments, and debug identity",
+      |fixture| {
+        let &Ok((ref parsed, ref root, _)) = fixture else {
+          return false;
+        };
+        let Some(table) = root.as_table() else {
+          return false;
+        };
+        let Some(boolean_node) = root.get_key("boolean") else {
+          return false;
+        };
+        let Some(boolean) = boolean_node.as_bool() else {
+          return false;
+        };
+        let Some(string_node) = root.get_key("string") else {
+          return false;
+        };
+        let Some(string) = string_node.as_str() else {
+          return false;
+        };
+        parsed.diagnostics().is_empty()
+          && table.syntax().is_some()
+          && table.errors().is_empty()
+          && table.is_valid_node()
+          && table.kind() == TableKind::Regular
+          && table.header_comments().count() == 1
+          && format!("{table:?}").contains("Table")
+          && source_facts(&boolean_node) == (true, 0, true, 1, 1)
+          && boolean.value()
+          && format!("{boolean:?}").contains("Bool")
+          && source_facts(&string_node) == (true, 0, true, 1, 1)
+          && string.value() == "value"
+          && format!("{string:?}").contains("Str")
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Preserve signed integer identity and each source radix representation.
   #[test]
-  fn integer_wrappers_preserve_signedness_and_radix() -> Result<(), TestFailure> {
-    let root = concrete_wrapper_dom()?;
-    let negative_node = path(&root, "negative")?;
-    let negative = ensure_some(
-      negative_node.as_integer(),
-      "the negative integer path must expose its concrete wrapper",
-    )?;
-    ensure(
-      (
-        negative.representation(),
-        negative.value().is_negative(),
-        negative.value().is_positive(),
-        negative.value().as_negative(),
-        negative.value().as_positive(),
-        negative.value().to_string(),
-        negative.syntax().is_some(),
-        negative.errors().len(),
-        negative.is_valid_node(),
-        format!("{negative:?}").contains("Integer"),
-      ) == (
-        IntegerRepr::Dec,
-        true,
-        false,
-        Some(-2),
-        None,
-        String::from("-2"),
-        true,
-        0,
-        true,
-        true,
-      ),
-      "negative integers must retain signedness, decimal representation, provenance, and debug identity",
-    )?;
-
-    let positive_node = path(&root, "positive")?;
-    let positive = ensure_some(
-      positive_node.as_integer(),
-      "the positive integer path must expose its concrete wrapper",
-    )?;
-    ensure(
-      (
-        positive.representation(),
-        positive.value().is_positive(),
-        positive.value().is_negative(),
-        positive.value().as_positive(),
-        positive.value().as_negative(),
-        positive.value().to_string(),
-      ) == (IntegerRepr::Dec, true, false, Some(3), None, String::from("3")),
-      "nonnegative integers must retain unsigned identity and the opposite projection polarity",
-    )?;
-    for (path_name, representation, value) in [
-      ("binary", IntegerRepr::Bin, 2_u64),
-      ("octal", IntegerRepr::Oct, 8_u64),
-      ("hexadecimal", IntegerRepr::Hex, 16_u64),
-    ] {
-      let node = path(&root, path_name)?;
-      let integer = ensure_some(node.as_integer(), "a radix integer path must expose an integer wrapper")?;
-      ensure(
-        (integer.representation(), integer.value()) == (representation, IntegerValue::Positive(value)),
-        "each radix integer must retain both its semantic value and source representation",
-      )?;
-    }
-    Ok(())
+  fn integer_wrappers_preserve_signedness_and_radix() -> Result<(), impl Debug> {
+    ensure_that(
+      dom_fixture(CONCRETE_WRAPPER_SOURCE),
+      "integer wrappers must retain signedness, radix, source metadata, and decoded values",
+      |fixture| {
+        let &Ok((ref parsed, ref root, _)) = fixture else {
+          return false;
+        };
+        let Some(negative_node) = root.get_key("negative") else {
+          return false;
+        };
+        let Some(negative) = negative_node.as_integer() else {
+          return false;
+        };
+        let Some(positive_node) = root.get_key("positive") else {
+          return false;
+        };
+        let Some(positive) = positive_node.as_integer() else {
+          return false;
+        };
+        parsed.diagnostics().is_empty()
+          && negative.representation() == IntegerRepr::Dec
+          && negative.value().is_negative()
+          && !negative.value().is_positive()
+          && negative.value().as_negative() == Some(-2)
+          && negative.value().as_positive().is_none()
+          && negative.value().to_string() == "-2"
+          && negative.syntax().is_some()
+          && negative.errors().is_empty()
+          && negative.is_valid_node()
+          && format!("{negative:?}").contains("Integer")
+          && positive.representation() == IntegerRepr::Dec
+          && positive.value().is_positive()
+          && !positive.value().is_negative()
+          && positive.value().as_positive() == Some(3)
+          && positive.value().as_negative().is_none()
+          && positive.value().to_string() == "3"
+          && [
+            ("binary", IntegerRepr::Bin, 2_u64),
+            ("octal", IntegerRepr::Oct, 8_u64),
+            ("hexadecimal", IntegerRepr::Hex, 16_u64),
+          ]
+          .into_iter()
+          .all(|(key, repr, expected)| {
+            matches!(root.get_key(key), Some(ref node) if node.as_integer().is_some_and(|integer|
+              integer.representation() == repr && integer.value() == IntegerValue::Positive(expected)))
+          })
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Preserve floating-point metadata and every supported date/time rendering.
   #[test]
-  fn float_and_date_time_wrappers_preserve_metadata_and_rendering() -> Result<(), TestFailure> {
-    let root = concrete_wrapper_dom()?;
-    let float_node = path(&root, "float")?;
-    let float = ensure_some(float_node.as_float(), "the float path must expose its concrete wrapper")?;
-    ensure_eq(&float.value(), &1.5, "the float wrapper must expose its decoded value")?;
-    ensure_source_backed_wrapper(
-      &float_node,
-      format!("{float:?}").contains("Float"),
-      "the float wrapper must expose shared source metadata",
-    )?;
-
-    for (path_name, rendered) in [
-      ("offset", "1979-05-27T07:32:00Z"),
-      ("local", "1979-05-27T07:32:00"),
-      ("local_fraction", "1979-05-27T07:32:00.5"),
-      ("date", "1979-05-27"),
-      ("time", "07:32:00"),
-      ("time_fraction", "07:32:00.5"),
-    ] {
-      let node = path(&root, path_name)?;
-      let date_time = ensure_some(node.as_date(), "a date/time path must expose its concrete wrapper")?;
-      ensure_eq(
-        &date_time.value().to_string(),
-        &rendered.to_owned(),
-        "each date/time family must preserve its stable semantic rendering",
-      )?;
-      ensure_source_backed_wrapper(
-        &node,
-        format!("{date_time:?}").contains("DateTime"),
-        "each date/time family must preserve shared source metadata",
-      )?;
-    }
-    Ok(())
+  fn float_and_date_time_wrappers_preserve_metadata_and_rendering() -> Result<(), impl Debug> {
+    ensure_that(
+      dom_fixture(CONCRETE_WRAPPER_SOURCE),
+      "float and date-time wrappers must preserve decoded values, metadata, comments, and semantic rendering",
+      |fixture| {
+        let &Ok((ref parsed, ref root, _)) = fixture else {
+          return false;
+        };
+        let Some(float_node) = root.get_key("float") else {
+          return false;
+        };
+        let Some(float) = float_node.as_float() else {
+          return false;
+        };
+        parsed.diagnostics().is_empty()
+          && source_facts(&float_node) == (true, 0, true, 1, 1)
+          && float.value().partial_cmp(&1.5) == Some(Ordering::Equal)
+          && format!("{float:?}").contains("Float")
+          && [
+            ("offset", "1979-05-27T07:32:00Z"),
+            ("local", "1979-05-27T07:32:00"),
+            ("local_fraction", "1979-05-27T07:32:00.5"),
+            ("date", "1979-05-27"),
+            ("time", "07:32:00"),
+            ("time_fraction", "07:32:00.5"),
+          ]
+          .into_iter()
+          .all(|(key, expected)| {
+            matches!(root.get_key(key), Some(ref node) if source_facts(node) == (true, 0, true, 1, 1)
+              && node.as_date().is_some_and(|date| date.value().to_string() == expected && format!("{date:?}").contains("DateTime")))
+          })
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Normalize each supported alternate date/time spelling without changing its semantic value.
   #[test]
-  fn date_time_decoding_normalizes_alternate_spellings() -> Result<(), TestFailure> {
-    let root = clean_dom("space = 1979-05-27 07:32:00z\nlower = 1979-05-27t07:32:00z\ncomma = 07:32:00,5\n")?;
-    for (path_name, expected) in [
-      ("space", "1979-05-27T07:32:00Z"),
-      ("lower", "1979-05-27T07:32:00Z"),
-      ("comma", "07:32:00.5"),
-    ] {
-      let node = path(&root, path_name)?;
-      let value = ensure_some(node.as_date(), "a supported alternate date/time spelling must decode")?;
-      ensure_eq(
-        &value.value().to_string(),
-        &expected.to_owned(),
-        "alternate date/time spellings must normalize without changing meaning",
-      )?;
-    }
-    Ok(())
+  fn date_time_decoding_normalizes_alternate_spellings() -> Result<(), impl Debug> {
+    ensure_that(
+      dom_fixture("space = 1979-05-27 07:32:00z\nlower = 1979-05-27t07:32:00z\ncomma = 07:32:00,5\n"),
+      "alternate date-time spellings must normalize without changing semantic values",
+      |fixture| {
+        let Ok(ref value) = *fixture else {
+          return false;
+        };
+
+        value.0.diagnostics().is_empty()
+          && [
+            ("space", "1979-05-27T07:32:00Z"),
+            ("lower", "1979-05-27T07:32:00Z"),
+            ("comma", "07:32:00.5"),
+          ]
+          .into_iter()
+          .all(|(key, expected)| {
+            matches!(value.1.get_key(key), Some(ref node) if node.as_date().is_some_and(|date| date.value().to_string() == expected))
+          })
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Distinguish inline arrays from arrays of tables through both kind polarities.
   #[test]
-  fn array_wrappers_preserve_inline_and_table_polarities() -> Result<(), TestFailure> {
-    let root = concrete_wrapper_dom()?;
-    let array_node = path(&root, "array")?;
-    let array = ensure_some(array_node.as_array(), "the inline array path must expose its concrete wrapper")?;
-    ensure(
-      (
-        array.kind(),
-        array.kind().is_inline(),
-        array.kind().is_tables(),
-        source_facts(&array_node),
-        format!("{array:?}").contains("Array"),
-      ) == (ArrayKind::Inline, true, false, (true, 0, true, 1, 1), true),
-      "an inline array must retain its representation, source metadata, and opposite kind polarity",
-    )?;
-    let tables_node = path(&root, "tables")?;
-    let tables = ensure_some(tables_node.as_array(), "the array-of-tables path must expose its concrete wrapper")?;
-    ensure(
-      (tables.kind(), tables.kind().is_tables(), tables.kind().is_inline()) == (ArrayKind::Tables, true, false),
-      "an array of tables must retain its representation and opposite kind polarity",
+  fn array_wrappers_preserve_inline_and_table_polarities() -> Result<(), impl Debug> {
+    ensure_that(
+      dom_fixture(CONCRETE_WRAPPER_SOURCE),
+      "array wrappers must retain representation, source metadata, and opposite kind polarities",
+      |fixture| {
+        let &Ok((ref parsed, ref root, _)) = fixture else {
+          return false;
+        };
+        let Some(inline_node) = root.get_key("array") else {
+          return false;
+        };
+        let Some(inline) = inline_node.as_array() else {
+          return false;
+        };
+        let Some(tables_node) = root.get_key("tables") else {
+          return false;
+        };
+        let Some(tables) = tables_node.as_array() else {
+          return false;
+        };
+        parsed.diagnostics().is_empty()
+          && source_facts(&inline_node) == (true, 0, true, 1, 1)
+          && inline.kind() == ArrayKind::Inline
+          && inline.kind().is_inline()
+          && !inline.kind().is_tables()
+          && format!("{inline:?}").contains("Array")
+          && tables.kind() == ArrayKind::Tables
+          && tables.kind().is_tables()
+          && !tables.kind().is_inline()
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Preserve malformed scalar provenance, diagnostics, and reader-facing type names.
   #[test]
-  fn invalid_wrappers_preserve_typed_decoder_failures() -> Result<(), TestFailure> {
-    let root = concrete_wrapper_dom()?;
-    let invalid_node = path(&root, "invalid")?;
-    let invalid = ensure_some(
-      invalid_node.as_invalid(),
-      "the malformed scalar path must expose its invalid wrapper",
-    )?;
-    let InvalidReason::MalformedScalar(ref malformed) = *invalid.reason() else {
-      return ensure(false, "an out-of-range integer must retain a malformed-scalar reason");
-    };
-    let invalid_syntax = ensure_some(invalid.syntax(), "a malformed source scalar must retain its syntax anchor")?;
-    ensure(
-      (
-        malformed.kind(),
-        matches!(malformed.failure(), DecodeFailure::InvalidValue { .. }),
-        malformed.syntax().text_range(),
-        invalid_syntax.text_range(),
-        invalid.errors().is_empty(),
-        invalid.is_valid_node(),
-        invalid.comments().count(),
-        invalid.header_comments().count(),
-        format!("{invalid:?}").contains("Invalid"),
-      ) == (
-        ScalarKind::Integer,
-        true,
-        malformed.syntax().text_range(),
-        malformed.syntax().text_range(),
-        false,
-        false,
-        1,
-        1,
-        true,
-      ),
-      "an invalid wrapper must retain its typed decoder failure, provenance, diagnostics, and shared comments",
-    )?;
-    ensure(
-      [
-        ScalarKind::Bool,
-        ScalarKind::String,
-        ScalarKind::Integer,
-        ScalarKind::Float,
-        ScalarKind::DateTime,
-      ]
-      .map(|kind| (kind.as_str(), kind.to_string()))
-        == [
-          ("Boolean", "Boolean".to_owned()),
-          ("string", "string".to_owned()),
-          ("integer", "integer".to_owned()),
-          ("floating-point", "floating-point".to_owned()),
-          ("date-time", "date-time".to_owned()),
-        ],
-      "every malformed-scalar family must expose its stable reader-facing name",
-    )
+  fn invalid_wrappers_preserve_typed_decoder_failures() -> Result<(), impl Debug> {
+    let fixture_kinds = [
+      ScalarKind::Bool,
+      ScalarKind::String,
+      ScalarKind::Integer,
+      ScalarKind::Float,
+      ScalarKind::DateTime,
+    ];
+    ensure_that((dom_fixture(CONCRETE_WRAPPER_SOURCE), fixture_kinds), "invalid wrappers must retain native decoder evidence and every scalar family's reader-facing name", |observed| {
+      let &(Ok((ref parsed, ref root, _)), ref kinds) = observed else { return false; };
+      let Some(node) = root.get_key("invalid") else { return false; };
+      let Some(invalid) = node.as_invalid() else { return false; };
+      parsed.diagnostics().is_empty()
+        && matches!(invalid.reason(), InvalidReason::MalformedScalar(malformed) if malformed.kind() == ScalarKind::Integer
+          && matches!(malformed.failure(), DecodeFailure::InvalidValue { .. }) && invalid.syntax().is_some_and(|syntax| syntax.text_range() == malformed.syntax().text_range()))
+        && !invalid.errors().is_empty() && !invalid.is_valid_node() && invalid.comments().count() == 1 && invalid.header_comments().count() == 1 && format!("{invalid:?}").contains("Invalid")
+        && kinds.map(|kind| (kind.as_str(), kind.to_string())) == [
+          ("Boolean", String::from("Boolean")), ("string", String::from("string")), ("integer", String::from("integer")), ("floating-point", String::from("floating-point")), ("date-time", String::from("date-time")),
+        ]
+    }).map(drop).map_err(Box::new)
   }
 }

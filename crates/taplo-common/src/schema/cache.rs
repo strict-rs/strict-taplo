@@ -388,171 +388,165 @@ fn expiration_deadline(now: OffsetDateTime, duration: Duration) -> OffsetDateTim
 
 #[cfg(test)]
 mod tests {
+  use std::fmt::Debug;
   use std::path::PathBuf;
   use std::sync::Arc;
   use std::time::Duration;
 
   use futures::executor::block_on;
   use serde_json::json;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_contains;
-  use strict_test_support::ensure_eq;
-  use strict_test_support::ensure_ok;
-  use strict_test_support::ensure_some;
-  use taplo_test_support::ensure_result;
+  use strict_test_support::ensure_that;
   use time::OffsetDateTime;
+  use url::ParseError;
   use url::Url;
 
   use super::Cache;
+  use super::CacheError;
   use super::CachedJson;
   use super::cache_hash;
   use crate::environment::LocalEnvironment as _;
   use crate::schema::transport::OfflineSchemaTransport;
   use crate::test_support::TestEnvironment;
-  /// Parse the shared cache fixture URL.
-  fn schema_url() -> Result<Url, TestFailure> {
-    ensure_ok(Url::parse("https://example.com/schema.json"), "the cache fixture URL must parse")
+
+  /// Parse the shared cache fixture URL without erasing its native failure.
+  fn schema_url() -> Result<Url, ParseError> {
+    Url::parse("https://example.com/schema.json")
   }
 
   #[test]
-  fn optional_and_required_disk_persistence_have_distinct_contracts() -> Result<(), TestFailure> {
-    block_on(async {
-      let environment = TestEnvironment::default();
-      let transport = OfflineSchemaTransport::new(environment.clone());
-      let cache = ensure_result(Cache::new(transport), "the test cache must initialize")?;
-      let url = schema_url()?;
-      let schema = Arc::new(json!({ "type": "object" }));
-
-      let required = cache.save(url.clone(), Arc::clone(&schema)).await;
-      ensure(required.is_err(), "public save must remain fallible without a disk root")?;
-      let required_error = ensure_some(required.err(), "the save error must exist")?;
-      ensure_contains(
-        &required_error.to_string(),
-        "not configured",
-        "the missing-cache-path diagnostic must be retained",
-      )?;
-
-      ensure_result(
-        cache.save_if_configured(url.clone(), Arc::clone(&schema)).await,
-        "optional persistence must skip an absent disk root",
-      )?;
-      ensure_eq(&environment.writes().len(), &0, "skipped optional persistence must not write")?;
-
-      cache.set_cache_path(Some(PathBuf::from("/cache")));
-      ensure_result(
-        cache.save_if_configured(url.clone(), Arc::clone(&schema)).await,
-        "configured optional persistence must write",
-      )?;
-      let expected_path = PathBuf::from("/cache").join(cache_hash(&url));
-      ensure(
-        environment.writes() == [expected_path.clone()],
-        "configured persistence must use the URL-derived cache entry path",
-      )?;
-      let bytes = ensure_result(
-        environment.read_file(&expected_path).await,
-        "the written cache entry must be readable",
-      )?;
-      let cached = ensure_ok(
-        serde_json::from_slice::<CachedJson>(&bytes),
-        "the written cache entry must be valid cached JSON",
-      )?;
-      ensure_eq(&cached.url.as_str(), &url.as_str(), "cached URL")?;
-      ensure(cached.value == *schema, "the configured write must preserve the schema value")?;
-
+  fn optional_and_required_disk_persistence_have_distinct_contracts() -> Result<(), impl Debug> {
+    let environment = TestEnvironment::default();
+    let cache = Cache::new(OfflineSchemaTransport::new(environment.clone()));
+    let url = schema_url();
+    let schema = Arc::new(json!({ "type": "object" }));
+    let observed = block_on(async {
+      let (store, address) = cache.as_ref().ok().zip(url.as_ref().ok())?;
+      let required = store.save(address.clone(), Arc::clone(&schema)).await;
+      let optional = store.save_if_configured(address.clone(), Arc::clone(&schema)).await;
+      let skipped_writes = environment.writes();
+      store.set_cache_path(Some(PathBuf::from("/cache")));
+      let configured = store.save_if_configured(address.clone(), Arc::clone(&schema)).await;
+      let writes = environment.writes();
+      let path = PathBuf::from("/cache").join(cache_hash(address));
+      let bytes = environment.read_file(&path).await;
+      let decoded = bytes
+        .as_ref()
+        .ok()
+        .map(|contents| serde_json::from_slice::<CachedJson>(contents));
       environment.set_write_failure(true);
-      let failed = cache.save_if_configured(url, schema).await;
-      ensure(failed.is_err(), "an actual configured write failure must be returned")
-    })
+      let failed = store.save_if_configured(address.clone(), Arc::clone(&schema)).await;
+      Some((required, optional, skipped_writes, configured, writes, path, bytes, decoded, failed))
+    });
+    ensure_that(
+      (environment, cache, url, schema, observed),
+      "required, optional, configured, and failed persistence must preserve their distinct contracts",
+      |actual| {
+        let Some(ref io) = actual.4 else {
+          return false;
+        };
+        matches!(&io.0, Err(error @ CacheError::PathNotConfigured) if error.to_string().contains("not configured"))
+          && io.1.is_ok()
+          && io.2.is_empty()
+          && io.3.is_ok()
+          && io.4.as_slice() == [io.5.clone()]
+          && io.7.as_ref().is_some_and(|result| {
+            result
+              .as_ref()
+              .is_ok_and(|cached| actual.2.as_ref().is_ok_and(|address| &cached.url == address) && cached.value == *actual.3)
+          })
+          && io.8.is_err()
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn expiration_policy_invalidates_memory_and_disk_entries_at_the_deadline() -> Result<(), TestFailure> {
-    block_on(async {
-      let environment = TestEnvironment::default();
-      let transport = OfflineSchemaTransport::new(environment.clone());
-      let cache = ensure_result(Cache::new(transport.clone()), "the expiring cache must initialize")?;
-      ensure_result(
-        cache.set_expiration_times(Duration::from_secs(1), Duration::from_secs(1)),
-        "the short expiration policy must install",
-      )?;
-      cache.set_cache_path(Some(PathBuf::from("/cache")));
-      let url = schema_url()?;
-      let schema = Arc::new(json!({ "type": "string" }));
-      ensure_result(
-        cache.store(url.clone(), Arc::clone(&schema)).await,
-        "the expiring cache entry must persist",
-      )?;
-      ensure(cache.contains_schema(&url), "a newly stored schema must be present in memory")?;
-
-      let deadline = ensure_some(
-        OffsetDateTime::UNIX_EPOCH.checked_add(time::Duration::seconds(1)),
-        "the cache deadline must be representable",
-      )?;
-      environment.set_now(deadline);
-      let expired_memory = cache.load(&url, false).await;
-      ensure(
-        matches!(expired_memory, Err(super::CacheError::Expired { .. })),
-        "an entry must expire exactly at its configured deadline",
-      )?;
-      ensure(
-        !cache.contains_schema(&url),
-        "an expired LRU generation must be cleared before consulting disk",
-      )?;
-
-      let reader = ensure_result(Cache::new(transport), "the disk-cache reader must initialize")?;
-      reader.set_cache_path(Some(PathBuf::from("/cache")));
-      let expired_disk = reader.load(&url, false).await;
-      ensure(
-        matches!(expired_disk, Err(super::CacheError::Expired { .. })),
-        "a fresh reader must reject the serialized entry at its deadline",
-      )?;
-      let stale = ensure_result(
-        reader.load(&url, true).await,
-        "an explicit stale fallback must retain an expired serialized entry",
-      )?;
-      ensure(
-        *stale == *schema,
-        "the stale fallback must preserve the complete cached schema value",
-      )
-    })
+  fn expiration_policy_invalidates_memory_and_disk_entries_at_the_deadline() -> Result<(), impl Debug> {
+    let environment = TestEnvironment::default();
+    let transport = OfflineSchemaTransport::new(environment.clone());
+    let cache = Cache::new(transport.clone());
+    let url = schema_url();
+    let schema = Arc::new(json!({ "type": "string" }));
+    let deadline = OffsetDateTime::UNIX_EPOCH.checked_add(time::Duration::seconds(1));
+    let observed = block_on(async {
+      let (store, address) = cache.as_ref().ok().zip(url.as_ref().ok())?;
+      let policy = store.set_expiration_times(Duration::from_secs(1), Duration::from_secs(1));
+      store.set_cache_path(Some(PathBuf::from("/cache")));
+      let stored = store.store(address.clone(), Arc::clone(&schema)).await;
+      let present = store.contains_schema(address);
+      if let Some(instant) = deadline {
+        environment.set_now(instant);
+      }
+      let expired_memory = store.load(address, false).await;
+      let retained = store.contains_schema(address);
+      let reader = Cache::new(transport);
+      let disk = if let Ok(ref fresh) = reader {
+        fresh.set_cache_path(Some(PathBuf::from("/cache")));
+        Some((fresh.load(address, false).await, fresh.load(address, true).await))
+      } else {
+        None
+      };
+      Some((policy, stored, present, expired_memory, retained, reader, disk))
+    });
+    ensure_that(
+      (environment, cache, url, schema, deadline, observed),
+      "memory and disk entries must expire exactly at the deadline while explicit stale reads retain the schema",
+      |actual| {
+        let Some(ref loads) = actual.5 else {
+          return false;
+        };
+        actual.4.is_some()
+          && loads.0.is_ok()
+          && loads.1.is_ok()
+          && loads.2
+          && matches!(&loads.3, Err(CacheError::Expired { .. }))
+          && !loads.4
+          && loads.6.as_ref().is_some_and(|disk| {
+            matches!(&disk.0, Err(CacheError::Expired { .. })) && disk.1.as_ref().is_ok_and(|stale| **stale == *actual.3)
+          })
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn disk_entries_must_match_their_url_derived_identity() -> Result<(), TestFailure> {
-    block_on(async {
-      let environment = TestEnvironment::default();
-      let transport = OfflineSchemaTransport::new(environment.clone());
-      let cache = ensure_result(Cache::new(transport), "the identity-checking cache must initialize")?;
-      cache.set_cache_path(Some(PathBuf::from("/cache")));
-      let expected = schema_url()?;
-      let actual = ensure_ok(Url::parse("https://example.com/other.json"), "the mismatched cache URL must parse")?;
-      let path = PathBuf::from("/cache").join(cache_hash(&expected));
-      let bytes = ensure_ok(
-        serde_json::to_vec(&CachedJson {
-          expires_by: OffsetDateTime::UNIX_EPOCH.saturating_add(time::Duration::hours(1)),
-          url:        actual.clone(),
-          value:      json!({ "type": "number" }),
-        }),
-        "the mismatched cache fixture must serialize",
-      )?;
-      environment.insert_file(path.clone(), bytes);
-
-      ensure(
-        matches!(
-          cache.load(&expected, false).await,
-          Err(super::CacheError::UrlMismatch {
-            path: error_path,
-            expected: error_expected,
-            actual: error_actual,
-          }) if (
-            error_path.as_ref(),
-            error_expected.as_ref(),
-            error_actual.as_ref(),
-          ) == (&path, &expected, &actual)
-        ),
-        "a cache filename must not authorize data serialized for another schema URL",
-      )
-    })
+  fn disk_entries_must_match_their_url_derived_identity() -> Result<(), impl Debug> {
+    let environment = TestEnvironment::default();
+    let cache = Cache::new(OfflineSchemaTransport::new(environment.clone()));
+    let expected = schema_url();
+    let other = Url::parse("https://example.com/other.json");
+    let observed = block_on(async {
+      let ((store, requested), stored_url) = cache.as_ref().ok().zip(expected.as_ref().ok()).zip(other.as_ref().ok())?;
+      store.set_cache_path(Some(PathBuf::from("/cache")));
+      let path = PathBuf::from("/cache").join(cache_hash(requested));
+      let bytes = serde_json::to_vec(&CachedJson {
+        expires_by: OffsetDateTime::UNIX_EPOCH.saturating_add(time::Duration::hours(1)),
+        url:        stored_url.clone(),
+        value:      json!({ "type": "number" }),
+      });
+      if let Ok(ref contents) = bytes {
+        environment.insert_file(path.clone(), contents.clone());
+      }
+      let loaded = store.load(requested, false).await;
+      Some((path, bytes, loaded))
+    });
+    ensure_that(
+      (environment, cache, expected, other, observed),
+      "cache filenames must reject data serialized for a different URL while retaining both identities",
+      |actual| {
+        let Some(ref disk) = actual.4 else {
+          return false;
+        };
+        disk.1.is_ok()
+          && matches!(&disk.2,
+          Err(CacheError::UrlMismatch { path, expected: required, actual: different }) if path.as_ref() == &disk.0
+            && actual.2.as_ref().is_ok_and(|requested| required.as_ref() == requested)
+            && actual.3.as_ref().is_ok_and(|alternative| different.as_ref() == alternative))
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

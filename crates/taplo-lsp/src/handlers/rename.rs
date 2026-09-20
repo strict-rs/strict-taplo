@@ -206,7 +206,7 @@ fn header_is_incomplete(query: &Query) -> bool {
 
 #[cfg(test)]
 mod tests {
-  use std::future::Future;
+  use std::fmt::Debug;
 
   use futures::executor::block_on;
   use lsp_types::Position;
@@ -215,13 +215,10 @@ mod tests {
   use lsp_types::RenameParams;
   use lsp_types::TextDocumentPositionParams;
   use lsp_types::WorkspaceEdit;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_eq;
+  use strict_test_support::ResultFailure;
   use strict_test_support::ensure_ok;
-  use strict_test_support::ensure_some;
+  use strict_test_support::ensure_that;
   use taplo_lsp_async::Params;
-  use taplo_lsp_async::rpc::RpcError;
   use taplo_lsp_async::util::Mapper;
   use url::Url;
 
@@ -231,6 +228,7 @@ mod tests {
   use super::rename_concurrent;
   use super::rename_document;
   use super::rename_local;
+  use crate::handlers::test_support::FixtureFailure;
   use crate::handlers::test_support::concurrent_world;
   use crate::handlers::test_support::local_world;
   use crate::handlers::test_support::parse_document;
@@ -242,24 +240,24 @@ mod tests {
   use crate::world::DocumentState;
 
   /// Build a parsed document with a mapper that may deliberately represent a different source.
-  fn document(source: &str, mapper_source: &str) -> Result<DocumentState, TestFailure> {
+  fn document(source: &str, mapper_source: &str) -> Result<DocumentState, FixtureFailure> {
     let mut document = parse_document(source, "the rename fixture tree must build")?;
     document.mapper = ensure_ok(Mapper::new_utf16(mapper_source), "the rename mapper fixture must build")?;
     Ok(document)
   }
 
   /// Parse the rename document URL fixture.
-  fn document_url() -> Result<Url, TestFailure> {
+  fn document_url() -> Result<Url, ResultFailure<url::ParseError>> {
     fixture_url("file:///workspace/file.toml", "the rename fixture URL must parse")
   }
 
   /// Decode one prepare-rename request through its public wire shape.
-  fn prepare_params(document: &Url, line: u32, character: u32) -> Result<TextDocumentPositionParams, TestFailure> {
+  fn prepare_params(document: &Url, line: u32, character: u32) -> Result<TextDocumentPositionParams, ResultFailure<serde_json::Error>> {
     position_params(document, line, character, "the prepare-rename request fixture must decode")
   }
 
   /// Decode one rename request through its public wire shape.
-  fn rename_params(document: &Url, line: u32, character: u32, new_name: &str) -> Result<RenameParams, TestFailure> {
+  fn rename_params(document: &Url, line: u32, character: u32, new_name: &str) -> Result<RenameParams, ResultFailure<serde_json::Error>> {
     decode_rename_params(document, line, character, new_name, "the rename request fixture must decode")
   }
 
@@ -274,236 +272,181 @@ mod tests {
       .collect()
   }
 
-  /// Resolve one prepare/rename request pair through a selected execution family.
-  async fn rename_outputs(
-    prepare: impl Future<Output = Result<Option<PrepareRenameResponse>, RpcError>>,
-    rename: impl Future<Output = Result<Option<WorkspaceEdit>, RpcError>>,
-    prepare_execution: &'static str,
-    prepare_presence: &'static str,
-    rename_execution: &'static str,
-    rename_presence: &'static str,
-  ) -> Result<(PrepareRenameResponse, WorkspaceEdit), TestFailure> {
-    let prepared = ensure_some(ensure_ok(prepare.await, prepare_execution)?, prepare_presence)?;
-    let edit = ensure_some(ensure_ok(rename.await, rename_execution)?, rename_presence)?;
-    Ok((prepared, edit))
-  }
-
-  /// Execute one rename scenario through every selected handler family.
-  macro_rules! rename_family_outputs {
-    ($document:ident, $line:literal, $character:literal, $new_name:literal; $(($world:ident, $prepare:path, $rename:path, $prepare_execution:literal, $prepare_presence:literal, $rename_execution:literal, $rename_presence:literal)),+ $(,)?) => {
-      (
-        $(
-          rename_outputs(
-            $prepare(
-              &$world,
-              Params::from(Some(prepare_params(&$document, $line, $character)?)),
-            ),
-            $rename(
-              &$world,
-              Params::from(Some(rename_params(
-                &$document,
-                $line,
-                $character,
-                $new_name,
-              )?)),
-            ),
-            $prepare_execution,
-            $prepare_presence,
-            $rename_execution,
-            $rename_presence,
-          ).await?
-        ),+
-      )
-    };
-  }
-
   #[test]
-  fn prepare_and_rename_accept_identifiers_but_reject_other_positions() -> Result<(), TestFailure> {
-    let source = "alpha = 1\n";
-    let document = document(source, source)?;
-    let prepared = ensure_some(
-      ensure_ok(
-        prepare_document(&document, Position::new(0, 1)),
-        "identifier prepare-rename must be fallible without failing",
-      )?,
-      "a real identifier must be prepare-renameable",
-    )?;
-    ensure(
-      prepared == PrepareRenameResponse::Range(Range::new(Position::new(0, 0), Position::new(0, 5))),
-      "prepare-rename must return the exact identifier range",
-    )?;
-
-    let edit = ensure_some(
-      ensure_ok(
-        rename_document(&document, &document_url()?, Position::new(0, 1), "renamed"),
-        "identifier rename must succeed",
-      )?,
-      "a real identifier must produce a workspace edit",
-    )?;
-    let edits = ensure_some(
-      edit
-        .changes
-        .as_ref()
-        .and_then(|document_changes| document_changes.values().next()),
-      "rename changes and document edits must exist",
-    )?;
-    let replacement = ensure_some(edits.first(), "the key replacement must exist")?;
-    ensure_eq(
-      &replacement.new_text.as_str(),
-      &"renamed",
-      "rename must use the requested replacement text",
-    )?;
-    ensure(
-      replacement.range == Range::new(Position::new(0, 0), Position::new(0, 5)),
-      "rename must map the full identifier range",
-    )?;
-
-    for position in [Position::new(0, 7), Position::new(0, 8)] {
-      ensure(
-        ensure_ok(
+  fn prepare_and_rename_accept_identifiers_but_reject_other_positions() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let source = "alpha = 1\n";
+      let document = document(source, source)?;
+      let url = document_url()?;
+      let prepared = prepare_document(&document, Position::new(0, 1));
+      let edit = rename_document(&document, &url, Position::new(0, 1), "renamed");
+      let rejected = [Position::new(0, 7), Position::new(0, 8)].map(|position| {
+        (
+          position,
           prepare_document(&document, position),
-          "a nonidentifier prepare request must remain fallible",
-        )?
-        .is_none(),
-        "whitespace and primitive positions must not prepare rename",
-      )?;
-      ensure(
-        ensure_ok(
-          rename_document(&document, &document_url()?, position, "ignored"),
-          "a nonidentifier rename request must remain fallible",
-        )?
-        .is_none(),
-        "whitespace and primitive positions must not produce edits",
-      )?;
-    }
-    Ok(())
-  }
-
-  #[test]
-  fn array_table_header_rename_targets_the_semantic_key_across_instances() -> Result<(), TestFailure> {
-    let source = "[[products]]\nname = \"first\"\n[[products]]\nname = \"second\"\n";
-    let document = document(source, source)?;
-    let edit = ensure_some(
-      ensure_ok(
-        rename_document(&document, &document_url()?, Position::new(0, 3), "items"),
-        "array-table header rename must succeed",
-      )?,
-      "a complete array-table header must produce a workspace edit",
-    )?;
-    ensure(
-      edit_observation(&edit)
-        == vec![
-          (Range::new(Position::new(2, 2), Position::new(2, 10)), String::from("items")),
-          (Range::new(Position::new(0, 2), Position::new(0, 10)), String::from("items")),
-        ],
-      "array-table header rename must remove runtime item indices and replace every semantic key occurrence in rewrite order",
+          rename_document(&document, &url, position, "ignored"),
+        )
+      });
+      Ok::<_, FixtureFailure>((document, url, prepared, edit, rejected))
+    })();
+    ensure_that(
+      observed,
+      "rename must preserve exact identifier edits and reject whitespace or primitive positions without edits",
+      |result| {
+        let Ok(ref scenario) = *result else {
+          return false;
+        };
+        let Ok(Some(ref workspace)) = scenario.3 else {
+          return false;
+        };
+        scenario.2
+          == Ok(Some(PrepareRenameResponse::Range(Range::new(
+            Position::new(0, 0),
+            Position::new(0, 5),
+          ))))
+          && workspace
+            .changes
+            .as_ref()
+            .and_then(|changes| changes.values().next())
+            .and_then(|edits| edits.first())
+            .is_some_and(|replacement| {
+              replacement.new_text == "renamed" && replacement.range == Range::new(Position::new(0, 0), Position::new(0, 5))
+            })
+          && scenario
+            .4
+            .iter()
+            .all(|position| matches!(position.1, Ok(None)) && matches!(position.2, Ok(None)))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn malformed_headers_and_missing_mapper_endpoints_do_not_return_partial_edits() -> Result<(), TestFailure> {
-    let malformed_source = "[alpha.\n";
-    let malformed = document(malformed_source, malformed_source)?;
-    ensure(
-      ensure_ok(
-        rename_document(&malformed, &document_url()?, Position::new(0, 2), "renamed"),
-        "a malformed header rename request must not panic",
-      )?
-      .is_none(),
-      "a malformed header without a renameable DOM path must produce no edit",
-    )?;
-
-    let source = "alpha = 1\n";
-    let unmappable = document(source, "a")?;
-    let result = rename_document(&unmappable, &document_url()?, Position::new(0, 0), "renamed");
-    let error = ensure_some(result.err(), "an unmappable replacement endpoint must return a typed error")?;
-    ensure_eq(&error.code, &-32603, "mapping failure must be reported as an internal RPC error")?;
-    let detail = ensure_some(
-      error.details.as_ref().and_then(serde_json::Value::as_str),
-      "mapping failure must retain its textual RPC detail",
-    )?;
-    ensure(
-      [detail.contains("byte offset"), detail.contains("beyond source length")] == [true, true],
-      "mapping failure must carry actionable context rather than a partial edit",
+  fn array_table_header_rename_targets_the_semantic_key_across_instances() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let source = "[[products]]\nname = \"first\"\n[[products]]\nname = \"second\"\n";
+      let document = document(source, source)?;
+      let url = document_url()?;
+      let edit = rename_document(&document, &url, Position::new(0, 3), "items");
+      Ok::<_, FixtureFailure>((document, url, edit))
+    })();
+    ensure_that(
+      observed,
+      "array-table rename must omit item indices and replace every semantic key in rewrite order",
+      |result| {
+        let Ok(ref scenario) = *result else {
+          return false;
+        };
+        let Ok(Some(ref edit)) = scenario.2 else {
+          return false;
+        };
+        edit_observation(edit)
+          == vec![
+            (Range::new(Position::new(2, 2), Position::new(2, 10)), String::from("items")),
+            (Range::new(Position::new(0, 2), Position::new(0, 10)), String::from("items")),
+          ]
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn rename_handlers_preserve_absence_errors_and_execution_family_parity() -> Result<(), TestFailure> {
-    block_on(async {
+  fn malformed_headers_and_missing_mapper_endpoints_do_not_return_partial_edits() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let malformed_source = "[alpha.\n";
+      let malformed = document(malformed_source, malformed_source)?;
+      let unmappable = document("alpha = 1\n", "a")?;
+      let url = document_url()?;
+      let absent = rename_document(&malformed, &url, Position::new(0, 2), "renamed");
+      let rejected = rename_document(&unmappable, &url, Position::new(0, 0), "renamed");
+      Ok::<_, FixtureFailure>((malformed, unmappable, url, absent, rejected))
+    })();
+    ensure_that(
+      observed,
+      "malformed headers must return absence and unmappable endpoints must retain actionable typed errors without partial edits",
+      |result| {
+        let Ok(ref scenario) = *result else {
+          return false;
+        };
+        matches!(scenario.3, Ok(None))
+          && scenario.4.as_ref().is_err_and(|error| {
+            error.code == -32603
+              && error
+                .details
+                .as_ref()
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|detail| detail.contains("byte offset") && detail.contains("beyond source length"))
+          })
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
+  }
+
+  #[test]
+  fn rename_handlers_preserve_absence_errors_and_execution_family_parity() -> Result<(), impl Debug> {
+    let observed = block_on(async {
       let document = document_url()?;
-      let source = "[alpha]\nvalue = 1\n[alpha.child]\nvalue = 2\n";
-
+      let missing_document = fixture_url("file:///workspace/missing.toml", "the missing rename document URL must parse")?;
       let local = local_world()?;
       let concurrent = concurrent_world()?;
-      let (local_installation, concurrent_installation) = futures::join!(
-        replace_local_document(&local, &document, source, "the local rename document must install",),
-        replace_concurrent_document(&concurrent, &document, source, "the concurrent rename document must install",),
+      let local_prepare_params = prepare_params(&document, 0, 2)?;
+      let local_rename_params = rename_params(&document, 0, 2, "renamed")?;
+      let concurrent_prepare_params = prepare_params(&document, 0, 2)?;
+      let concurrent_rename_params = rename_params(&document, 0, 2, "renamed")?;
+      let absent_params = prepare_params(&missing_document, 0, 0)?;
+      let source = "[alpha]\nvalue = 1\n[alpha.child]\nvalue = 2\n";
+      let installations = futures::join!(
+        replace_local_document(&local, &document, source, "the local rename document must install"),
+        replace_concurrent_document(&concurrent, &document, source, "the concurrent rename document must install"),
       );
-      local_installation?;
-      concurrent_installation?;
-
-      let ((local_prepare, local_edit), (concurrent_prepare, concurrent_edit)) = rename_family_outputs!(
+      let local_prepare = prepare_rename_local(&local, Params::from(Some(local_prepare_params))).await;
+      let local_edit = rename_local(&local, Params::from(Some(local_rename_params))).await;
+      let concurrent_prepare = prepare_rename_concurrent(&concurrent, Params::from(Some(concurrent_prepare_params))).await;
+      let concurrent_edit = rename_concurrent(&concurrent, Params::from(Some(concurrent_rename_params))).await;
+      let absent = prepare_rename_local(&local, Params::from(Some(absent_params))).await;
+      let rejected = rename_local(&local, Params::<RenameParams>::from(None)).await;
+      Ok::<_, FixtureFailure>((
         document,
-        0,
-        2,
-        "renamed";
-        (
-          local,
-          prepare_rename_local,
-          rename_local,
-          "local prepare-rename must execute",
-          "a local identifier must prepare rename",
-          "local rename must execute",
-          "a local identifier must produce a workspace edit"
-        ),
-        (
-          concurrent,
-          prepare_rename_concurrent,
-          rename_concurrent,
-          "concurrent prepare-rename must execute",
-          "a concurrent identifier must prepare rename",
-          "concurrent rename must execute",
-          "a concurrent identifier must produce a workspace edit"
-        ),
-      );
-      ensure(
-        local_prepare == PrepareRenameResponse::Range(Range::new(Position::new(0, 1), Position::new(0, 6))),
-        "local prepare-rename must retain the exact selected identifier range",
-      )?;
-      let local_observation = edit_observation(&local_edit);
-      ensure(
-        local_observation
-          == vec![
-            (Range::new(Position::new(2, 1), Position::new(2, 6)), "renamed".into()),
-            (Range::new(Position::new(0, 1), Position::new(0, 6)), "renamed".into()),
-          ],
-        "local rename must replace every exact occurrence in descending source order without editing the dotted child segment",
-      )?;
-
-      let missing_document = fixture_url("file:///workspace/missing.toml", "the missing rename document URL must parse")?;
-      ensure(
-        ensure_ok(
-          prepare_rename_local(&local, Params::from(Some(prepare_params(&missing_document, 0, 0)?))).await,
-          "prepare-rename for an unopened document must remain an absent success",
-        )?
-        .is_none(),
-        "prepare-rename must not fabricate state for an unopened document",
-      )?;
-      let missing_params = ensure_some(
-        rename_local(&local, Params::<RenameParams>::from(None)).await.err(),
-        "rename without parameters must return a typed invalid-params error",
-      )?;
-      ensure_eq(
-        &missing_params.code,
-        &-32602,
-        "rename without parameters must retain the standard invalid-params code",
-      )?;
-
-      ensure(
-        (concurrent_prepare, edit_observation(&concurrent_edit)) == (local_prepare, local_observation),
-        "local and concurrent rename families must preserve identical prepare and workspace-edit observations",
-      )
-    })
+        local,
+        concurrent,
+        installations,
+        (local_prepare, local_edit),
+        (concurrent_prepare, concurrent_edit),
+        absent,
+        rejected,
+      ))
+    });
+    ensure_that(
+      observed,
+      "rename families must preserve exact ordered edits, absence and parameter errors",
+      |result| {
+        let Ok(ref scenario) = *result else {
+          return false;
+        };
+        let Ok(Some(ref edit)) = scenario.4.1 else {
+          return false;
+        };
+        scenario.3.0.is_ok()
+          && scenario.3.1.is_ok()
+          && scenario.4.0
+            == Ok(Some(PrepareRenameResponse::Range(Range::new(
+              Position::new(0, 1),
+              Position::new(0, 6),
+            ))))
+          && edit_observation(edit)
+            == vec![
+              (Range::new(Position::new(2, 1), Position::new(2, 6)), "renamed".into()),
+              (Range::new(Position::new(0, 1), Position::new(0, 6)), "renamed".into()),
+            ]
+          && scenario.4 == scenario.5
+          && matches!(scenario.6, Ok(None))
+          && scenario.7.as_ref().is_err_and(|error| error.code == -32602)
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

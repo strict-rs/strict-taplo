@@ -17,6 +17,9 @@ use super::error::StaskError;
 /// Complete command result and its deterministic effect recorder.
 pub(super) type Execution<Outcome = (), Failure = template_core::CoreError> = (Result<Outcome, Failure>, Arc<RecordingEffects>);
 
+/// Command context and the complete shared recorder for its filesystem and process effects.
+pub(super) type RecordingContext = (CommandContext<RecordingWorkspace>, Arc<RecordingEffects>);
+
 /// Native setup failures and complete rejected extension observations.
 #[derive(Debug, thiserror::Error)]
 pub(super) enum ExtensionTestFailure<Subject> {
@@ -38,7 +41,7 @@ impl<Subject> From<PredicateFailure<Subject>> for ExtensionTestFailure<Subject> 
 }
 
 /// Construct one command context with process results consumed in call order.
-pub(super) fn recording_context(statuses: &[i32]) -> Result<(CommandContext<RecordingWorkspace>, Arc<RecordingEffects>), TestFailure> {
+pub(super) fn recording_context(statuses: &[i32]) -> Result<RecordingContext, TestFailure> {
   let recorder = Arc::new(RecordingEffects::default());
   for status in statuses {
     recorder.queue_process_result(Ok(process_output(*status, Vec::new(), Vec::new())?));

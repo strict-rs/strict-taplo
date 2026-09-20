@@ -972,6 +972,7 @@ fn empty_value_snippet(schema: &Value, cursor_count: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+  use std::fmt::Debug;
   use std::sync::Arc;
 
   use futures::executor::block_on;
@@ -986,22 +987,21 @@ mod tests {
   use lsp_types::Range;
   use serde_json::Value;
   use serde_json::json;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_contains;
-  use strict_test_support::ensure_eq;
+  use strict_test_support::ResultFailure;
   use strict_test_support::ensure_ok;
-  use strict_test_support::ensure_some;
+  use strict_test_support::ensure_that;
   use taplo::dom::Keys;
+  use taplo::dom::error::QueryError;
   use taplo::rowan::TextSize;
   use taplo_common::schema::associations::SchemaAssociation;
   use taplo_common::schema::associations::priority;
   use taplo_common::schema::associations::source;
+  use taplo_common::schema::transport::LocalSchemaTransport;
   use taplo_lsp_async::Params;
   use taplo_lsp_async::rpc::RpcError;
-  use taplo_lsp_async::util::Mapper;
   use url::Url;
 
+  use super::super::test_support::FixtureFailure;
   use super::super::test_support::local_world;
   use super::super::test_support::parse_document;
   use super::super::test_support::position_params;
@@ -1026,37 +1026,69 @@ mod tests {
   use super::schema_value_to_toml;
   use super::standalone_key_completions;
   use super::table_header_completions;
-  use crate::LocalTestFuture;
+  use crate::LocalFuture;
   use crate::query::Query;
+  use crate::world::DocumentSnapshot;
+  use crate::world::DocumentState;
+  use crate::world::DocumentUpdate;
   use crate::world::LocalWorld;
   use crate::world::ManualAssociationRule;
+  use crate::world::ManualAssociationUpdate;
   use crate::world::TestEnvironment;
+  use crate::world::WorldError;
 
-  /// One schema candidate in traversal shape: full path, relative path, and schema body.
+  /// Schema traversal candidate retaining full path, relative path, and schema body.
   type SchemaCandidate = (Keys, Keys, Arc<Value>);
 
-  /// Classify one real parsed cursor fixture through the production completion decision model.
-  fn classify(source: &str, offset: u32) -> Result<Option<CompletionTarget>, TestFailure> {
-    let document = parse_document(source, "the completion-target fixture must parse")?;
-    ensure_ok(
-      CompletionTarget::classify(&Query::at(&document.dom, TextSize::new(offset)), &document.dom, &document.mapper),
-      "the completion target must project into LSP coordinates",
-    )
+  /// Native request decoding and complete completion response.
+  type CompletionRequest = Result<Result<Option<CompletionResponse>, RpcError>, ResultFailure<serde_json::Error>>;
+
+  /// One installed document revision and its complete completion response.
+  type RevisionCompletion = (Result<DocumentUpdate, Box<ResultFailure<WorldError>>>, CompletionRequest);
+
+  /// Source, position, expected label sequence, and whether labels compare in sorted order.
+  type CompletionCase = (&'static str, u32, &'static str, bool);
+
+  /// Parsed document, cursor query, and the native completion classification.
+  type CursorClassification = (DocumentState, Query, Result<Option<CompletionTarget>, RpcError>);
+
+  /// World, association, and snapshot owners used across completion revisions.
+  #[derive(Debug)]
+  struct CompletionFixture {
+    /// Local world retaining all document revisions and schema services.
+    world:       LocalWorld<TestEnvironment>,
+    /// Canonical source identity.
+    document:    Url,
+    /// Initial source installation and emitted effects.
+    installed:   Result<DocumentUpdate, Box<ResultFailure<WorldError>>>,
+    /// Manual association transition and its emitted effects.
+    association: Result<ManualAssociationUpdate, WorldError>,
+    /// Snapshot into whose services the schema was installed.
+    snapshot:    Option<DocumentSnapshot<LocalSchemaTransport<TestEnvironment>>>,
   }
 
-  /// Construct one schema candidate through the same exact-path representation used by traversal.
-  fn completion_schema(full: &str, relative: &str, schema: Value) -> Result<SchemaCandidate, TestFailure> {
+  /// Preserve a real parsed cursor and its completion classification.
+  fn classify(source: &str, offset: u32) -> Result<CursorClassification, Box<ResultFailure<WorldError>>> {
+    parse_document(source, "the completion-target fixture must parse").map(|document| {
+      let query = Query::at(&document.dom, TextSize::new(offset));
+      let classified = CompletionTarget::classify(&query, &document.dom, &document.mapper);
+      (document, query, classified)
+    })
+  }
+
+  /// Construct a complete schema candidate through the exact traversal path representation.
+  fn completion_schema(full: &str, relative: &str, schema: Value) -> Result<SchemaCandidate, ResultFailure<QueryError>> {
     let full_path = ensure_ok(full.parse::<Keys>(), "the full completion path must parse")?;
     let relative_path = ensure_ok(relative.parse::<Keys>(), "the relative completion path must parse")?;
     Ok((full_path, relative_path, Arc::new(schema)))
   }
 
-  /// Return completion labels in their observable protocol order.
+  /// Borrow completion labels in their observable protocol order.
   fn labels(completions: &[CompletionItem]) -> Vec<&str> {
     completions.iter().map(|completion| completion.label.as_str()).collect()
   }
 
-  /// Project a simple completion replacement into exact observable fields.
+  /// Borrow exact fields from a simple completion replacement.
   fn simple_text_edit(item: &CompletionItem) -> Option<(&Range, &str)> {
     match *item.text_edit.as_ref()? {
       CompletionTextEdit::Edit(ref edit) => Some((&edit.range, edit.new_text.as_str())),
@@ -1064,156 +1096,88 @@ mod tests {
     }
   }
 
-  /// Decode one complete completion request through its public wire shape.
-  #[allow(
-    clippy::single_call_fn,
-    reason = "the named fixture fixes completion's request type at the shared positional decoder, so every scenario exercises the real \
-              `CompletionParams` wire shape rather than a hand-built value"
-  )]
-  fn completion_params(document: &Url, line: u32, character: u32) -> Result<CompletionParams, TestFailure> {
-    position_params(document, line, character, "the completion request fixture must decode")
-  }
-
-  /// Execute one local completion request against the current document revision.
+  /// Execute a local completion request while retaining decoding and handler failures separately.
   fn completion_at<'operation>(
     world: &'operation LocalWorld<TestEnvironment>,
     document: &'operation Url,
     character: u32,
-    context: &'static str,
-  ) -> LocalTestFuture<'operation, Option<CompletionResponse>> {
+  ) -> LocalFuture<'operation, CompletionRequest> {
     Box::pin(async move {
-      ensure_ok(
-        completion_local(world, Params::from(Some(completion_params(document, 0, character)?))).await,
-        context,
-      )
+      let parameters = position_params::<CompletionParams>(document, 0, character, "the completion request fixture must decode")?;
+      Ok(completion_local(world, Params::from(Some(parameters))).await)
     })
   }
 
-  /// Install one source revision and execute completion through the local public handler family.
-  #[allow(
-    clippy::single_call_fn,
-    reason = "the named helper binds source installation to the completion request that must observe it, so a scenario cannot query a \
-              revision it never committed"
-  )]
-  fn complete_source<'operation>(
-    world: &'operation LocalWorld<TestEnvironment>,
-    document: &'operation Url,
-    source_text: &'operation str,
-    character: u32,
-    context: &'static str,
-  ) -> LocalTestFuture<'operation, Option<CompletionResponse>> {
+  /// Observe all requested revisions without dropping prior installs or protocol responses.
+  fn complete_cases<'operation>(
+    fixture: &'operation CompletionFixture,
+    cases: impl IntoIterator<Item = CompletionCase> + 'operation,
+  ) -> LocalFuture<'operation, Vec<(CompletionCase, RevisionCompletion)>> {
     Box::pin(async move {
-      replace_local_document(world, document, source_text, "the completion document revision must install").await?;
-      completion_at(world, document, character, context).await
+      let mut observed = Vec::new();
+      for case in cases {
+        let installed = replace_local_document(
+          &fixture.world,
+          &fixture.document,
+          case.0,
+          "the completion document revision must install",
+        )
+        .await;
+        let response = completion_at(&fixture.world, &fixture.document, case.1).await;
+        observed.push((case, (installed, response)));
+      }
+      observed
     })
   }
 
-  /// Return owned labels from either supported LSP completion response representation.
-  #[allow(
-    clippy::single_call_fn,
-    reason = "the named projection keeps the exhaustive `CompletionResponse` match in one place, so assertions observe labels without \
-              depending on which wire representation the handler returns"
-  )]
-  fn response_labels(response: CompletionResponse) -> Vec<String> {
-    match response {
-      CompletionResponse::Array(items) => items.into_iter().map(|item| item.label).collect(),
-      CompletionResponse::List(list) => list.items.into_iter().map(|item| item.label).collect(),
+  /// Borrow response labels without consuming the remaining completion protocol fields.
+  fn response_labels(response: &CompletionRequest, sort: bool) -> Option<Vec<&str>> {
+    let mut observed = match *response.as_ref().ok()?.as_ref().ok()?.as_ref()? {
+      CompletionResponse::Array(ref items) => labels(items),
+      CompletionResponse::List(ref list) => labels(&list.items),
+    };
+    if sort {
+      observed.sort_unstable();
     }
+    Some(observed)
   }
 
-  /// Execute one schema-backed completion request and require a present response.
-  fn completion_labels<'operation>(
-    world: &'operation LocalWorld<TestEnvironment>,
-    document: &'operation Url,
-    source_text: &'operation str,
-    character: u32,
-    execution_context: &'static str,
-    presence_context: &'static str,
-  ) -> LocalTestFuture<'operation, Vec<String>> {
-    Box::pin(async move {
-      let response = ensure_some(
-        complete_source(world, document, source_text, character, execution_context).await?,
-        presence_context,
-      )?;
-      Ok(response_labels(response))
-    })
-  }
-
-  /// Execute one completion request whose observable label contract is order-independent.
-  fn sorted_completion_labels<'operation>(
-    world: &'operation LocalWorld<TestEnvironment>,
-    document: &'operation Url,
-    source_text: &'operation str,
-    character: u32,
-    execution_context: &'static str,
-    presence_context: &'static str,
-  ) -> LocalTestFuture<'operation, String> {
-    Box::pin(async move {
-      let mut labels = completion_labels(world, document, source_text, character, execution_context, presence_context).await?;
-      labels.sort();
-      Ok(labels.join(","))
-    })
-  }
-
-  /// Construct one document with an exact association and a complete in-memory schema.
-  fn schema_backed_completion_world() -> LocalTestFuture<'static, (LocalWorld<TestEnvironment>, Url)> {
+  /// Construct a schema-backed world while retaining every native setup outcome.
+  fn schema_backed_completion_world() -> LocalFuture<'static, Result<CompletionFixture, FixtureFailure>> {
     Box::pin(async {
       let world = local_world()?;
       let document = fixture_url("file:///workspace/completion.toml", "the completion document URL must parse")?;
-      replace_local_document(&world, &document, "", "the initial completion document must install").await?;
       let schema_url = fixture_url("https://example.com/completion-schema.json", "the completion schema URL must parse")?;
-      drop(ensure_ok(
-        world
-          .associate_schema(ManualAssociationRule::Url(document.clone()), SchemaAssociation {
-            meta:     json!({ "source": source::MANUAL }),
-            url:      schema_url.clone(),
-            priority: priority::MAX,
-          })
-          .await,
-        "the exact completion schema association must commit",
-      )?);
-      let snapshot = ensure_some(
-        world.document_snapshot(&document).await,
-        "the associated completion document must expose a snapshot",
-      )?;
-      snapshot.schemas.add_schema(
-        &schema_url,
-        Arc::new(json!({
-          "type": "object",
-          "properties": {
-            "flag": {
-              "type": "boolean"
-            },
-            "name": {
-              "type": "string"
-            },
-            "table": {
-              "type": "object",
-              "properties": {
-                "nested": {
-                  "const": 1
-                }
-              }
-            },
-            "items": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "properties": {
-                  "id": {
-                    "type": "integer"
-                  }
-                }
-              }
-            }
-          }
-        })),
-      );
-      Ok((world, document))
+      let installed = replace_local_document(&world, &document, "", "the initial completion document must install").await;
+      let association = world
+        .associate_schema(ManualAssociationRule::Url(document.clone()), SchemaAssociation {
+          meta:     json!({ "source": source::MANUAL }),
+          url:      schema_url.clone(),
+          priority: priority::MAX,
+        })
+        .await;
+      let snapshot = world.document_snapshot(&document).await;
+      if let Some(ref captured) = snapshot {
+        captured.schemas.add_schema(
+          &schema_url,
+          Arc::new(json!({ "type": "object", "properties": {
+        "flag": { "type": "boolean" }, "name": { "type": "string" },
+        "table": { "type": "object", "properties": { "nested": { "const": 1 } } },
+        "items": { "type": "array", "items": { "type": "object", "properties": { "id": { "type": "integer" } } } }
+      } })),
+        );
+      }
+      Ok(CompletionFixture {
+        world,
+        document,
+        installed,
+        association,
+        snapshot,
+      })
     })
   }
 
-  /// Extract rendered Markdown from one completion documentation value.
+  /// Borrow rendered Markdown while preserving its complete completion owner.
   fn markdown(docs: Option<&Documentation>) -> Option<&str> {
     match *docs? {
       Documentation::MarkupContent(MarkupContent {
@@ -1223,937 +1187,676 @@ mod tests {
     }
   }
 
-  /// Render one expected LSP snippet placeholder with an editable default, such as `${0:true}`.
+  /// Render one expected editable-default placeholder.
   fn snippet_placeholder(tab_stop: u8, default_text: &str) -> String {
     format!("${{{tab_stop}:{default_text}}}")
   }
 
   #[test]
-  fn completion_documentation_prefers_extension_content() -> Result<(), TestFailure> {
-    let schema = json!({
-        "description": "description docs",
-        "x-taplo": { "docs": { "main": "extension docs" } }
+  fn completion_documentation_prefers_extension_content() -> Result<(), impl Debug> {
+    let cases = [
+      (
+        json!({ "description": "description docs", "x-taplo": { "docs": { "main": "extension docs" } } }),
+        Some("extension docs"),
+      ),
+      (json!({ "description": "description docs" }), Some("description docs")),
+      (json!({ "description": "" }), None),
+    ]
+    .map(|(schema, expected)| {
+      let docs = documentation(&schema);
+      (schema, expected, docs)
     });
-    let docs = ensure_some(
-      ensure_ok(documentation(&schema), "valid completion extension metadata must decode")?,
-      "completion docs must exist",
-    )?;
-    ensure(
-      markdown(Some(&docs)) == Some("extension docs"),
-      "extension main docs must override schema description",
-    )?;
-    ensure(
-      markdown(
-        ensure_ok(
-          documentation(&json!({ "description": "description docs" })),
-          "an absent extension must retain schema documentation",
-        )?
-        .as_ref(),
-      ) == Some("description docs"),
-      "schema description must backfill absent extension docs",
-    )?;
-    ensure(
-      ensure_ok(
-        documentation(&json!({ "description": "" })),
-        "empty schema documentation must decode",
-      )?
-      .is_none(),
-      "empty documentation must be omitted",
+    ensure_that(
+      cases,
+      "completion documentation must prefer extensions, fall back to description, and omit empty content",
+      |observed| {
+        observed
+          .iter()
+          .all(|case| case.2.as_ref().is_ok_and(|docs| markdown(docs.as_ref()) == case.1))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn completion_targets_classify_each_supported_cursor_surface() -> Result<(), TestFailure> {
-    ensure(
-      matches!(
-        classify("[alpha]\n", 3)?,
-        Some(CompletionTarget::TableHeader {
-          prefix_length: 1,
-          replacement: Some(_),
-          ..
-        })
-      ),
-      "a cursor inside a table header must select table-header completion with its replacement range",
-    )?;
-    ensure(
-      matches!(
-        classify("[[alpha]]\n", 4)?,
-        Some(CompletionTarget::ArrayTableHeader {
-          prefix_length: 1,
-          replacement:   Some(_),
-        })
-      ),
-      "a cursor inside an array-table header must select array-table completion",
-    )?;
-    ensure(
-      matches!(
-        classify("", 0)?,
-        Some(CompletionTarget::EmptyLine {
-          lookup_path
-        }) if lookup_path.is_empty()
-      ),
-      "an empty document must select root entry insertion",
-    )?;
-    let Some(CompletionTarget::EntryKey {
-      lookup_path,
-      prefix_length,
-      replacement,
-      has_equals,
-    }) = classify("alpha = 1\n", 2)?
-    else {
-      return ensure(false, "a cursor inside an assigned key must select entry-key completion");
-    };
-    ensure(lookup_path.is_empty(), "a root entry key must retain the root schema lookup path")?;
-    ensure_eq(
-      &prefix_length,
-      &1,
-      "a one-segment entry key must retain one completed prefix segment",
-    )?;
-    ensure(replacement.is_some(), "an existing entry key must retain its replacement range")?;
-    ensure(has_equals, "an assigned entry key must preserve its existing equals sign")?;
-    ensure(
-      matches!(
-        classify("root = { alpha = 1,  }\n", 20)?,
-        Some(CompletionTarget::InlineTableEntry { .. })
-      ),
-      "a cursor between inline-table entries must select inline entry insertion",
-    )?;
-    ensure(
-      matches!(
-        classify("alpha = 1\n", 8)?,
-        Some(CompletionTarget::EntryValue {
-          replacement: Some(_),
-          single_quote: false,
-          ..
-        })
-      ),
-      "a cursor on a scalar value must select value replacement with basic-string preference",
-    )?;
-    let Some(CompletionTarget::EntryValue {
-      replacement: value_replacement,
-      lookup_path: value_lookup_path,
-      ..
-    }) = classify("values = [1]\n", 10)?
-    else {
-      return ensure(false, "a cursor on an array element must select entry-value completion");
-    };
-    ensure(
-      (value_replacement.is_none(), value_lookup_path.is_empty()) == (true, false),
-      "an array element must retain its semantic inline lookup path without replacing the complete array value",
-    )?;
-    ensure(
-      matches!(
-        classify("alpha.", 6)?,
-        Some(CompletionTarget::StandaloneKey {
-          replacement: Some(_),
-          ..
-        })
-      ),
-      "an incomplete standalone key must select complete-entry replacement",
-    )
+  fn completion_targets_classify_each_supported_cursor_surface() -> Result<(), impl Debug> {
+    let observed = [
+      classify("[alpha]\n", 3),
+      classify("[[alpha]]\n", 4),
+      classify("", 0),
+      classify("alpha = 1\n", 2),
+      classify("root = { alpha = 1,  }\n", 20),
+      classify("alpha = 1\n", 8),
+      classify("values = [1]\n", 10),
+      classify("alpha.", 6),
+    ];
+    ensure_that(observed, "completion classification must retain each cursor surface, lookup path and replacement boundary", |fixtures| {
+      let [ref table, ref array_table, ref empty, ref key, ref inline, ref value, ref array_value, ref standalone] = *fixtures;
+      table.as_ref().is_ok_and(|fixture| matches!(fixture.2, Ok(Some(CompletionTarget::TableHeader { prefix_length: 1, replacement: Some(_), .. }))))
+        && array_table.as_ref().is_ok_and(|fixture| matches!(fixture.2, Ok(Some(CompletionTarget::ArrayTableHeader { prefix_length: 1, replacement: Some(_) }))))
+        && empty.as_ref().is_ok_and(|fixture| matches!(fixture.2, Ok(Some(CompletionTarget::EmptyLine { ref lookup_path })) if lookup_path.is_empty()))
+        && key.as_ref().is_ok_and(|fixture| matches!(fixture.2, Ok(Some(CompletionTarget::EntryKey { ref lookup_path, prefix_length: 1, replacement: Some(_), has_equals: true })) if lookup_path.is_empty()))
+        && inline.as_ref().is_ok_and(|fixture| matches!(fixture.2, Ok(Some(CompletionTarget::InlineTableEntry { .. }))))
+        && value.as_ref().is_ok_and(|fixture| matches!(fixture.2, Ok(Some(CompletionTarget::EntryValue { replacement: Some(_), single_quote: false, .. }))))
+        && array_value.as_ref().is_ok_and(|fixture| matches!(fixture.2, Ok(Some(CompletionTarget::EntryValue { replacement: None, ref lookup_path, .. })) if !lookup_path.is_empty()))
+        && standalone.as_ref().is_ok_and(|fixture| matches!(fixture.2, Ok(Some(CompletionTarget::StandaloneKey { replacement: Some(_), .. }))))
+    }).map(drop).map_err(Box::new)
   }
 
-  /// Preserve every trustworthy value while omitting or placeholder-projecting malformed values.
   #[test]
-  fn tolerant_completion_instances_preserve_semantics_indices_and_deep_shape() -> Result<(), TestFailure> {
-    let document = parse_document(
+  fn tolerant_completion_instances_preserve_semantics_indices_and_deep_shape() -> Result<(), impl Debug> {
+    let tolerant = parse_document(
       "negative = -1\nvalid = 1\ninvalid = 999999999999999999999999999999\nnonfinite = inf\nvalues = [1, 999999999999999999999999999999, \
        inf]\nduplicate = 1\nduplicate = 2\ndate = 1979-05-27\n",
       "the tolerant completion-instance fixture must parse",
-    )?;
-    ensure_eq(
-      &completion_instance(&document.dom),
-      &json!({
-        "negative": -1,
-        "valid": 1,
-        "values": [1, null, null],
-        "duplicate": 2,
-        "date": "1979-05-27"
-      }),
-      "completion projection must retain valid values, final duplicate winners, and array positions without inventing malformed table \
-       values",
-    )?;
-
+    )
+    .map(|document| {
+      let instance = completion_instance(&document.dom);
+      (document, instance)
+    });
     let depth = 10_000;
     let source = format!("deep = {}1{}\n", "[".repeat(depth), "]".repeat(depth));
-    let deep_document = parse_document(&source, "the deeply nested completion-instance fixture must parse")?;
-    let deep_instance = completion_instance(&deep_document.dom);
-    let mut current = deep_instance.get("deep");
-    for _ in 0..depth {
-      current = current.and_then(Value::as_array).and_then(|array| array.first());
-    }
-    ensure(
-      current == Some(&json!(1)),
-      "completion projection must preserve deeply nested array shape without call-stack recursion",
+    let deep = parse_document(&source, "the deeply nested completion-instance fixture must parse").map(|document| {
+      let instance = completion_instance(&document.dom);
+      (document, instance)
+    });
+    ensure_that(
+      (tolerant, deep),
+      "completion instances must preserve trustworthy values, duplicate winners, array positions and deep shape",
+      |observed| {
+        observed.0.as_ref().is_ok_and(|fixture| {
+          fixture.1 == json!({ "negative": -1, "valid": 1, "values": [1, null, null], "duplicate": 2, "date": "1979-05-27" })
+        }) && observed.1.as_ref().is_ok_and(|fixture| {
+          fixture
+            .1
+            .get("deep")
+            .and_then(|root| (0..depth).try_fold(root, |current, _| current.as_array().and_then(|array| array.first())))
+            == Some(&json!(1))
+        })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
-  /// Exercise the empty-line and header completion targets through schema lookup and rendering.
   #[test]
-  fn schema_backed_handler_completes_header_surfaces() -> Result<(), TestFailure> {
-    block_on(async {
-      let (world, document) = schema_backed_completion_world().await?;
-
-      let empty_label_set = sorted_completion_labels(
-        &world,
-        &document,
-        "",
-        0,
-        "empty-line completion must execute through the local handler",
-        "an empty associated document must return root entry completions",
-      )
-      .await?;
-      ensure_eq(
-        &empty_label_set.as_str(),
-        &"flag,items,name,table,table.nested",
-        "empty-line completion must expose root and reachable nested schema paths",
-      )?;
-
-      let table_labels = completion_labels(
-        &world,
-        &document,
-        "[ta]\n",
-        3,
-        "table-header completion must execute through the local handler",
-        "an incomplete table header must return schema-backed header completions",
-      )
-      .await?
-      .join(",");
-      ensure_eq(
-        &table_labels.as_str(),
-        &"table,table.nested",
-        "table-header completion must retain object-compatible paths, including unconstrained nested schemas",
-      )?;
-
-      let array_table_labels = completion_labels(
-        &world,
-        &document,
-        "[[it]]\n",
-        4,
-        "array-table completion must execute through the local handler",
-        "an incomplete array-table header must return schema-backed header completions",
-      )
-      .await?
-      .join(",");
-      ensure_eq(
-        &array_table_labels.as_str(),
-        &"items",
-        "array-table completion must retain only compatible arrays of objects",
-      )
-    })
+  fn schema_backed_handler_completes_header_surfaces() -> Result<(), impl Debug> {
+    let observed = block_on(async {
+      let fixture = schema_backed_completion_world().await?;
+      let cases = complete_cases(&fixture, [
+        ("", 0, "flag,items,name,table,table.nested", true),
+        ("[ta]\n", 3, "table,table.nested", false),
+        ("[[it]]\n", 4, "items", false),
+      ])
+      .await;
+      Ok::<_, FixtureFailure>((fixture, cases))
+    });
+    ensure_that(
+      observed,
+      "empty lines and headers must expose exactly their compatible schema paths",
+      |result| {
+        let Ok(ref scenario) = *result else {
+          return false;
+        };
+        scenario.0.installed.is_ok()
+          && scenario.0.association.is_ok()
+          && scenario.0.snapshot.is_some()
+          && scenario
+            .1
+            .iter()
+            .all(|case| case.1.0.is_ok() && response_labels(&case.1.1, case.0.3).is_some_and(|names| names.join(",") == case.0.2))
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
-  /// Exercise the standalone and assigned entry-key completion targets through schema lookup.
   #[test]
-  fn schema_backed_handler_completes_key_surfaces() -> Result<(), TestFailure> {
-    block_on(async {
-      let (world, document) = schema_backed_completion_world().await?;
-
-      let entry_key_label_set = sorted_completion_labels(
-        &world,
-        &document,
-        "fl",
-        2,
-        "standalone-key completion must execute through the local handler",
-        "an incomplete standalone key must return complete-entry replacements",
-      )
-      .await?;
-      ensure_eq(
-        &entry_key_label_set.as_str(),
-        &"flag,items,name,table,table.nested",
-        "standalone-key replacement must expose every compatible schema path",
-      )?;
-
-      let assigned_key_label_set = sorted_completion_labels(
-        &world,
-        &document,
-        "fl = false\n",
-        1,
-        "assigned entry-key completion must execute through the local handler",
-        "an assigned partial key must return schema-backed key replacements",
-      )
-      .await?;
-      ensure_eq(
-        &assigned_key_label_set.as_str(),
-        &",flag,items,name,table,table.nested",
-        "assigned entry-key completion must expose the current path and every compatible schema path while retaining the existing equals \
-         sign",
-      )
-    })
+  fn schema_backed_handler_completes_key_surfaces() -> Result<(), impl Debug> {
+    let observed = block_on(async {
+      let fixture = schema_backed_completion_world().await?;
+      let cases = complete_cases(&fixture, [
+        ("fl", 2, "flag,items,name,table,table.nested", true),
+        ("fl = false\n", 1, ",flag,items,name,table,table.nested", true),
+      ])
+      .await;
+      Ok::<_, FixtureFailure>((fixture, cases))
+    });
+    ensure_that(
+      observed,
+      "standalone and assigned partial keys must expose complete paths while preserving the existing assignment",
+      |result| {
+        let Ok(ref scenario) = *result else {
+          return false;
+        };
+        scenario.0.installed.is_ok()
+          && scenario.0.association.is_ok()
+          && scenario.0.snapshot.is_some()
+          && scenario
+            .1
+            .iter()
+            .all(|case| case.1.0.is_ok() && response_labels(&case.1.1, case.0.3).is_some_and(|names| names.join(",") == case.0.2))
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
-  /// Exercise the value, inline-table, and incomplete-value completion targets through rendering.
   #[test]
-  fn schema_backed_handler_completes_value_surfaces() -> Result<(), TestFailure> {
-    block_on(async {
-      let (world, document) = schema_backed_completion_world().await?;
-
-      let entry_value_labels = completion_labels(
-        &world,
-        &document,
-        "flag = false\n",
-        9,
-        "entry-value completion must execute through the local handler",
-        "a Boolean value must return schema-backed replacement values",
-      )
-      .await?
-      .join(",");
-      ensure_eq(
-        &entry_value_labels.as_str(),
-        &"true,false",
-        "entry-value completion must render both Boolean schema polarities",
-      )?;
-
-      let inline_entry_labels = completion_labels(
-        &world,
-        &document,
-        "table = {  }\n",
-        10,
-        "inline-table completion must execute through the local handler",
-        "an inline table gap must return nested entry completions",
-      )
-      .await?
-      .join(",");
-      ensure_eq(
-        &inline_entry_labels.as_str(),
-        &"nested",
-        "inline-table completion must traverse to the nested object schema",
-      )?;
-
-      let incomplete_value_labels = completion_labels(
-        &world,
-        &document,
-        "name = ",
-        7,
-        "incomplete-value completion must execute through the local handler",
-        "an incomplete assigned value must retain schema-backed value completions",
-      )
-      .await?
-      .join(",");
-      ensure_eq(
-        &incomplete_value_labels.as_str(),
-        &r#""""#,
-        "an incomplete string value must offer the schema-directed empty string snippet",
-      )
-    })
+  fn schema_backed_handler_completes_value_surfaces() -> Result<(), impl Debug> {
+    let observed = block_on(async {
+      let fixture = schema_backed_completion_world().await?;
+      let cases = complete_cases(&fixture, [
+        ("flag = false\n", 9, "true,false", false),
+        ("table = {  }\n", 10, "nested", false),
+        ("name = ", 7, r#""""#, false),
+      ])
+      .await;
+      Ok::<_, FixtureFailure>((fixture, cases))
+    });
+    ensure_that(
+      observed,
+      "value, inline-table and incomplete-value completion must preserve Boolean polarities and nested or string snippets",
+      |result| {
+        let Ok(ref scenario) = *result else {
+          return false;
+        };
+        scenario.0.installed.is_ok()
+          && scenario.0.association.is_ok()
+          && scenario.0.snapshot.is_some()
+          && scenario
+            .1
+            .iter()
+            .all(|case| case.1.0.is_ok() && response_labels(&case.1.1, case.0.3).is_some_and(|names| names.join(",") == case.0.2))
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
-  /// Preserve absent success responses and typed request failures at every handler guard.
   #[test]
-  fn completion_handler_preserves_absence_and_typed_parameter_failures() -> Result<(), TestFailure> {
-    block_on(async {
-      let (world, document) = schema_backed_completion_world().await?;
-      let unassociated_world = local_world()?;
-      replace_local_document(
-        &unassociated_world,
-        &document,
+  fn completion_handler_preserves_absence_and_typed_parameter_failures() -> Result<(), impl Debug> {
+    let observed = block_on(async {
+      let unassociated = local_world()?;
+      let disabled = local_world()?;
+      let missing_document = fixture_url("file:///workspace/missing.toml", "the missing completion document URL must parse")?;
+      let fixture = schema_backed_completion_world().await?;
+      let unassociated_install = replace_local_document(
+        &unassociated,
+        &fixture.document,
         "",
         "the unassociated completion document must install",
       )
-      .await?;
-      ensure(
-        completion_at(
-          &unassociated_world,
-          &document,
-          0,
-          "completion without an association must remain an absent success",
-        )
-        .await?
-        .is_none(),
-        "an open document without a schema association must not fabricate completions",
-      )?;
-
-      let disabled_world = local_world()?;
-      let disabled_configuration = json!({
-        "schema": {
-          "enabled": false,
-          "catalogs": []
-        }
-      });
-      drop(ensure_ok(
-        disabled_world
-          .apply_configuration_values_local(Some(&disabled_configuration), &[])
-          .await,
-        "the schema-disabled completion configuration must commit",
-      )?);
-      replace_local_document(
-        &disabled_world,
-        &document,
+      .await;
+      let unassociated_response = completion_at(&unassociated, &fixture.document, 0).await;
+      let configuration = disabled
+        .apply_configuration_values_local(Some(&json!({ "schema": { "enabled": false, "catalogs": [] } })), &[])
+        .await;
+      let disabled_install = replace_local_document(
+        &disabled,
+        &fixture.document,
         "",
         "the schema-disabled completion document must install",
       )
-      .await?;
-      ensure(
-        completion_at(
-          &disabled_world,
-          &document,
-          0,
-          "schema-disabled completion must remain an absent success",
-        )
-        .await?
-        .is_none(),
-        "schema-disabled documents must not request or fabricate completion candidates",
-      )?;
-
-      let missing_document = fixture_url("file:///workspace/missing.toml", "the missing completion document URL must parse")?;
-      ensure(
-        completion_at(
-          &world,
-          &missing_document,
-          0,
-          "completion for an unopened document must remain an absent success",
-        )
-        .await?
-        .is_none(),
-        "completion must not fabricate state for an unopened document",
-      )?;
-      let missing_params = ensure_some(
-        completion_local(&world, Params::<CompletionParams>::from(None)).await.err(),
-        "completion without parameters must return a typed invalid-params error",
-      )?;
-      ensure(
-        (missing_params.code, missing_params.details.is_some()) == (-32602, true),
-        "completion without parameters must retain the standard typed invalid-params error",
-      )
-    })
-  }
-
-  #[test]
-  fn completion_target_rejects_value_context_without_a_semantic_node() -> Result<(), TestFailure> {
-    let source = "alpha = ";
-    let document = parse_document(source, "the incomplete completion fixture must parse")?;
-    let mapper = ensure_ok(Mapper::new_utf16(source), "the incomplete completion mapper must construct")?;
-    let mut query = Query::at(&document.dom, TextSize::new(8));
-    ensure(query.in_entry_value(), "the incomplete assignment cursor must retain value context")?;
-    if let Some(before) = query.before.as_mut() {
-      before.dom_node = None;
-    }
-    if let Some(after) = query.after.as_mut() {
-      after.dom_node = None;
-    }
-    ensure(
-      ensure_ok(
-        CompletionTarget::classify(&query, &document.dom, &mapper),
-        "the incomplete target must project without a mapping failure",
-      )?
-      .is_none(),
-      "an incomplete value without a semantic DOM node must not fabricate a completion lookup path",
-    )
-  }
-
-  #[test]
-  fn enum_completion_uses_only_convertible_values_and_suppresses_fallbacks() -> Result<(), TestFailure> {
-    let schema = json!({
-        "enum": [1, null, 2],
-        "const": 3,
-        "default": 4,
-        "type": "string",
-        "description": "schema docs",
-        "x-taplo": {
-            "docs": { "enumValues": ["one docs", null, "two docs"] }
-        }
+      .await;
+      let disabled_response = completion_at(&disabled, &fixture.document, 0).await;
+      let missing = completion_at(&fixture.world, &missing_document, 0).await;
+      let rejected = completion_local(&fixture.world, Params::<CompletionParams>::from(None)).await;
+      Ok::<_, FixtureFailure>((
+        fixture,
+        unassociated,
+        disabled,
+        unassociated_install,
+        configuration,
+        disabled_install,
+        [unassociated_response, disabled_response, missing],
+        rejected,
+      ))
     });
-    let mut completions = Vec::new();
-    let replacement = Range::default();
-    ensure_ok(
-      add_value_completions(&schema, Some(&replacement), &mut completions, false),
-      "valid enum values must produce completions",
-    )?;
-    ensure_eq(
-      &completions.len(),
-      &2,
-      "a nonempty convertible enum must suppress const, default, and type completions",
-    )?;
-    ensure(
-      completions.iter().map(|item| item.label.as_str()).collect::<Vec<_>>() == vec!["1", "2"],
-      "invalid enum values must be omitted while valid values retain declaration order",
-    )?;
-    let first = ensure_some(completions.first(), "the first enum completion must exist")?;
-    let second = ensure_some(completions.get(1), "the second enum completion must exist")?;
-    ensure(
-      markdown(first.documentation.as_ref()) == Some("one docs"),
-      "enum documentation must remain aligned by original schema index",
-    )?;
-    ensure(
-      markdown(second.documentation.as_ref()) == Some("two docs"),
-      "later enum documentation must remain aligned after an invalid value is skipped",
-    )?;
-    ensure(
-      completions
-        .iter()
-        .map(|item| (item.insert_text.is_some(), item.text_edit.is_some()))
-        .collect::<Vec<_>>()
-        == vec![(true, true), (true, true)],
-      "mapped enum completions must support both insertion and replacement",
+    ensure_that(
+      observed,
+      "completion guards must preserve absent successes and the typed missing-parameters failure",
+      |result| {
+        let Ok(ref scenario) = *result else {
+          return false;
+        };
+        scenario.0.installed.is_ok()
+          && scenario.0.association.is_ok()
+          && scenario.0.snapshot.is_some()
+          && scenario.3.is_ok()
+          && scenario.4.is_ok()
+          && scenario.5.is_ok()
+          && scenario.6.iter().all(|response| matches!(*response, Ok(Ok(None))))
+          && scenario
+            .7
+            .as_ref()
+            .is_err_and(|error| error.code == -32602 && error.details.is_some())
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn type_derived_completions_cover_absent_null_union_and_unknown_types() -> Result<(), TestFailure> {
-    for (schema, expected_labels) in [
+  fn completion_target_rejects_value_context_without_a_semantic_node() -> Result<(), impl Debug> {
+    let observed = parse_document("alpha = ", "the incomplete completion fixture must parse").map(|document| {
+      let original = Query::at(&document.dom, TextSize::new(8));
+      let mut query = Query::at(&document.dom, TextSize::new(8));
+      if let Some(before) = query.before.as_mut() {
+        before.dom_node = None;
+      }
+      if let Some(after) = query.after.as_mut() {
+        after.dom_node = None;
+      }
+      let classified = CompletionTarget::classify(&query, &document.dom, &document.mapper);
+      (document, original, query, classified)
+    });
+    ensure_that(
+      observed,
+      "an incomplete value cursor must retain value context and reject classification without a semantic node",
+      |result| {
+        result
+          .as_ref()
+          .is_ok_and(|fixture| fixture.1.in_entry_value() && matches!(fixture.3, Ok(None)))
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
+  }
+
+  #[test]
+  fn enum_completion_uses_only_convertible_values_and_suppresses_fallbacks() -> Result<(), impl Debug> {
+    let schema = json!({ "enum": [1, null, 2], "const": 3, "default": 4, "type": "string", "description": "schema docs",
+      "x-taplo": { "docs": { "enumValues": ["one docs", null, "two docs"] } } });
+    let replacement = Range::default();
+    let mut completions = Vec::new();
+    let outcome = add_value_completions(&schema, Some(&replacement), &mut completions, false);
+    ensure_that(
+      (schema, replacement, outcome, completions),
+      "convertible enum values must suppress fallbacks and retain source-index docs, insertion and replacement",
+      |observed| {
+        observed.2.is_ok()
+          && labels(&observed.3) == ["1", "2"]
+          && observed
+            .3
+            .first()
+            .is_some_and(|item| markdown(item.documentation.as_ref()) == Some("one docs"))
+          && observed
+            .3
+            .get(1)
+            .is_some_and(|item| markdown(item.documentation.as_ref()) == Some("two docs"))
+          && observed
+            .3
+            .iter()
+            .all(|item| item.insert_text.is_some() && item.text_edit.is_some())
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
+  }
+
+  #[test]
+  fn type_derived_completions_cover_absent_null_union_and_unknown_types() -> Result<(), impl Debug> {
+    let observed = [
       (json!({}), "{ }"),
       (json!({ "type": null }), "{ }"),
       (json!({ "type": ["array", "object", "unknown"] }), "[],{ }"),
-    ] {
+    ]
+    .map(|(schema, expected)| {
       let mut completions = Vec::new();
-      ensure_ok(
-        add_value_completions(&schema, None, &mut completions, false),
-        "a schema type declaration must produce its supported fallback completions",
-      )?;
-      let labels = completions
-        .iter()
-        .map(|completion| completion.label.as_str())
-        .collect::<Vec<_>>()
-        .join(",");
-      ensure_eq(
-        &labels.as_str(),
-        &expected_labels,
-        "type-derived completion must include only supported TOML value families",
-      )?;
-    }
-    Ok(())
+      let outcome = add_value_completions(&schema, None, &mut completions, false);
+      (schema, expected, outcome, completions)
+    });
+    ensure_that(
+      observed,
+      "type-derived completion must include only supported TOML value families",
+      |cases| cases.iter().all(|case| case.2.is_ok() && labels(&case.3).join(",") == case.1),
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn completion_errors_map_to_internal_rpc_details_without_losing_the_typed_message() -> Result<(), TestFailure> {
+  fn completion_errors_map_to_internal_rpc_details_without_losing_the_typed_message() -> Result<(), impl Debug> {
     let rpc_error = RpcError::from(CompletionError::Lossy {
       original:   Box::new(json!(1)),
       round_trip: Box::new(json!(2)),
     });
-    ensure(
-      (rpc_error.code, rpc_error.details.as_ref().and_then(Value::as_str))
-        == (-32603, Some("schema completion value loses data during TOML conversion")),
-      "completion failures must retain their stable typed message at the JSON-RPC adapter boundary",
+    ensure_that(
+      rpc_error,
+      "completion failures must retain their stable typed message at the JSON-RPC boundary",
+      |error| {
+        (error.code, error.details.as_ref().and_then(Value::as_str))
+          == (-32603, Some("schema completion value loses data during TOML conversion"))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn null_enum_const_and_default_values_fall_through_in_order() -> Result<(), TestFailure> {
-    let const_schema = json!({
-        "enum": [null],
-        "const": 3,
-        "default": 4,
-        "type": "string"
-    });
-    let mut completions = Vec::new();
-    ensure_ok(
-      add_value_completions(&const_schema, None, &mut completions, false),
-      "a null enum value must fall through to a valid constant",
-    )?;
-    ensure(
-      completions.iter().map(|item| item.label.as_str()).collect::<Vec<_>>() == vec!["3"],
-      "an all-invalid enum must fall through to a valid const",
-    )?;
-    let const_completion = ensure_some(completions.first(), "the const fallback completion must exist")?;
-    ensure(
-      (const_completion.text_edit.is_some(), const_completion.insert_text.is_some()) == (false, true),
-      "an unmappable optional range must retain insert text without a replacement edit",
-    )?;
-
-    let default_schema = json!({
-        "enum": [],
-        "const": null,
-        "default": "fallback",
-        "type": "boolean"
-    });
-    completions.clear();
-    ensure_ok(
-      add_value_completions(&default_schema, None, &mut completions, false),
-      "an absent constant must fall through to a valid default",
-    )?;
-    ensure(
-      completions.iter().map(|item| item.label.as_str()).collect::<Vec<_>>() == vec!["\"fallback\""],
-      "empty enum and null const must fall through to a valid default",
-    )?;
-
-    let type_schema = json!({
-        "enum": [null],
-        "const": null,
-        "default": null,
-        "type": "boolean"
-    });
-    completions.clear();
-    ensure_ok(
-      add_value_completions(&type_schema, None, &mut completions, false),
-      "absent literal values must fall through to type snippets",
-    )?;
-    ensure(
-      completions.iter().map(|item| item.label.as_str()).collect::<Vec<_>>() == vec!["true", "false"],
-      "null enum, const, and default values must fall through to type snippets",
-    )?;
-    ensure(
-      ensure_ok(
-        schema_value_to_toml(&Value::Null, false),
-        "JSON null is an absent TOML completion value",
-      )?
-      .is_none(),
-      "null must never become bogus TOML completion text",
-    )?;
-    ensure(
-      matches!(
-        schema_value_to_toml(&json!({ "bad": null }), false),
-        Err(CompletionError::Decode { .. })
+  fn null_enum_const_and_default_values_fall_through_in_order() -> Result<(), impl Debug> {
+    let cases = [
+      (json!({ "enum": [null], "const": 3, "default": 4, "type": "string" }), vec!["3"]),
+      (
+        json!({ "enum": [], "const": null, "default": "fallback", "type": "boolean" }),
+        vec![r#""fallback""#],
       ),
-      "a nonconvertible composite value must return a typed conversion error",
+      (json!({ "enum": [null], "const": null, "default": null, "type": "boolean" }), vec![
+        "true", "false",
+      ]),
+    ]
+    .map(|(schema, expected)| {
+      let mut completions = Vec::new();
+      let outcome = add_value_completions(&schema, None, &mut completions, false);
+      (schema, expected, outcome, completions)
+    });
+    let absent = schema_value_to_toml(&Value::Null, false);
+    let rejected = schema_value_to_toml(&json!({ "bad": null }), false);
+    ensure_that(
+      (cases, absent, rejected),
+      "null candidates must fall through enum, const, default and type while unrepresentable composites preserve decode failures",
+      |observed| {
+        observed.0.iter().all(|case| case.2.is_ok() && labels(&case.3) == case.1)
+          && observed
+            .0
+            .first()
+            .and_then(|case| case.3.first())
+            .is_some_and(|item| item.text_edit.is_none() && item.insert_text.is_some())
+          && matches!(observed.1, Ok(None))
+          && matches!(observed.2, Err(CompletionError::Decode { .. }))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn schema_shape_filters_accept_only_matching_container_contracts() -> Result<(), TestFailure> {
-    for (schema, expected) in [
+  fn schema_shape_filters_accept_only_matching_container_contracts() -> Result<(), impl Debug> {
+    let objects = [
       (json!({}), true),
       (json!({ "type": null }), true),
       (json!({ "type": "object" }), true),
       (json!({ "type": ["string", "object"] }), true),
       (json!({ "type": "string" }), false),
       (json!({ "type": ["string", "boolean"] }), false),
-    ] {
-      ensure(
-        accepts_object(&schema) == expected,
-        "object completion eligibility must follow the schema type declaration",
-      )?;
-    }
-    for (schema, expected) in [
+    ]
+    .map(|(schema, expected)| {
+      let actual = accepts_object(&schema);
+      (schema, expected, actual)
+    });
+    let arrays = [
       (json!({ "type": "array" }), true),
       (json!({ "type": "array", "items": {} }), true),
       (json!({ "type": "array", "items": { "type": null } }), true),
       (json!({ "type": "array", "items": { "type": "object" } }), true),
       (json!({ "type": "array", "items": { "type": "string" } }), false),
       (json!({ "type": "object", "items": { "type": "object" } }), false),
-    ] {
-      ensure(
-        accepts_array_of_objects(&schema) == expected,
-        "array-table completion eligibility must require array items that permit objects",
+    ]
+    .map(|(schema, expected)| {
+      let actual = accepts_array_of_objects(&schema);
+      (schema, expected, actual)
+    });
+    ensure_that(
+      (objects, arrays),
+      "container completion filters must preserve matching type and array-item contracts",
+      |observed| observed.0.iter().chain(&observed.1).all(|case| case.1 == case.2),
+    )
+    .map(drop)
+    .map_err(Box::new)
+  }
+
+  #[test]
+  fn header_builders_filter_existing_and_incompatible_schema_paths() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let document = parse_document(
+        "[existing]\nvalue = 1\n[pseudo.child]\n",
+        "the header-completion DOM fixture must parse",
       )?;
-    }
-    Ok(())
-  }
-
-  #[test]
-  fn header_builders_filter_existing_and_incompatible_schema_paths() -> Result<(), TestFailure> {
-    let document = parse_document(
-      "[existing]\nvalue = 1\n[pseudo.child]\n",
-      "the header-completion DOM fixture must parse",
-    )?;
-    let replacement = Range::default();
-    let schemas = vec![
-      completion_schema("existing", "existing", json!({ "type": "object" }))?,
-      completion_schema("missing", "missing", json!({ "type": "object", "description": "missing table" }))?,
-      completion_schema("pseudo", "pseudo", json!({ "type": "object" }))?,
-      completion_schema("scalar", "scalar", json!({ "type": "string" }))?,
-    ];
-    let current = ensure_ok("current".parse::<Keys>(), "the current header path must parse")?;
-    let completions = ensure_ok(
-      table_header_completions(&document.dom, schemas.clone(), Some(&replacement), &current),
-      "standard table-header completions must build",
-    )?;
-    ensure(
-      labels(&completions) == ["missing", "pseudo"],
-      "standard table headers must omit concrete existing paths and non-object schemas",
-    )?;
-    let missing = ensure_some(completions.first(), "the missing table completion must exist")?;
-    ensure(
-      (
-        missing.kind,
-        missing.insert_text.as_deref(),
-        markdown(missing.documentation.as_ref()),
-        simple_text_edit(missing),
-      ) == (
-        Some(CompletionItemKind::STRUCT),
-        Some("missing"),
-        Some("missing table"),
-        Some((&replacement, "missing")),
-      ),
-      "a table-header completion must carry its structural kind, documentation, insertion, and replacement edit",
-    )?;
-
-    let existing = ensure_ok("existing".parse::<Keys>(), "the existing header path must parse")?;
-    let current_completions = ensure_ok(
-      table_header_completions(&document.dom, schemas, None, &existing),
-      "the current table header must remain completable",
-    )?;
-    ensure(
-      labels(&current_completions) == ["existing", "missing", "pseudo"],
-      "the currently edited concrete header must remain eligible while unrelated concrete paths stay filtered",
-    )?;
-
-    let array_schemas = vec![
-      completion_schema("items", "items", json!({ "type": "array", "items": { "type": "object" } }))?,
-      completion_schema("open", "open", json!({ "type": "array" }))?,
-      completion_schema("strings", "strings", json!({ "type": "array", "items": { "type": "string" } }))?,
-      completion_schema("object", "object", json!({ "type": "object" }))?,
-    ];
-    let array_completions = ensure_ok(
-      array_table_header_completions(array_schemas, None),
-      "array-table header completions must build",
-    )?;
-    ensure(
-      labels(&array_completions) == ["items", "open"],
-      "array-table headers must retain only schemas whose array items permit objects",
-    )?;
-    ensure(
-      matches!(
-        header_completion(&existing, &json!({ "x-taplo": true }), None,),
-        Err(CompletionError::SchemaExtension(_))
-      ),
-      "malformed Taplo metadata must remain a typed header-completion failure",
+      let replacement = Range::default();
+      let schemas = vec![
+        completion_schema("existing", "existing", json!({ "type": "object" }))?,
+        completion_schema("missing", "missing", json!({ "type": "object", "description": "missing table" }))?,
+        completion_schema("pseudo", "pseudo", json!({ "type": "object" }))?,
+        completion_schema("scalar", "scalar", json!({ "type": "string" }))?,
+      ];
+      let current = ensure_ok("current".parse::<Keys>(), "the current header path must parse")?;
+      let existing = ensure_ok("existing".parse::<Keys>(), "the existing header path must parse")?;
+      let array_schemas = vec![
+        completion_schema("items", "items", json!({ "type": "array", "items": { "type": "object" } }))?,
+        completion_schema("open", "open", json!({ "type": "array" }))?,
+        completion_schema("strings", "strings", json!({ "type": "array", "items": { "type": "string" } }))?,
+        completion_schema("object", "object", json!({ "type": "object" }))?,
+      ];
+      let completions = table_header_completions(&document.dom, schemas.clone(), Some(&replacement), &current);
+      let current_completions = table_header_completions(&document.dom, schemas.clone(), None, &existing);
+      let arrays = array_table_header_completions(array_schemas.clone(), None);
+      let invalid = header_completion(&existing, &json!({ "x-taplo": true }), None);
+      Ok::<_, FixtureFailure>((
+        document, replacement, schemas, array_schemas, completions, current_completions, arrays, invalid,
+      ))
+    })();
+    ensure_that(
+      observed,
+      "header completion must filter existing and incompatible paths while preserving current-header eligibility and protocol fields",
+      |result| {
+        let Ok(ref scenario) = *result else {
+          return false;
+        };
+        let Ok(ref items) = scenario.4 else {
+          return false;
+        };
+        labels(items) == ["missing", "pseudo"]
+          && items.first().is_some_and(|item| {
+            (
+              item.kind,
+              item.insert_text.as_deref(),
+              markdown(item.documentation.as_ref()),
+              simple_text_edit(item),
+            ) == (
+              Some(CompletionItemKind::STRUCT),
+              Some("missing"),
+              Some("missing table"),
+              Some((&scenario.1, "missing")),
+            )
+          })
+          && scenario
+            .5
+            .as_ref()
+            .is_ok_and(|current_items| labels(current_items) == ["existing", "missing", "pseudo"])
+          && scenario
+            .6
+            .as_ref()
+            .is_ok_and(|array_items| labels(array_items) == ["items", "open"])
+          && matches!(scenario.7, Err(CompletionError::SchemaExtension(_)))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn entry_builders_preserve_presence_and_replacement_contracts() -> Result<(), TestFailure> {
-    let document = parse_document("existing = 1\n[pseudo.child]\n", "the entry-completion DOM fixture must parse")?;
-    let schemas = vec![
-      completion_schema("existing", "existing", json!({ "default": 2 }))?,
-      completion_schema("missing", "missing", json!({ "type": "string", "description": "missing entry" }))?,
-      completion_schema("pseudo", "pseudo", json!({ "type": "object" }))?,
-    ];
-    let new_entries = ensure_ok(
-      new_entry_completions(&document.dom, schemas.clone()),
-      "new-entry completions must build",
-    )?;
-    ensure(
-      (
-        labels(&new_entries),
-        new_entries
-          .iter()
-          .map(|completion| (completion.kind, completion.insert_text_format))
-          .collect::<Vec<_>>(),
-      ) == (vec!["missing", "pseudo"], vec![
-        (Some(CompletionItemKind::VARIABLE), Some(InsertTextFormat::SNIPPET)),
-        (Some(CompletionItemKind::VARIABLE), Some(InsertTextFormat::SNIPPET)),
-      ]),
-      "new-entry completions must omit concrete paths and emit snippets for missing or pseudo paths",
-    )?;
-    let missing = ensure_some(new_entries.first(), "the missing entry completion must exist")?;
-    ensure(
-      (missing.insert_text.as_deref(), markdown(missing.documentation.as_ref())) == (Some(r#"missing = "$0""#), Some("missing entry")),
-      "a new entry completion must retain its schema-directed snippet and documentation",
-    )?;
-
-    let replacement = Range::default();
-    let standalone = ensure_ok(
-      standalone_key_completions(&document.dom, schemas, Some(&replacement)),
-      "standalone-key completions must build",
-    )?;
-    ensure(
-      (
-        labels(&standalone),
-        standalone
-          .iter()
-          .map(|completion| completion.text_edit.is_some())
-          .collect::<Vec<_>>(),
-      ) == (vec!["missing", "pseudo"], vec![true, true]),
-      "standalone-key completion must replace only missing or pseudo paths",
+  fn entry_builders_preserve_presence_and_replacement_contracts() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let document = parse_document("existing = 1\n[pseudo.child]\n", "the entry-completion DOM fixture must parse")?;
+      let schemas = vec![
+        completion_schema("existing", "existing", json!({ "default": 2 }))?,
+        completion_schema("missing", "missing", json!({ "type": "string", "description": "missing entry" }))?,
+        completion_schema("pseudo", "pseudo", json!({ "type": "object" }))?,
+      ];
+      let replacement = Range::default();
+      let new_entries = new_entry_completions(&document.dom, schemas.clone());
+      let standalone = standalone_key_completions(&document.dom, schemas.clone(), Some(&replacement));
+      Ok::<_, FixtureFailure>((document, schemas, replacement, new_entries, standalone))
+    })();
+    ensure_that(
+      observed,
+      "entry builders must omit concrete paths and preserve snippet, documentation and replacement fields for missing or pseudo paths",
+      |result| {
+        let Ok(ref scenario) = *result else {
+          return false;
+        };
+        let Ok(ref items) = scenario.3 else {
+          return false;
+        };
+        labels(items) == ["missing", "pseudo"]
+          && items
+            .iter()
+            .all(|item| (item.kind, item.insert_text_format) == (Some(CompletionItemKind::VARIABLE), Some(InsertTextFormat::SNIPPET)))
+          && items.first().is_some_and(|item| {
+            (item.insert_text.as_deref(), markdown(item.documentation.as_ref())) == (Some(r#"missing = "$0""#), Some("missing entry"))
+          })
+          && scenario.4.as_ref().is_ok_and(|standalone_items| {
+            labels(standalone_items) == ["missing", "pseudo"] && standalone_items.iter().all(|item| item.text_edit.is_some())
+          })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn entry_builders_preserve_equals_and_value_contracts() -> Result<(), TestFailure> {
-    let replacement = Range::default();
-    let key_schema = vec![completion_schema("feature", "feature", json!({ "default": true }))?];
-    let assigned = ensure_ok(
-      entry_key_completions(key_schema.clone(), Some(&replacement), true),
-      "assigned entry-key completions must build",
-    )?;
-    let assigned_item = ensure_some(assigned.first(), "the assigned key completion must exist")?;
-    ensure(
-      (
-        assigned_item.insert_text.as_deref(),
-        assigned_item.insert_text_format,
-        simple_text_edit(assigned_item),
-      ) == (Some("feature "), None, Some((&replacement, "feature "))),
-      "an assigned key completion must replace only the key and retain the equals-sign boundary",
-    )?;
-    let unassigned = ensure_ok(
-      entry_key_completions(key_schema, None, false),
-      "unassigned entry-key completions must build",
-    )?;
-    let unassigned_item = ensure_some(unassigned.first(), "the unassigned key completion must exist")?;
-    let feature_snippet = snippet_placeholder(0, "true");
-    let expected_entry_insert = format!("feature = {feature_snippet}");
-    ensure(
-      (
-        unassigned_item.insert_text.as_deref(),
-        unassigned_item.insert_text_format,
-        unassigned_item.text_edit.is_some(),
-      ) == (Some(expected_entry_insert.as_str()), Some(InsertTextFormat::SNIPPET), false),
-      "an unassigned key completion must insert a complete schema-directed entry snippet",
-    )?;
-
-    let values = ensure_ok(
-      entry_value_completions(
-        vec![
-          completion_schema("choice", "choice", json!({ "const": "fixed" }))?,
-          completion_schema("flag", "flag", json!({ "type": "boolean" }))?,
-        ],
-        Some(&replacement),
-        true,
-      ),
-      "entry-value completions must build",
-    )?;
-    ensure(
-      (
-        labels(&values),
-        values
-          .iter()
-          .map(|completion| completion.text_edit.is_some())
-          .collect::<Vec<_>>(),
-      ) == (vec!["'fixed'", "true", "false"], vec![true, true, true]),
-      "value completion must combine schema branches, honor literal-quote preference, and retain replacement edits",
+  fn entry_builders_preserve_equals_and_value_contracts() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let replacement = Range::default();
+      let key_schema = vec![completion_schema("feature", "feature", json!({ "default": true }))?];
+      let value_schemas = vec![
+        completion_schema("choice", "choice", json!({ "const": "fixed" }))?,
+        completion_schema("flag", "flag", json!({ "type": "boolean" }))?,
+      ];
+      let assigned = entry_key_completions(key_schema.clone(), Some(&replacement), true);
+      let unassigned = entry_key_completions(key_schema.clone(), None, false);
+      let values = entry_value_completions(value_schemas.clone(), Some(&replacement), true);
+      Ok::<_, ResultFailure<QueryError>>((replacement, key_schema, value_schemas, assigned, unassigned, values))
+    })();
+    ensure_that(
+      observed,
+      "assigned keys must preserve equals while unassigned keys and branch values retain complete snippets and replacements",
+      |result| {
+        let Ok(ref scenario) = *result else {
+          return false;
+        };
+        let Ok(ref assigned) = scenario.3 else {
+          return false;
+        };
+        let Ok(ref unassigned) = scenario.4 else {
+          return false;
+        };
+        assigned.first().is_some_and(|item| {
+          (item.insert_text.as_deref(), item.insert_text_format, simple_text_edit(item))
+            == (Some("feature "), None, Some((&scenario.0, "feature ")))
+        }) && unassigned.first().is_some_and(|item| {
+          item.insert_text.as_deref() == Some(format!("feature = {}", snippet_placeholder(0, "true")).as_str())
+            && item.insert_text_format == Some(InsertTextFormat::SNIPPET)
+            && item.text_edit.is_none()
+        }) && scenario
+          .5
+          .as_ref()
+          .is_ok_and(|items| labels(items) == ["'fixed'", "true", "false"] && items.iter().all(|item| item.text_edit.is_some()))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn empty_value_snippets_cover_every_schema_type_polarity() -> Result<(), TestFailure> {
+  fn empty_value_snippets_cover_every_schema_type_polarity() -> Result<(), impl Debug> {
     let boolean_placeholder = snippet_placeholder(3, "false");
-    for (schema, expected) in [
+    let cases = [
       (json!({ "$ref": "#/$defs/value" }), "$3"),
       (json!({}), "{ $3 }"),
       (json!({ "type": null }), "{ $3 }"),
       (json!({ "type": ["string", "boolean"] }), "$3"),
       (json!({ "type": "object" }), "{ $3 }"),
       (json!({ "type": "array" }), "[$3]"),
-      (json!({ "type": "string" }), "\"$3\""),
+      (json!({ "type": "string" }), r#""$3""#),
       (json!({ "type": "boolean" }), boolean_placeholder.as_str()),
       (json!({ "type": "integer" }), "$3"),
-    ] {
-      let snippet = empty_value_snippet(&schema, 3);
-      ensure_eq(
-        &snippet.as_str(),
-        &expected,
-        "empty-value snippets must follow the schema type without inventing concrete values",
-      )?;
-    }
-    let missing_property = ensure_ok(
-      default_value_snippet(
-        &json!({
-          "type": "object",
-          "required": ["missing"],
-          "properties": {}
-        }),
-        0,
-        false,
-      ),
-      "a required key without a property schema must retain a nested object placeholder",
-    )?;
-    ensure_eq(
-      &missing_property.as_ref(),
-      &"{ missing = { $1 } }$0",
-      "a required key without a property schema must receive the generic nested object snippet",
+    ]
+    .map(|(schema, expected)| {
+      let actual = empty_value_snippet(&schema, 3);
+      (schema, expected.to_owned(), actual)
+    });
+    let schema = json!({ "type": "object", "required": ["missing"], "properties": {} });
+    let missing = default_value_snippet(&schema, 0, false);
+    ensure_that(
+      (cases, schema, missing),
+      "empty snippets must preserve each schema type and generic nested placeholders for absent required properties",
+      |observed| {
+        observed.0.iter().all(|case| case.1 == case.2) && observed.2.as_ref().is_ok_and(|snippet| snippet == "{ missing = { $1 } }$0")
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn schema_value_conversion_preserves_value_kind() -> Result<(), TestFailure> {
-    let scalar = ensure_some(
-      ensure_ok(
-        schema_value_to_toml(&json!(1), false),
-        "an integer schema value must decode and render",
-      )?,
-      "an integer schema value must convert",
-    )?;
-    ensure(
-      scalar == ("1".into(), CompletionItemKind::VALUE),
-      "scalar schema values must produce value completions",
-    )?;
-    let object = ensure_some(
-      ensure_ok(
-        schema_value_to_toml(&json!({ "key": 1 }), false),
-        "an object schema value must decode and render",
-      )?,
-      "an object schema value must convert",
-    )?;
-    ensure(
-      object.1 == CompletionItemKind::STRUCT,
-      "object schema values must produce structural completions",
+  fn schema_value_conversion_preserves_value_kind() -> Result<(), impl Debug> {
+    let scalar = schema_value_to_toml(&json!(1), false);
+    let object = schema_value_to_toml(&json!({ "key": 1 }), false);
+    ensure_that(
+      (scalar, object),
+      "schema value conversion must retain scalar text and distinguish structural completions",
+      |observed| {
+        observed.0.as_ref().is_ok_and(|value| {
+          value
+            .as_ref()
+            .is_some_and(|candidate| candidate == &("1".into(), CompletionItemKind::VALUE))
+        }) && observed.1.as_ref().is_ok_and(|value| {
+          value
+            .as_ref()
+            .is_some_and(|candidate| candidate.1 == CompletionItemKind::STRUCT)
+        })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn recursive_default_snippets_use_safe_precedence_and_saturating_cursors() -> Result<(), TestFailure> {
-    ensure_eq(
-      &ensure_ok(
-        default_value_snippet(&json!({ "const": "fixed", "default": "other", "type": "string" }), 0, false),
-        "a valid constant must produce a default snippet",
-      )?
-      .as_ref(),
-      &r#"${0:"fixed"}"#,
-      "valid const must win over default and type snippet",
-    )?;
-    ensure_eq(
-      &ensure_ok(
-        default_value_snippet(&json!({ "const": null, "default": true, "type": "string" }), 0, false),
-        "a valid default must produce a snippet",
-      )?
-      .as_ref(),
-      &snippet_placeholder(0, "true").as_str(),
-      "null const must fall through to a valid default",
-    )?;
-    ensure_eq(
-      &ensure_ok(
-        default_value_snippet(&json!({ "enum": [null, 1], "type": "string" }), 0, false),
-        "a partially representable enum must produce a placeholder",
-      )?
-      .as_ref(),
-      &"$0",
-      "an enum placeholder must be used only when at least one value converts",
-    )?;
-    ensure_eq(
-      &ensure_ok(
-        default_value_snippet(&json!({ "enum": [null], "type": "string" }), 0, false),
-        "an enum without TOML values must fall through",
-      )?
-      .as_ref(),
-      &r#""$0""#,
-      "an all-invalid enum must fall through to type-derived syntax",
-    )?;
-
-    let recursive = ensure_ok(
-      default_value_snippet(
-        &json!({
-            "type": "object",
-            "required": ["name"],
-            "properties": { "name": { "const": "fixed" } }
-        }),
-        usize::MAX,
-        false,
+  fn recursive_default_snippets_use_safe_precedence_and_saturating_cursors() -> Result<(), impl Debug> {
+    let cases = [
+      (
+        json!({ "const": "fixed", "default": "other", "type": "string" }),
+        r#"${0:"fixed"}"#.to_owned(),
       ),
-      "recursive object defaults must produce a snippet",
-    )?;
-    ensure_contains(
-      recursive.as_ref(),
-      &format!("${{{}:\"fixed\"}}", usize::MAX),
-      "recursive cursor numbering must saturate instead of overflowing",
-    )?;
-    let multi_key = ensure_ok(
-      default_value_snippet(
-        &json!({
-          "type": "object",
-          "required": ["name", "enabled"],
-          "properties": {
-            "name": {
-              "const": "fixed"
-            },
-            "enabled": {
-              "type": "boolean"
-            }
-          }
-        }),
-        0,
-        false,
+      (
+        json!({ "const": null, "default": true, "type": "string" }),
+        snippet_placeholder(0, "true"),
       ),
-      "an object with multiple required keys must produce one complete snippet",
-    )?;
-    ensure_eq(
-      &multi_key.as_ref(),
-      &r#"{ name = ${1:"fixed"}, enabled = ${1:false} }$0"#,
-      "multi-key object snippets must separate every required entry while sharing the nested cursor depth",
-    )?;
-    ensure_eq(
-      &completion_depth(usize::MAX, 1),
-      &usize::MAX,
-      "completion traversal depth must saturate at the platform maximum",
+      (json!({ "enum": [null, 1], "type": "string" }), "$0".to_owned()),
+      (json!({ "enum": [null], "type": "string" }), r#""$0""#.to_owned()),
+    ]
+    .map(|(schema, expected)| {
+      let actual = default_value_snippet(&schema, 0, false);
+      (schema, expected, actual)
+    });
+    let recursive_schema = json!({ "type": "object", "required": ["name"], "properties": { "name": { "const": "fixed" } } });
+    let recursive = default_value_snippet(&recursive_schema, usize::MAX, false);
+    let multi_schema = json!({ "type": "object", "required": ["name", "enabled"], "properties": { "name": { "const": "fixed" }, "enabled": { "type": "boolean" } } });
+    let multi = default_value_snippet(&multi_schema, 0, false);
+    let depth = completion_depth(usize::MAX, 1);
+    ensure_that(
+      (cases, recursive_schema, recursive, multi_schema, multi, depth),
+      "default snippets must retain precedence, all required keys and saturating nested cursor and traversal depths",
+      |observed| {
+        observed
+          .0
+          .iter()
+          .all(|case| case.2.as_ref().is_ok_and(|actual| actual.as_ref() == case.1))
+          && observed
+            .2
+            .as_ref()
+            .is_ok_and(|snippet| snippet.contains(&format!("${{{}:\"fixed\"}}", usize::MAX)))
+          && observed
+            .4
+            .as_ref()
+            .is_ok_and(|snippet| snippet == r#"{ name = ${1:"fixed"}, enabled = ${1:false} }$0"#)
+          && observed.5 == usize::MAX
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

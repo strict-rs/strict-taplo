@@ -51,6 +51,7 @@ pub(super) enum ConfigurationError {
 }
 
 /// Client-visible output after one committed configuration transition.
+#[derive(Debug)]
 pub(super) struct ConfigurationEffects {
   /// Current schema associations after configuration replacement.
   pub(super) associations: Vec<DidChangeSchemaAssociationParams>,
@@ -59,6 +60,7 @@ pub(super) struct ConfigurationEffects {
 }
 
 /// One configuration request together with the captured root identity of each scoped item.
+#[derive(Debug)]
 pub(super) struct ConfigurationRequest {
   /// Standard LSP request parameters.
   pub(super) params: ConfigurationParams,
@@ -240,13 +242,15 @@ define_lsp_execution_families!(
 
 #[cfg(test)]
 mod tests {
+  use std::fmt::Debug;
+
   use futures::executor::block_on;
   use lsp_types::ConfigurationParams;
   use lsp_types::DidChangeConfigurationParams;
   use serde_json::json;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
+  use strict_test_support::ResultFailure;
   use strict_test_support::ensure_ok;
+  use strict_test_support::ensure_that;
   use url::Url;
 
   use super::ConfigurationError;
@@ -260,13 +264,13 @@ mod tests {
   #[cfg(not(target_arch = "wasm32"))]
   use super::configuration_request_concurrent;
   use super::configuration_request_local;
+  use crate::handlers::test_support::FixtureFailure;
   #[cfg(not(target_arch = "wasm32"))]
   use crate::handlers::test_support::concurrent_world;
-  use crate::handlers::test_support::ensure_no_client_effects;
   use crate::handlers::test_support::local_world;
 
   /// Parse one rooted configuration fixture URL.
-  fn root(value: &str) -> Result<Url, TestFailure> {
+  fn root(value: &str) -> Result<Url, ResultFailure<url::ParseError>> {
     ensure_ok(Url::parse(value), "the configuration root fixture must parse")
   }
 
@@ -285,138 +289,142 @@ mod tests {
     }
   }
 
-  /// Require one detached request to contain only the global configuration item.
-  fn ensure_global_request(request: &ConfigurationRequest, context: &'static str) -> Result<(), TestFailure> {
-    ensure(
-      (
-        request.captured_roots.len(),
-        request.params.items.len(),
-        request
+  /// Native request and transition outcomes for one execution family.
+  #[derive(Debug)]
+  struct ConfigurationObservation {
+    /// Captured global configuration request.
+    request: Result<ConfigurationRequest, ConfigurationError>,
+    /// Pull response applied when the request was constructed.
+    pull:    Option<Result<super::ConfigurationEffects, ConfigurationError>>,
+    /// Push notification applied independently of request construction.
+    push:    Result<super::ConfigurationEffects, ConfigurationError>,
+  }
+
+  #[test]
+  fn configuration_responses_pair_every_scope_and_reject_incomplete_or_surplus_values() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let first = root("file:///workspace/first")?;
+      let second = root("file:///workspace/second")?;
+      let request = captured_request(vec![first.clone(), second.clone()]);
+      let complete = request.values(vec![json!({"global": true}), json!({"root": "first"}), json!({"root": "second"})]);
+      let missing_global = request.values(Vec::new());
+      let missing_scope = request.values(vec![json!({}), json!({})]);
+      let surplus = request.values(vec![json!({}), json!({}), json!({}), json!({})]);
+      Ok::<_, ResultFailure<url::ParseError>>((request, first, second, complete, missing_global, missing_scope, surplus))
+    })();
+    ensure_that(
+      observed,
+      "configuration responses must preserve captured root order and native missing or surplus value failures",
+      |result| {
+        let Ok(ref scenario) = *result else {
+          return false;
+        };
+        scenario.3.as_ref().is_ok_and(|values| {
+          *values
+            == (json!({"global": true}), vec![
+              (scenario.1.clone(), json!({"root": "first"})),
+              (scenario.2.clone(), json!({"root": "second"})),
+            ])
+        }) && matches!(scenario.4, Err(ConfigurationError::MissingGlobalValue))
+          && matches!(scenario.5, Err(ConfigurationError::MissingScopedValue { ref root }) if *root == scenario.2)
+          && matches!(
+            scenario.6,
+            Err(ConfigurationError::SurplusValues {
+              expected: 3, actual: 4
+            })
+          )
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
+  }
+
+  #[test]
+  fn global_configuration_request_and_application_match_across_execution_families() -> Result<(), impl Debug> {
+    let observed = block_on(async {
+      let configuration = json!({ "schema": { "enabled": false, "catalogs": [] } });
+      let local = local_world()?;
+      #[cfg(not(target_arch = "wasm32"))]
+      let concurrent = concurrent_world()?;
+      let local_request = configuration_request_local(&local).await;
+      let local_pull = match local_request.as_ref() {
+        Ok(request) => Some(apply_configuration_response_local(&local, request, vec![configuration.clone()]).await),
+        Err(_) => None,
+      };
+      let local_push = configuration_change_local(&local, DidChangeConfigurationParams {
+        settings: configuration.clone(),
+      })
+      .await;
+      let local_observation = ConfigurationObservation {
+        request: local_request,
+        pull:    local_pull,
+        push:    local_push,
+      };
+      #[cfg(not(target_arch = "wasm32"))]
+      let concurrent_observation = {
+        let request = configuration_request_concurrent(&concurrent).await;
+        let pull = match request.as_ref() {
+          Ok(captured) => Some(apply_configuration_response_concurrent(&concurrent, captured, vec![configuration.clone()]).await),
+          Err(_) => None,
+        };
+        let push = configuration_change_concurrent(&concurrent, DidChangeConfigurationParams {
+          settings: configuration
+        })
+        .await;
+        ConfigurationObservation {
+          request,
+          pull,
+          push,
+        }
+      };
+      Ok::<_, FixtureFailure>((
+        local,
+        #[cfg(not(target_arch = "wasm32"))]
+        concurrent,
+        [
+          local_observation,
+          #[cfg(not(target_arch = "wasm32"))]
+          concurrent_observation,
+        ],
+      ))
+    });
+    let global_application_matches = |family: &ConfigurationObservation| {
+      let Ok(ref request) = family.request else {
+        return false;
+      };
+      let Some(Ok(ref pull)) = family.pull else {
+        return false;
+      };
+      let Ok(ref push) = family.push else {
+        return false;
+      };
+      request.captured_roots.is_empty()
+        && request.params.items.len() == 1
+        && request
           .params
           .items
           .first()
-          .map(|item| (item.scope_uri.clone(), item.section.clone())),
-      ) == (0, 1, Some((None, Some(String::from("evenBetterToml"))))),
-      context,
+          .is_some_and(|item| item.scope_uri.is_none() && item.section.as_deref() == Some("evenBetterToml"))
+        && pull.associations.is_empty()
+        && pull.diagnostics.is_empty()
+        && push.associations.is_empty()
+        && push.diagnostics.is_empty()
+    };
+    ensure_that(
+      observed,
+      "both execution families must request one global section and apply pull and push configuration without client effects",
+      |result| {
+        let Ok(ref scenario) = *result else {
+          return false;
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let observations = &scenario.2;
+        #[cfg(target_arch = "wasm32")]
+        let observations = &scenario.1;
+        observations.iter().all(global_application_matches)
+      },
     )
-  }
-
-  #[test]
-  fn configuration_responses_pair_every_scope_and_reject_incomplete_or_surplus_values() -> Result<(), TestFailure> {
-    let first = root("file:///workspace/first")?;
-    let second = root("file:///workspace/second")?;
-    let request = captured_request(vec![first.clone(), second.clone()]);
-    let (global, scoped) = ensure_ok(
-      request.values(vec![json!({"global": true}), json!({"root": "first"}), json!({"root": "second"})]),
-      "a complete configuration response must pair every captured scope",
-    )?;
-    ensure(
-      (global, scoped)
-        == (json!({"global": true}), vec![
-          (first, json!({"root": "first"})),
-          (second.clone(), json!({"root": "second"})),
-        ]),
-      "configuration response pairing must preserve global value and captured root order",
-    )?;
-
-    ensure(
-      matches!(request.values(Vec::new()), Err(ConfigurationError::MissingGlobalValue)),
-      "an empty configuration response must retain the missing-global typed failure",
-    )?;
-    ensure(
-      matches!(
-        request.values(vec![json!({}), json!({})]),
-        Err(ConfigurationError::MissingScopedValue {
-          root
-        }) if root == second
-      ),
-      "a short configuration response must identify the omitted captured root",
-    )?;
-    ensure(
-      matches!(
-        request.values(vec![json!({}), json!({}), json!({}), json!({})]),
-        Err(ConfigurationError::SurplusValues {
-          expected: 3, actual: 4
-        })
-      ),
-      "a surplus configuration response must retain expected and actual cardinality",
-    )
-  }
-
-  #[test]
-  fn global_configuration_request_and_application_match_across_execution_families() -> Result<(), TestFailure> {
-    block_on(async {
-      let configuration = json!({
-        "schema": {
-          "enabled": false,
-          "catalogs": []
-        }
-      });
-      let local_world = local_world()?;
-      let local_request = ensure_ok(
-        configuration_request_local(&local_world).await,
-        "the local configuration request must construct",
-      )?;
-      ensure_global_request(
-        &local_request,
-        "a detached local world must request exactly one unscoped configuration section",
-      )?;
-      let local_pull = ensure_ok(
-        apply_configuration_response_local(&local_world, &local_request, vec![configuration.clone()]).await,
-        "a complete local pull response must apply",
-      )?;
-      ensure_no_client_effects(
-        &local_pull.associations,
-        &local_pull.diagnostics,
-        "configuration without open documents or associations must emit no local effects",
-      )?;
-      let local_push = ensure_ok(
-        configuration_change_local(&local_world, DidChangeConfigurationParams {
-          settings: configuration.clone(),
-        })
-        .await,
-        "a complete local push notification must apply",
-      )?;
-      ensure_no_client_effects(
-        &local_push.associations,
-        &local_push.diagnostics,
-        "configuration without open documents or associations must emit no pushed local effects",
-      )?;
-
-      #[cfg(not(target_arch = "wasm32"))]
-      {
-        let concurrent_world = concurrent_world()?;
-        let concurrent_request = ensure_ok(
-          configuration_request_concurrent(&concurrent_world).await,
-          "the concurrent configuration request must construct",
-        )?;
-        ensure_global_request(
-          &concurrent_request,
-          "a detached concurrent world must request exactly one unscoped configuration section",
-        )?;
-        let concurrent_pull = ensure_ok(
-          apply_configuration_response_concurrent(&concurrent_world, &concurrent_request, vec![configuration.clone()]).await,
-          "a complete concurrent pull response must apply",
-        )?;
-        ensure_no_client_effects(
-          &concurrent_pull.associations,
-          &concurrent_pull.diagnostics,
-          "configuration without open documents or associations must emit no concurrent effects",
-        )?;
-        let concurrent_push = ensure_ok(
-          configuration_change_concurrent(&concurrent_world, DidChangeConfigurationParams {
-            settings: configuration
-          })
-          .await,
-          "a complete concurrent push notification must apply",
-        )?;
-        ensure_no_client_effects(
-          &concurrent_push.associations,
-          &concurrent_push.diagnostics,
-          "configuration without open documents or associations must emit no pushed concurrent effects",
-        )?;
-      };
-      Ok(())
-    })
+    .map(drop)
+    .map_err(Box::new)
   }
 }

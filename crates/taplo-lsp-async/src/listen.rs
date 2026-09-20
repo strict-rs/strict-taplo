@@ -81,6 +81,7 @@ where
 }
 
 /// One successfully framed inbound transport event.
+#[derive(Debug)]
 enum InputEvent {
   /// A decoded JSON-RPC message ready for server classification.
   Message(rpc::Message),
@@ -620,6 +621,7 @@ mod tests {
   use futures::SinkExt as _;
   use futures::Stream;
   use futures::StreamExt as _;
+  use futures::channel::mpsc::TrySendError;
   use futures::channel::mpsc::unbounded;
   use futures::stream;
   use futures::task::noop_waker;
@@ -628,10 +630,8 @@ mod tests {
   use lsp_types::notification::Notification as _;
   #[cfg(feature = "tokio-stdio")]
   use lsp_types::request;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_ok;
-  use strict_test_support::ensure_some;
+  use strict_test_support::PredicateFailure;
+  use strict_test_support::ensure_that;
   #[cfg(feature = "tokio-stdio")]
   use tokio::io as test_io;
   use tokio::io::AsyncRead;
@@ -639,6 +639,9 @@ mod tests {
   use tokio::io::BufReader;
   use tokio::io::ReadBuf;
   use tokio::io::duplex;
+  use tokio::runtime::Handle;
+  #[cfg(feature = "tokio-stdio")]
+  use tokio::task::JoinError;
 
   use super::InputEvent;
   use super::MAXIMUM_MESSAGE_LENGTH;
@@ -741,58 +744,20 @@ mod tests {
     }
   }
 
-  #[cfg(feature = "tokio-stdio")]
-  /// Receive one complete JSON-RPC message from a framed client stream.
-  async fn receive_transport_message(
-    input: &mut BufReader<test_io::DuplexStream>,
-    context: &'static str,
-  ) -> Result<rpc::Message, TestFailure> {
-    let event = ensure_some(ensure_ok(read_message(input).await, context)?, context)?;
-    match event {
-      InputEvent::Message(message) => Ok(message),
-      InputEvent::ProtocolError(_) => ensure_some(None, "server output must contain valid JSON-RPC"),
-    }
-  }
-
-  #[cfg(feature = "tokio-stdio")]
-  /// Join one native transport driver without erasing either failure layer.
-  async fn join_transport(task: TransportTask, context: &'static str) -> Result<Result<(), ServerError>, TestFailure> {
-    ensure_ok(task.await, context)
-  }
-
-  /// Spawn one transport task that remains active until owned teardown.
+  /// Spawn a task whose cancellation is owned by fixture teardown.
   fn pending_transport_task() -> TransportTask {
     tokio::spawn(pending::<Result<(), ServerError>>())
   }
 
-  /// Build a transport with input ready concurrently with the supplied control stream.
-  #[allow(
-    clippy::single_call_fn,
-    reason = "the ready-input fixture centralizes the transport race state shared by the arbitration test"
-  )]
-  fn transport_with_ready_input<S>(shutdown_signals: S) -> Result<NativeTransport<S>, TestFailure>
-  where
-    S: Stream<Item = ()> + Unpin,
-  {
-    let runtime = ensure_ok(runtime_handle(), "the transport fixture requires the active runtime")?;
-    let (input_sender, input) = unbounded();
-    let input_message = rpc::Message {
-      jsonrpc: "2.0".into(),
-      method: Some("initialized".into()),
-      ..rpc::Message::default()
-    };
-    ensure(
-      input_sender.unbounded_send(InputEvent::Message(input_message)).is_ok(),
-      "the transport fixture must enqueue its ready input event",
-    )?;
-    let (output, _output_receiver) = unbounded();
-    Ok(NativeTransport::new(
-      runtime,
-      (input, pending_transport_task()),
-      (output, pending_transport_task()),
-      shutdown_signals,
-      ShutdownSignalState::Open,
-    ))
+  /// Native fixture setup failures retaining runtime or channel sources.
+  #[derive(Debug, thiserror::Error)]
+  enum TransportFixtureFailure {
+    /// Active runtime discovery failed.
+    #[error(transparent)]
+    Runtime(#[from] ServerError),
+    /// The fixture input channel rejected its complete native event.
+    #[error(transparent)]
+    Enqueue(#[from] Box<TrySendError<InputEvent>>),
   }
 
   /// Reader that exposes one exact underlying I/O failure.
@@ -812,218 +777,161 @@ mod tests {
     }
   }
 
-  /// Abort and join every pending fixture task under owned-teardown semantics.
-  #[allow(
-    clippy::single_call_fn,
-    reason = "the fixture teardown helper verifies cancellation ownership for both pending transport tasks"
-  )]
-  async fn abort_transport<S>(transport: &mut NativeTransport<S>) -> Result<(), TestFailure> {
-    transport.input_task.abort();
-    transport.output_task.abort();
-    ensure(
-      joined_task_result("input", (&mut transport.input_task).await, true).is_ok(),
-      "owned teardown must accept its input-task cancellation",
-    )?;
-    ensure(
-      joined_task_result("output", (&mut transport.output_task).await, true).is_ok(),
-      "owned teardown must accept its output-task cancellation",
-    )
+  /// Native arbitration result, residual control state, and both teardown completions.
+  #[derive(Debug)]
+  struct ArbitrationObservations {
+    /// Original input decision including native framing or task failures.
+    input:    Result<Option<InputEvent>, ServerError>,
+    /// Control stream state after the decision.
+    shutdown: ShutdownSignalState,
+    /// Both deliberately cancelled task completions.
+    cleanup:  [Result<(), ServerError>; 2],
   }
 
-  /// Observe one arbitration decision and clean up every pending fixture task.
-  async fn arbitrate_ready_input<S>(
-    shutdown_signals: S,
-    context: &'static str,
-  ) -> Result<(Option<InputEvent>, ShutdownSignalState), TestFailure>
+  /// Observe one arbitration decision and finish both owned task cancellations.
+  async fn arbitrate_ready_input<S>(shutdown_signals: S) -> Result<ArbitrationObservations, TransportFixtureFailure>
   where
     S: Stream<Item = ()> + Unpin,
   {
-    let mut transport = transport_with_ready_input(shutdown_signals)?;
-    let input = ensure_ok(transport.next_input().await, context)?;
-    let shutdown_state = transport.shutdown_state;
-    abort_transport(&mut transport).await?;
-    Ok((input, shutdown_state))
+    let runtime = runtime_handle()?;
+    let (sender, queued_input) = unbounded();
+    sender
+      .unbounded_send(InputEvent::Message(rpc::Message {
+        jsonrpc: "2.0".into(),
+        method: Some("initialized".into()),
+        ..rpc::Message::default()
+      }))
+      .map_err(Box::new)?;
+    let (output, _receiver) = unbounded();
+    let mut transport = NativeTransport::new(
+      runtime,
+      (queued_input, pending_transport_task()),
+      (output, pending_transport_task()),
+      shutdown_signals,
+      ShutdownSignalState::Open,
+    );
+    let input = transport.next_input().await;
+    let shutdown = transport.shutdown_state;
+    transport.input_task.abort();
+    transport.output_task.abort();
+    let cleanup = [
+      joined_task_result("input", (&mut transport.input_task).await, true),
+      joined_task_result("output", (&mut transport.output_task).await, true),
+    ];
+    Ok(ArbitrationObservations {
+      input,
+      shutdown,
+      cleanup,
+    })
   }
 
+  /// Native request and notification subjects for terminal-input classification.
+  type ExitMessages = [rpc::Message; 2];
+
+  /// Complete arbitration setup or execution result.
+  type ArbitrationOutcome = Result<ArbitrationObservations, TransportFixtureFailure>;
+
+  /// Complete handler-initialization and failed notification effects.
+  #[cfg(feature = "tokio-stdio")]
+  type FailedHandler = (Result<(), ServerError>, FramingOutcome, Result<(), ServerError>, JoinedTransport);
+
+  /// Native server task outcomes across completion and cancellation categories.
+  type HandlerOutcomes = [Result<(), ServerError>; 4];
+
+  /// Native transport lifecycle outcomes across all termination or cleanup cases.
+  type LifecycleOutcomes = [Result<(), ServerError>; 3];
+
   #[test]
-  fn only_the_exit_notification_terminates_protocol_input() -> Result<(), TestFailure> {
-    let exit_notification = rpc::Message {
+  fn only_the_exit_notification_terminates_protocol_input() -> Result<(), Box<PredicateFailure<ExitMessages>>> {
+    let notification = rpc::Message {
       jsonrpc: "2.0".into(),
       method: Some(notification::Exit::METHOD.into()),
       ..rpc::Message::default()
     };
-    ensure(
-      is_exit_notification(&exit_notification),
-      "an exact exit notification must terminate protocol input after lifecycle handling",
-    )?;
-
-    let exit_request = rpc::Message {
+    let request = rpc::Message {
       id: rpc::MessageId::Value(NumberOrString::Number(1)),
-      ..exit_notification
+      ..notification.clone()
     };
-    ensure(
-      !is_exit_notification(&exit_request),
-      "an exit request with an identifier must remain ordinary invalid protocol input",
+    ensure_that(
+      [notification, request],
+      "only the exact exit notification may terminate protocol input",
+      |messages| {
+        let [ref observed_notification, ref observed_request] = *messages;
+        is_exit_notification(observed_notification) && !is_exit_notification(observed_request)
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
-  /// Decode one complete in-memory transport fixture.
+  /// Decode an entire in-memory transport fixture without erasing either native layer.
   async fn decode(input: &[u8]) -> Result<Option<InputEvent>, ServerError> {
     read_message(&mut BufReader::new(input)).await
   }
 
-  /// Require one in-memory transport fixture to fail framing.
-  async fn decode_error(input: &[u8], context: &'static str) -> Result<ServerError, TestFailure> {
-    ensure_some(decode(input).await.err(), context)
-  }
+  /// Native framing completion including clean EOF and directional protocol events.
+  type FramingOutcome = Result<Option<InputEvent>, ServerError>;
 
   #[tokio::test]
-  async fn framing_accepts_one_content_length_and_decodes_the_message() -> Result<(), TestFailure> {
+  async fn framing_accepts_one_content_length_and_decodes_the_message() -> Result<(), Box<PredicateFailure<FramingOutcome>>> {
     let body = br#"{"jsonrpc":"2.0","method":"initialized"}"#;
     let mut frame = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
     frame.extend_from_slice(body);
-    let event = ensure_some(
-      decode(&frame).await.ok().flatten(),
-      "a complete framed message must produce one input event",
-    )?;
-    match event {
-      InputEvent::Message(message) => ensure(
-        message.method.as_deref() == Some("initialized"),
-        "the decoded message must preserve its method",
-      ),
-      InputEvent::ProtocolError(_) => ensure(false, "a valid JSON-RPC notification must not become a protocol-error response"),
-    }
+    ensure_that(
+      decode(&frame).await,
+      "one complete frame must retain its decoded notification",
+      |outcome| matches!(*outcome, Ok(Some(InputEvent::Message(ref message))) if message.method.as_deref() == Some("initialized")),
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[tokio::test]
-  async fn invalid_json_becomes_a_null_id_protocol_error_response() -> Result<(), TestFailure> {
-    let event = ensure_some(
-      decode(b"Content-Length: 1\r\n\r\n{").await.ok().flatten(),
-      "invalid framed JSON must produce one protocol event",
-    )?;
-    match event {
-      InputEvent::ProtocolError(response) => {
-        let error = ensure_some(response.error.as_ref(), "the protocol-error response must carry its JSON-RPC error")?;
-        ensure(
-          (&response.id, error.code) == (&rpc::MessageId::Null, -32700),
-          "invalid JSON must produce the standard parse response with a JSON null ID",
-        )
-      }
-      InputEvent::Message(_) => ensure(false, "invalid JSON must not be classified as a successful protocol message"),
-    }
+  async fn invalid_json_becomes_a_null_id_protocol_error_response() -> Result<(), Box<PredicateFailure<FramingOutcome>>> {
+    ensure_that(decode(b"Content-Length: 1\r\n\r\n{").await, "invalid framed JSON must retain a null-ID parse response", |outcome| matches!(*outcome, Ok(Some(InputEvent::ProtocolError(ref message))) if message.id == rpc::MessageId::Null && message.error.as_ref().is_some_and(|error| error.code == -32700))).map(drop).map_err(Box::new)
   }
 
+  /// Complete rejected frame results and the checked oversized fixture length.
+  type InvalidFrames = ([FramingOutcome; 5], Option<usize>, Option<FramingOutcome>);
+
   #[tokio::test]
-  async fn framing_rejects_invalid_content_length_declarations() -> Result<(), TestFailure> {
-    let error = decode_error(
-      b"Content-Length: 2\r\nContent-Length: 3\r\n\r\n{}",
-      "a repeated Content-Length header must fail",
-    )
-    .await?;
-    ensure(
-      matches!(error, ServerError::DuplicateContentLength {
-        first: 2, second: 3
-      }),
-      "the duplicate header error must retain both declarations",
-    )?;
-    let missing = decode_error(
-      b"Content-Type: application/vscode-jsonrpc\r\n\r\n",
-      "a missing Content-Length header must fail",
-    )
-    .await?;
-    ensure(
-      matches!(missing, ServerError::MissingContentLength),
-      "the missing header must retain its typed boundary",
-    )?;
-
-    let malformed = decode_error(b"Content-Length: invalid\r\n\r\n", "a malformed Content-Length header must fail").await?;
-    ensure(
-      matches!(malformed, ServerError::InvalidContentLength { .. }),
-      "the malformed numeric value must retain its typed boundary",
-    )?;
-    let malformed_header = decode_error(
-      b"Content-Length:2\r\n\r\n{}",
-      "a header without the required field separator must fail",
-    )
-    .await?;
-    ensure(
-      matches!(
-        malformed_header,
-        ServerError::MalformedHeader {
-          header
-        } if header == "Content-Length:2"
-      ),
-      "a malformed header field must retain its exact source line",
-    )?;
-    let line_ending = decode_error(
-      b"Content-Length: 2\n\n{}",
-      "a header without the required CRLF line ending must fail",
-    )
-    .await?;
-    ensure(
-      matches!(
-        line_ending,
-        ServerError::MalformedHeader {
-          header
-        } if header == "Content-Length: 2"
-      ),
-      "a malformed header line ending must retain the exact offending line",
-    )?;
-
-    let oversized_length = ensure_some(
-      MAXIMUM_MESSAGE_LENGTH.checked_add(1),
-      "the framing limit must admit a larger test value",
-    )?;
-    let oversized_frame = format!("Content-Length: {oversized_length}\r\n\r\n");
-    let oversized = decode_error(oversized_frame.as_bytes(), "an oversized message must fail before allocation").await?;
-    ensure(
-      matches!(
-        oversized,
-        ServerError::MessageTooLarge {
-          length,
-          maximum: MAXIMUM_MESSAGE_LENGTH
-        } if length == oversized_length
-      ),
-      "the oversized message error must retain the declared length and transport limit",
-    )
+  async fn framing_rejects_invalid_content_length_declarations() -> Result<(), Box<PredicateFailure<InvalidFrames>>> {
+    let outcomes = [
+      decode(b"Content-Length: 2\r\nContent-Length: 3\r\n\r\n{}").await,
+      decode(b"Content-Type: application/vscode-jsonrpc\r\n\r\n").await,
+      decode(b"Content-Length: invalid\r\n\r\n").await,
+      decode(b"Content-Length:2\r\n\r\n{}").await,
+      decode(b"Content-Length: 2\n\n{}").await,
+    ];
+    let length = MAXIMUM_MESSAGE_LENGTH.checked_add(1);
+    let oversized = match length {
+      Some(oversized_length) => Some(decode(format!("Content-Length: {oversized_length}\r\n\r\n").as_bytes()).await),
+      None => None,
+    };
+    ensure_that((outcomes, length, oversized), "invalid framing must retain duplicate, missing, malformed, and oversized declarations", |observed| {
+      matches!(observed.0, [Err(ServerError::DuplicateContentLength { first: 2, second: 3 }), Err(ServerError::MissingContentLength), Err(ServerError::InvalidContentLength { .. }), Err(ServerError::MalformedHeader { ref header }), Err(ServerError::MalformedHeader { header: ref line })] if header == "Content-Length:2" && line == "Content-Length: 2")
+        && matches!(observed.2, Some(Err(ServerError::MessageTooLarge { length: declared_length, maximum: MAXIMUM_MESSAGE_LENGTH })) if Some(declared_length) == observed.1)
+    }).map(drop).map_err(Box::new)
   }
 
+  /// Native clean, incomplete, truncated, and failed-reader outcomes.
+  type EndedFrames = [FramingOutcome; 4];
+
   #[tokio::test]
-  async fn framing_distinguishes_clean_eof_from_an_incomplete_header() -> Result<(), TestFailure> {
-    ensure(
-      decode(b"").await.ok().flatten().is_none(),
-      "EOF before a header begins must close the input stream cleanly",
-    )?;
-    let incomplete = ensure_some(
-      decode(b"Content-Length: 2\r\n").await.err(),
-      "EOF after a header begins must fail the incomplete frame",
-    )?;
-    ensure(
-      matches!(incomplete, ServerError::IncompleteHeader),
-      "an incomplete header block must retain its typed transport boundary",
-    )?;
-
-    let truncated = decode_error(b"Content-Length: 3\r\n\r\n{}", "EOF within a declared message body must fail").await?;
-    ensure(
-      matches!(truncated, ServerError::Io(source) if source.kind() == ErrorKind::UnexpectedEof),
-      "a truncated message body must retain the underlying unexpected-EOF category",
-    )?;
-
+  async fn framing_distinguishes_clean_eof_from_an_incomplete_header() -> Result<(), Box<PredicateFailure<EndedFrames>>> {
     let mut failing = BufReader::new(FailingReader {
       failed: false
     });
-    let read_failure = ensure_some(
-      read_message(&mut failing).await.err(),
-      "an underlying reader failure must reach the framing boundary",
-    )?;
-    ensure(
-      matches!(read_failure, ServerError::Io(source) if source.kind() == ErrorKind::ConnectionReset),
-      "an underlying reader failure must retain its exact I/O category",
-    )
+    ensure_that([decode(b"").await, decode(b"Content-Length: 2\r\n").await, decode(b"Content-Length: 3\r\n\r\n{}").await, read_message(&mut failing).await], "framing must distinguish clean EOF, incomplete headers, truncated bodies, and reader failures", |observed| {
+      matches!(*observed, [Ok(None), Err(ServerError::IncompleteHeader), Err(ServerError::Io(ref truncated)), Err(ServerError::Io(ref source))] if truncated.kind() == ErrorKind::UnexpectedEof && source.kind() == ErrorKind::ConnectionReset)
+    }).map(drop).map_err(Box::new)
   }
 
+  /// Both channel send results and the complete delivered and expected message.
+  type ChannelObservations = ([Result<(), MessageWriterError>; 2], Option<rpc::Message>, rpc::Message);
+
   #[tokio::test]
-  async fn output_channel_preserves_messages_and_reports_broken_pipes() -> Result<(), TestFailure> {
+  async fn output_channel_preserves_messages_and_reports_broken_pipes() -> Result<(), Box<PredicateFailure<ChannelObservations>>> {
     let (sender, mut receiver) = unbounded();
     let mut sink = message_sink(sender);
     let expected = rpc::Message {
@@ -1031,516 +939,485 @@ mod tests {
       method: Some("initialized".into()),
       ..rpc::Message::default()
     };
-    ensure_ok(
-      sink.send(expected.clone()).await,
-      "an open output channel must accept a complete JSON-RPC message",
-    )?;
-    let delivered = ensure_some(
-      receiver.next().await,
-      "the output receiver must observe the delivered JSON-RPC message",
-    )?;
-    ensure(
-      delivered == expected,
-      "the output channel must preserve the complete JSON-RPC message",
-    )?;
-
+    let sent = sink.send(expected.clone()).await;
+    let delivered = receiver.next().await;
     drop(receiver);
-    let error = ensure_some(
-      sink.send(expected).await.err(),
-      "a closed output channel must reject message delivery",
-    )?;
-    ensure(
-      error.kind() == ErrorKind::BrokenPipe,
-      "a closed output channel must use the broken-pipe I/O category",
-    )?;
-    ensure(
-      matches!(
-        error,
-        MessageWriterError::OutputChannelClosed {
-          source
-        } if source.is_disconnected()
-      ),
-      "the broken-pipe error must retain the futures disconnection source",
+    let rejected = sink.send(expected.clone()).await;
+    ensure_that(
+      ([sent, rejected], delivered, expected),
+      "the output channel must preserve complete messages and its native disconnection failure",
+      |observed| {
+        let ([ref accepted, ref rejection], ref captured, ref original) = *observed;
+        accepted.is_ok()
+          && captured.as_ref() == Some(original)
+          && matches!(*rejection, Err(ref error)
+            if error.kind() == ErrorKind::BrokenPipe
+              && matches!(*error, MessageWriterError::OutputChannelClosed { ref source } if source.is_disconnected()))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
+  /// Native framed write and read outcomes with all emitted bytes.
+  type WrittenFrame = (Result<(), ServerError>, io::Result<usize>, Vec<u8>);
+
   #[tokio::test]
-  async fn output_framing_serializes_one_complete_message() -> Result<(), TestFailure> {
+  async fn output_framing_serializes_one_complete_message() -> Result<(), Box<PredicateFailure<WrittenFrame>>> {
     let expected = rpc::Message {
       jsonrpc: "2.0".into(),
       method: Some("initialized".into()),
       ..rpc::Message::default()
     };
     let (mut reader, mut writer) = duplex(4_096);
-    ensure_ok(
-      write_message(&mut writer, expected).await,
-      "a writable transport must accept one JSON-RPC message",
-    )?;
+    let written = write_message(&mut writer, expected).await;
     drop(writer);
     let mut framed = Vec::new();
-    let bytes_read = ensure_ok(
-      reader.read_to_end(&mut framed).await,
-      "the transport fixture must expose every framed byte",
-    )?;
-    ensure(
-      (bytes_read, framed.as_slice())
-        == (
-          framed.len(),
-          b"Content-Length: 40\r\n\r\n{\"jsonrpc\":\"2.0\",\"method\":\"initialized\"}",
-        ),
-      "output framing must emit an exact content-length header and JSON body",
+    let read = reader.read_to_end(&mut framed).await;
+    ensure_that(
+      (written, read, framed),
+      "output framing must emit its exact content length and complete JSON body",
+      |observed| {
+        observed.0.is_ok()
+          && observed.1.as_ref().is_ok_and(|count| *count == observed.2.len())
+          && observed.2 == b"Content-Length: 40\r\n\r\n{\"jsonrpc\":\"2.0\",\"method\":\"initialized\"}"
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
+
+  /// Native task join layers kept separate from server completion.
+  #[cfg(feature = "tokio-stdio")]
+  type JoinedTransport = Result<Result<(), ServerError>, JoinError>;
+
+  #[cfg(feature = "tokio-stdio")]
+  /// Input producer setup, framed delivery, and joined completion.
+  type ClosedConsumer = Result<(Result<(), ServerError>, JoinedTransport), ServerError>;
 
   #[cfg(feature = "tokio-stdio")]
   #[tokio::test]
-  async fn input_producer_stops_cleanly_after_its_consumer_closes() -> Result<(), TestFailure> {
-    let runtime = ensure_ok(runtime_handle(), "the input-producer fixture requires the active runtime")?;
-    let (server_input, mut client_output) = duplex(4_096);
-    let (input, task) = create_input(&runtime, server_input);
-    drop(input);
-
-    ensure_ok(
-      write_message(&mut client_output, transport_notification("initialized")).await,
-      "the closed-consumer fixture must deliver one complete framed message",
-    )?;
-    drop(client_output);
-    ensure_ok(
-      join_transport(task, "the closed-consumer input producer must join").await?,
-      "the input producer must treat loss of its consumer as owned transport shutdown",
+  async fn input_producer_stops_cleanly_after_its_consumer_closes() -> Result<(), Box<PredicateFailure<ClosedConsumer>>> {
+    let observed = match runtime_handle() {
+      Ok(runtime) => {
+        let (server_input, mut client_output) = duplex(4_096);
+        let (input, task) = create_input(&runtime, server_input);
+        drop(input);
+        let written = write_message(&mut client_output, transport_notification("initialized")).await;
+        drop(client_output);
+        Ok((written, task.await))
+      }
+      Err(error) => Err(error),
+    };
+    ensure_that(
+      observed,
+      "input production must treat consumer closure as owned transport shutdown",
+      |outcome| matches!(*outcome, Ok((Ok(()), Ok(Ok(()))))),
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn runtime_discovery_reports_missing_context_without_string_erasure() -> Result<(), TestFailure> {
-    let error = ensure_some(runtime_handle().err(), "runtime discovery outside Tokio must fail")?;
-    ensure(
-      matches!(
-        error,
-        ServerError::RuntimeUnavailable {
-          source
-        } if source.is_missing_context()
-      ),
+  fn runtime_discovery_reports_missing_context_without_string_erasure() -> Result<(), PredicateFailure<Result<Handle, ServerError>>> {
+    ensure_that(
+      runtime_handle(),
       "runtime discovery must retain Tokio's missing-context category",
+      |outcome| matches!(*outcome, Err(ServerError::RuntimeUnavailable { ref source }) if source.is_missing_context()),
     )
+    .map(drop)
   }
 
   #[tokio::test]
-  async fn runtime_discovery_returns_the_active_handle() -> Result<(), TestFailure> {
-    ensure(
-      runtime_handle().is_ok(),
-      "runtime discovery inside Tokio must return the active handle",
+  async fn runtime_discovery_returns_the_active_handle() -> Result<(), PredicateFailure<Result<Handle, ServerError>>> {
+    ensure_that(
+      runtime_handle(),
+      "runtime discovery inside Tokio must return its native handle",
+      Result::is_ok,
     )
+    .map(drop)
   }
 
   #[cfg(feature = "tokio-stdio")]
+  /// One lifecycle request, its frame write, and complete native response event.
+  #[derive(Debug)]
+  struct LifecycleExchange {
+    /// Expected response identifier retained with the operation.
+    id:       i32,
+    /// Framed client request delivery.
+    write:    Result<(), ServerError>,
+    /// Complete framed response.
+    response: FramingOutcome,
+  }
+
+  #[cfg(feature = "tokio-stdio")]
+  /// Complete lifecycle exchanges and terminal transport shutdown.
+  type TransportLifecycle = (Vec<LifecycleExchange>, Result<(), ServerError>, JoinedTransport);
+
+  #[cfg(feature = "tokio-stdio")]
   #[tokio::test]
-  async fn stdio_transport_runs_the_complete_protocol_lifecycle() -> Result<(), TestFailure> {
+  async fn stdio_transport_runs_the_complete_protocol_lifecycle() -> Result<(), Box<PredicateFailure<TransportLifecycle>>> {
     let (server_input, mut client_input) = duplex(4_096);
     let (client_output_stream, server_output) = duplex(4_096);
     let server = ConcurrentServer::new().on_request::<TransportInitialize, _>(initialize_transport);
     let transport = tokio::spawn(server.listen_stdio((), server_input, server_output, stream::empty()));
     let mut client_output = BufReader::new(client_output_stream);
-
-    for (method, request_id) in [
+    let mut exchanges = Vec::new();
+    for (method, id) in [
       (<TransportInitialize as request::Request>::METHOD, 1),
       (<request::Shutdown as request::Request>::METHOD, 2),
     ] {
-      ensure_ok(
-        write_message(&mut client_input, transport_request(method, request_id)).await,
-        "the client must frame each lifecycle request",
-      )?;
-      let response = receive_transport_message(&mut client_output, "the transport must return each lifecycle response").await?;
-      ensure(
-        (response.id, response.result, response.error)
-          == (
-            rpc::MessageId::Value(NumberOrString::Number(request_id)),
-            Some(serde_json::Value::Null),
-            None,
-          ),
-        "the native transport must preserve each successful lifecycle response",
-      )?;
+      let write = write_message(&mut client_input, transport_request(method, id)).await;
+      let response = read_message(&mut client_output).await;
+      exchanges.push(LifecycleExchange {
+        id,
+        write,
+        response,
+      });
     }
-
-    ensure_ok(
-      write_message(&mut client_input, transport_notification(notification::Exit::METHOD)).await,
-      "the client must frame its terminal exit notification",
-    )?;
-    ensure_ok(
-      join_transport(transport, "the native protocol transport task must join").await?,
-      "initialize, shutdown, and exit must complete the native protocol transport",
-    )
+    let exit = write_message(&mut client_input, transport_notification(notification::Exit::METHOD)).await;
+    let joined = transport.await;
+    ensure_that((exchanges, exit, joined), "native transport must preserve each lifecycle response and complete initialization, shutdown, and exit", |observed| observed.0.len() == 2 && observed.0.iter().all(|exchange| exchange.write.is_ok() && matches!(exchange.response, Ok(Some(InputEvent::Message(ref message))) if message.id == rpc::MessageId::Value(NumberOrString::Number(exchange.id)) && message.result == Some(serde_json::Value::Null) && message.error.is_none())) && observed.1.is_ok() && matches!(observed.2, Ok(Ok(())))).map(drop).map_err(Box::new)
   }
 
   #[cfg(feature = "tokio-stdio")]
+  /// Raw malformed-frame write, relayed response, external-stop send, and task completion.
+  type RelayedError = (io::Result<()>, FramingOutcome, Result<(), TrySendError<()>>, JoinedTransport);
+
+  #[cfg(feature = "tokio-stdio")]
   #[tokio::test]
-  async fn stdio_transport_relays_protocol_errors_before_external_stop() -> Result<(), TestFailure> {
+  async fn stdio_transport_relays_protocol_errors_before_external_stop() -> Result<(), Box<PredicateFailure<RelayedError>>> {
     let (server_input, mut client_input) = duplex(4_096);
     let (client_output_stream, server_output) = duplex(4_096);
     let (shutdown_sender, shutdown_signals) = unbounded();
     let transport = tokio::spawn(ConcurrentServer::new().listen_stdio((), server_input, server_output, shutdown_signals));
     let mut client_output = BufReader::new(client_output_stream);
+    let written = stdio_fixture::write_frame(&mut client_input, b"Content-Length: 1\r\n\r\n{").await;
+    let response = read_message(&mut client_output).await;
+    let stopped = shutdown_sender.unbounded_send(());
+    let joined = transport.await;
+    ensure_that((written, response, stopped, joined), "parse responses must relay before graceful external shutdown", |observed| observed.0.is_ok() && matches!(observed.1, Ok(Some(InputEvent::Message(ref message))) if message.id == rpc::MessageId::Null && message.error.as_ref().is_some_and(|error| error.code == -32700)) && observed.2.is_ok() && matches!(observed.3, Ok(Ok(())))).map(drop).map_err(Box::new)
+  }
 
-    ensure_ok(
-      stdio_fixture::write_frame(&mut client_input, b"Content-Length: 1\r\n\r\n{").await,
-      "the malformed client frame must reach the native reader",
-    )?;
-    let response = receive_transport_message(&mut client_output, "the transport must relay a parse-error response").await?;
-    let error = ensure_some(
-      response.error.as_ref(),
-      "the relayed parse-error response must carry a typed RPC error",
-    )?;
-    ensure(
-      (&response.id, error.code) == (&rpc::MessageId::Null, -32700),
-      "the native transport must relay the standard null-ID JSON parse error",
-    )?;
-
-    ensure(
-      shutdown_sender.unbounded_send(()).is_ok(),
-      "the external-stop fixture must remain connected",
-    )?;
-    ensure_ok(
-      join_transport(transport, "the externally stopped protocol transport must join").await?,
-      "external stop after a relayed protocol error must remain graceful",
-    )
+  #[cfg(feature = "tokio-stdio")]
+  /// Reader, writer, and independently executing handler failure evidence.
+  #[derive(Debug)]
+  struct TransportFailures {
+    /// Malformed-header delivery and transport completion.
+    reader:  (io::Result<()>, JoinedTransport),
+    /// Request delivery and closed response-stream failure.
+    writer:  (Result<(), ServerError>, JoinedTransport),
+    /// Initialization, its response, rejected notification, and transport completion.
+    handler: FailedHandler,
   }
 
   #[cfg(feature = "tokio-stdio")]
   #[tokio::test]
-  async fn stdio_transport_preserves_reader_writer_and_handler_failures() -> Result<(), TestFailure> {
-    let (malformed_server_input, mut malformed_client_input) = duplex(4_096);
-    let (_malformed_client_output, malformed_server_output) = duplex(4_096);
-    let malformed_transport =
-      tokio::spawn(ConcurrentServer::new().listen_stdio((), malformed_server_input, malformed_server_output, stream::pending()));
-    ensure_ok(
-      stdio_fixture::write_frame(&mut malformed_client_input, b"Content-Type: application/vscode-jsonrpc\r\n\r\n").await,
-      "the malformed transport header must reach the native reader",
-    )?;
-    let malformed_result = join_transport(malformed_transport, "the malformed-header transport task must join").await?;
-    ensure(
-      matches!(malformed_result, Err(ServerError::MissingContentLength)),
-      "the stdio listener must preserve the reader's typed framing failure",
-    )?;
+  async fn stdio_transport_preserves_reader_writer_and_handler_failures() -> Result<(), Box<PredicateFailure<TransportFailures>>> {
+    let (reader_input, mut reader_client) = duplex(4_096);
+    let (_reader_output, reader_sink) = duplex(4_096);
+    let reader_task = tokio::spawn(ConcurrentServer::new().listen_stdio((), reader_input, reader_sink, stream::pending()));
+    let reader_write = stdio_fixture::write_frame(&mut reader_client, b"Content-Type: application/vscode-jsonrpc\r\n\r\n").await;
+    let reader = (reader_write, reader_task.await);
 
-    let (writer_server_input, mut writer_client_input) = duplex(4_096);
-    let (discarded_client_output, writer_server_output) = duplex(4_096);
-    drop(discarded_client_output);
-    let writer_transport = tokio::spawn(
+    let (writer_input, mut writer_client) = duplex(4_096);
+    let (discarded, writer_sink) = duplex(4_096);
+    drop(discarded);
+    let writer_task = tokio::spawn(
       ConcurrentServer::new()
         .on_request::<TransportInitialize, _>(initialize_transport)
-        .listen_stdio((), writer_server_input, writer_server_output, stream::pending()),
+        .listen_stdio((), writer_input, writer_sink, stream::pending()),
     );
-    ensure_ok(
-      write_message(
-        &mut writer_client_input,
-        transport_request(<TransportInitialize as request::Request>::METHOD, 3),
-      )
-      .await,
-      "the client must deliver a request whose response stream is closed",
-    )?;
-    let writer_result = join_transport(writer_transport, "the failed-writer transport task must join").await?;
-    ensure(
-      matches!(
-        writer_result,
-        Err(ServerError::Io(source)) if source.kind() == ErrorKind::BrokenPipe
-      ),
-      "the stdio listener must preserve the writer's broken-pipe category",
-    )?;
+    let writer_write = write_message(
+      &mut writer_client,
+      transport_request(<TransportInitialize as request::Request>::METHOD, 3),
+    )
+    .await;
+    let writer = (writer_write, writer_task.await);
 
-    let (handler_server_input, mut handler_client_input) = duplex(4_096);
-    let (handler_client_output, handler_server_output) = duplex(4_096);
+    let (handler_input, mut handler_client) = duplex(4_096);
+    let (handler_output, handler_sink) = duplex(4_096);
     let server = ConcurrentServer::new()
       .on_request::<TransportInitialize, _>(initialize_transport)
       .on_notification::<RejectTransportWork, _>(reject_transport_work);
-    let handler_transport = tokio::spawn(server.listen_stdio((), handler_server_input, handler_server_output, stream::pending()));
-    let mut handler_output = BufReader::new(handler_client_output);
-    ensure_ok(
-      write_message(
-        &mut handler_client_input,
-        transport_request(<TransportInitialize as request::Request>::METHOD, 4),
-      )
-      .await,
-      "the handler-failure fixture must initialize its protocol session",
-    )?;
-    drop(
-      receive_transport_message(
-        &mut handler_output,
-        "the handler-failure fixture must receive its initialize response",
-      )
-      .await?,
-    );
-    ensure_ok(
-      write_message(&mut handler_client_input, transport_notification(RejectTransportWork::METHOD)).await,
-      "the client must deliver the rejected independent notification",
-    )?;
-    let handler_result = join_transport(handler_transport, "the failed-handler transport task must join").await?;
-    ensure(
-      matches!(handler_result, Err(ServerError::ExitBeforeShutdown)),
-      "the stdio listener must preserve the handler's typed server failure",
+    let handler_task = tokio::spawn(server.listen_stdio((), handler_input, handler_sink, stream::pending()));
+    let mut output = BufReader::new(handler_output);
+    let initialized = write_message(
+      &mut handler_client,
+      transport_request(<TransportInitialize as request::Request>::METHOD, 4),
     )
+    .await;
+    let response = read_message(&mut output).await;
+    let notification = write_message(&mut handler_client, transport_notification(RejectTransportWork::METHOD)).await;
+    let handler = (initialized, response, notification, handler_task.await);
+    ensure_that(
+      TransportFailures {
+        reader,
+        writer,
+        handler,
+      },
+      "native transport must preserve distinct framing, writer I/O, and handler failures",
+      |observed| {
+        matches!(observed.reader, (Ok(()), Ok(Err(ServerError::MissingContentLength))))
+          && matches!(observed.writer, (Ok(()), Ok(Err(ServerError::Io(ref source)))) if source.kind() == ErrorKind::BrokenPipe)
+          && matches!(
+            observed.handler,
+            (
+              Ok(()),
+              Ok(Some(InputEvent::Message(_))),
+              Ok(()),
+              Ok(Err(ServerError::ExitBeforeShutdown))
+            )
+          )
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[cfg(feature = "tokio-stdio")]
-  #[tokio::test]
-  async fn stdio_transport_distinguishes_external_stop_from_early_exit() -> Result<(), TestFailure> {
-    ensure_ok(
-      ConcurrentServer::new()
-        .listen_stdio((), test_io::empty(), test_io::sink(), stream::iter([()]))
-        .await,
-      "an external process stop must end an idle stdio transport gracefully",
-    )?;
+  /// Idle external stop and terminal early-exit outcomes with complete output bytes.
+  type EarlyExit = (
+    Result<(), ServerError>,
+    Result<(), ServerError>,
+    JoinedTransport,
+    io::Result<usize>,
+    Vec<u8>,
+  );
 
+  #[cfg(feature = "tokio-stdio")]
+  #[tokio::test]
+  async fn stdio_transport_distinguishes_external_stop_from_early_exit() -> Result<(), Box<PredicateFailure<EarlyExit>>> {
+    let stopped = ConcurrentServer::new()
+      .listen_stdio((), test_io::empty(), test_io::sink(), stream::iter([()]))
+      .await;
     let (server_input, mut client_input) = duplex(4_096);
     let (mut client_output, server_output) = duplex(4_096);
     let transport = tokio::spawn(ConcurrentServer::new().listen_stdio((), server_input, server_output, stream::pending()));
-    ensure_ok(
-      write_message(&mut client_input, transport_notification(notification::Exit::METHOD)).await,
-      "the client must deliver its premature exit notification",
-    )?;
-    let result = join_transport(transport, "the premature-exit transport task must join").await?;
-    ensure(
-      matches!(result, Err(ServerError::ExitBeforeShutdown)),
-      "protocol exit without shutdown must remain a typed lifecycle failure",
-    )?;
+    let written = write_message(&mut client_input, transport_notification(notification::Exit::METHOD)).await;
+    let joined = transport.await;
     let mut output = Vec::new();
-    let output_length = ensure_ok(
-      client_output.read_to_end(&mut output).await,
-      "the closed premature-exit transport must expose its complete output",
-    )?;
-    ensure(
-      (output_length, output.is_empty()) == (0, true),
-      "a terminal notification must not fabricate a JSON-RPC response",
+    let read = client_output.read_to_end(&mut output).await;
+    ensure_that(
+      (stopped, written, joined, read, output),
+      "external stop must succeed while early protocol exit retains its error and emits no response",
+      |observed| {
+        observed.0.is_ok()
+          && observed.1.is_ok()
+          && matches!(observed.2, Ok(Err(ServerError::ExitBeforeShutdown)))
+          && matches!(observed.3, Ok(0))
+          && observed.4.is_empty()
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[tokio::test]
-  async fn external_shutdown_precedes_already_ready_protocol_input() -> Result<(), TestFailure> {
-    let (input, shutdown_state) = arbitrate_ready_input(stream::iter([()]), "the prioritized transport decision must be available").await?;
-    ensure(
-      (input.is_some(), shutdown_state) == (false, ShutdownSignalState::Requested),
-      "an external stop request must win when protocol input is ready concurrently",
+  async fn external_shutdown_precedes_already_ready_protocol_input() -> Result<(), Box<PredicateFailure<ArbitrationOutcome>>> {
+    ensure_that(
+      arbitrate_ready_input(stream::iter([()])).await,
+      "a ready external stop must win before protocol input without losing teardown outcomes",
+      |outcome| {
+        matches!(*outcome, Ok(ref observed)
+          if matches!(observed.input, Ok(None))
+            && observed.shutdown == ShutdownSignalState::Requested
+            && observed.cleanup.iter().all(Result::is_ok))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[tokio::test]
-  async fn closed_shutdown_stream_does_not_suppress_ready_protocol_input() -> Result<(), TestFailure> {
-    let (input, shutdown_state) = arbitrate_ready_input(
-      stream::empty(),
-      "ready protocol input must remain available after the control stream closes",
+  async fn closed_shutdown_stream_does_not_suppress_ready_protocol_input() -> Result<(), Box<PredicateFailure<ArbitrationOutcome>>> {
+    ensure_that(
+      arbitrate_ready_input(stream::empty()).await,
+      "a closed external control stream must preserve ready protocol input and owned teardown",
+      |outcome| {
+        matches!(*outcome, Ok(ref observed)
+          if matches!(observed.input, Ok(Some(InputEvent::Message(ref message))) if message.method.as_deref() == Some("initialized"))
+            && observed.shutdown == ShutdownSignalState::Closed
+            && observed.cleanup.iter().all(Result::is_ok))
+      },
     )
-    .await?;
-    let message = match input {
-      Some(InputEvent::Message(message)) => message,
-      Some(InputEvent::ProtocolError(_)) | None => {
-        return ensure(false, "ready protocol input must remain a successful message");
-      }
-    };
-    ensure(
-      (message.method.as_deref(), shutdown_state) == (Some("initialized"), ShutdownSignalState::Closed),
-      "closing the external stop stream must disable only that control source",
-    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[cfg(feature = "tokio-tcp")]
-  /// Accept one ready fixture transport while preserving the external-signal state.
-  async fn accept_fixture<S>(signals: &mut S, value: u8) -> Result<(u8, ShutdownSignalState), TestFailure>
-  where
-    S: Stream<Item = ()> + Unpin,
-  {
-    ensure_some(
-      ensure_ok(
-        accept_or_shutdown(signals, ready(Ok::<u8, Infallible>(value))).await,
-        "the ready TCP fixture must complete acceptance",
-      )?,
-      "a non-triggering stop stream must preserve the accepted value",
+  /// Complete TCP accept arbitration outcomes for all control-stream states.
+  type TcpAcceptance = (
+    [Result<Option<(u8, ShutdownSignalState)>, Infallible>; 3],
+    io::Result<Option<(u8, ShutdownSignalState)>>,
+  );
+
+  #[cfg(feature = "tokio-tcp")]
+  #[tokio::test]
+  async fn tcp_acceptance_preserves_control_priority_and_residual_state() -> Result<(), Box<PredicateFailure<TcpAcceptance>>> {
+    let accepted = [
+      accept_or_shutdown(&mut stream::iter([()]), ready(Ok::<u8, Infallible>(1))).await,
+      accept_or_shutdown(&mut stream::empty(), ready(Ok::<u8, Infallible>(2))).await,
+      accept_or_shutdown(&mut stream::pending(), ready(Ok::<u8, Infallible>(3))).await,
+    ];
+    let failed = accept_or_shutdown(
+      &mut stream::pending(),
+      ready(Err::<u8, io::Error>(io::Error::from(ErrorKind::ConnectionAborted))),
     )
+    .await;
+    ensure_that(
+      (accepted, failed),
+      "TCP acceptance must preserve control priority, residual stream state, and native listener errors",
+      |observed| {
+        observed.0
+          == [
+            Ok(None),
+            Ok(Some((2, ShutdownSignalState::Closed))),
+            Ok(Some((3, ShutdownSignalState::Open))),
+          ]
+          && observed
+            .1
+            .as_ref()
+            .is_err_and(|error| error.kind() == ErrorKind::ConnectionAborted)
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
+  }
+
+  #[cfg(feature = "tokio-tcp")]
+  /// External stop, reserved socket owner, address discovery, and bind rejection.
+  #[derive(Debug)]
+  struct TcpBinding {
+    /// Idle listener's external stop result.
+    stopped:  Result<(), ServerError>,
+    /// Socket retained until the final bind assertion completes.
+    listener: io::Result<net::TcpListener>,
+    /// Native address lookup outcome.
+    address:  Option<io::Result<net::SocketAddr>>,
+    /// Native second bind result when setup provided an address.
+    rejected: Option<Result<(), ServerError>>,
   }
 
   #[cfg(feature = "tokio-tcp")]
   #[tokio::test]
-  async fn tcp_acceptance_preserves_control_priority_and_residual_state() -> Result<(), TestFailure> {
-    let mut requested = stream::iter([()]);
-    let stopped = ensure_ok(
-      accept_or_shutdown(&mut requested, ready(Ok::<u8, Infallible>(1))).await,
-      "a ready external stop must resolve TCP acceptance",
-    )?;
-    ensure(
-      stopped.is_none(),
-      "a real external stop must win over a concurrently ready TCP acceptance",
-    )?;
-
-    let mut closed = stream::empty();
-    let accepted_after_close = accept_fixture(&mut closed, 2).await?;
-    ensure(
-      accepted_after_close == (2, ShutdownSignalState::Closed),
-      "a closed stop stream must remain closed when the accepted transport enters the driver",
-    )?;
-
-    let mut open = stream::pending();
-    let accepted_while_open = accept_fixture(&mut open, 3).await?;
-    ensure(
-      accepted_while_open == (3, ShutdownSignalState::Open),
-      "a pending stop stream must remain open when the accepted transport enters the driver",
-    )?;
-
-    let mut accept_error_shutdown = stream::pending();
-    let accept_error = ensure_some(
-      accept_or_shutdown(
-        &mut accept_error_shutdown,
-        ready(Err::<u8, io::Error>(io::Error::from(ErrorKind::ConnectionAborted))),
-      )
-      .await
-      .err(),
-      "a failed TCP acceptance must retain its typed transport error",
-    )?;
-    ensure(
-      accept_error.kind() == ErrorKind::ConnectionAborted,
-      "TCP accept arbitration must preserve the listener's I/O error category",
-    )
-  }
-
-  #[cfg(feature = "tokio-tcp")]
-  #[tokio::test]
-  async fn tcp_listener_distinguishes_external_stop_from_bind_failure() -> Result<(), TestFailure> {
-    let ephemeral_address = net::SocketAddr::from(([127, 0, 0, 1], 0));
-    ensure_ok(
-      ConcurrentServer::new()
-        .listen_tcp((), ephemeral_address, stream::iter([()]))
-        .await,
-      "an external process stop must end an idle TCP listener gracefully",
-    )?;
-
-    let occupied = ensure_ok(
-      net::TcpListener::bind(ephemeral_address),
-      "the bind-failure fixture must reserve one local address",
-    )?;
-    let occupied_address = ensure_ok(occupied.local_addr(), "the bind-failure fixture must expose its reserved address")?;
-    let error = ensure_some(
-      ConcurrentServer::new()
-        .listen_tcp((), occupied_address, stream::pending())
-        .await
-        .err(),
-      "binding a second listener to the reserved address must fail",
-    )?;
-    ensure(
-      matches!(error, ServerError::Io(source) if source.kind() == ErrorKind::AddrInUse),
-      "the TCP listener must preserve the operating system's address-in-use category",
-    )
-  }
-
-  #[tokio::test]
-  async fn transport_task_polling_records_each_completion_once() -> Result<(), TestFailure> {
-    let mut task_handle = tokio::spawn(async { Ok(()) });
-    let mut completion = TaskCompletion::Active;
-    ensure_ok(
-      poll_fn(|context| poll_transport_task("output", &mut task_handle, &mut completion, context)).await,
-      "an active successful transport task must expose its completion",
-    )?;
-    ensure(
-      completion == TaskCompletion::Complete,
-      "observing a transport task must commit its completion state",
-    )?;
-
-    let waker = noop_waker();
-    let mut context = Context::from_waker(&waker);
-    ensure(
-      matches!(
-        poll_transport_task("output", &mut task_handle, &mut completion, &mut context,),
-        Poll::Pending
+  async fn tcp_listener_distinguishes_external_stop_from_bind_failure() -> Result<(), Box<PredicateFailure<TcpBinding>>> {
+    let ephemeral = net::SocketAddr::from(([127, 0, 0, 1], 0));
+    let stopped = ConcurrentServer::new().listen_tcp((), ephemeral, stream::iter([()])).await;
+    let listener = net::TcpListener::bind(ephemeral);
+    let address = listener.as_ref().ok().map(net::TcpListener::local_addr);
+    let rejected = match address.as_ref() {
+      Some(&Ok(reserved_address)) => Some(
+        ConcurrentServer::new()
+          .listen_tcp((), reserved_address, stream::pending())
+          .await,
       ),
-      "an already interpreted transport task must not be polled a second time",
-    )?;
+      Some(&Err(_)) | None => None,
+    };
+    ensure_that(
+      TcpBinding {
+        stopped,
+        listener,
+        address,
+        rejected,
+      },
+      "TCP listeners must distinguish graceful external stop from native address-in-use failure",
+      |observed| {
+        observed.stopped.is_ok()
+          && observed.listener.is_ok()
+          && matches!(observed.address, Some(Ok(_)))
+          && matches!(observed.rejected, Some(Err(ServerError::Io(ref source))) if source.kind() == ErrorKind::AddrInUse)
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
+  }
 
+  /// Native successful/failed task polls and their committed completion states.
+  type TaskPolls = (
+    Result<(), ServerError>,
+    TaskCompletion,
+    Poll<Result<(), ServerError>>,
+    Result<(), ServerError>,
+    TaskCompletion,
+  );
+
+  #[tokio::test]
+  async fn transport_task_polling_records_each_completion_once() -> Result<(), Box<PredicateFailure<TaskPolls>>> {
+    let mut task = tokio::spawn(async { Ok(()) });
+    let mut completion = TaskCompletion::Active;
+    let first = poll_fn(|context| poll_transport_task("output", &mut task, &mut completion, context)).await;
+    let waker = noop_waker();
+    let repeated = poll_transport_task("output", &mut task, &mut completion, &mut Context::from_waker(&waker));
     let mut failed_task = tokio::spawn(async { Err(ServerError::MissingContentLength) });
     let mut failed_completion = TaskCompletion::Active;
-    let error = ensure_some(
-      poll_fn(|task_context| poll_transport_task("input", &mut failed_task, &mut failed_completion, task_context))
-        .await
-        .err(),
-      "an active failed transport task must expose its typed result",
-    )?;
-    ensure(
-      (matches!(error, ServerError::MissingContentLength), failed_completion) == (true, TaskCompletion::Complete),
-      "polling a failed transport task must preserve its failure and commit completion exactly once",
+    let failed = poll_fn(|context| poll_transport_task("input", &mut failed_task, &mut failed_completion, context)).await;
+    ensure_that(
+      (first, completion, repeated, failed, failed_completion),
+      "each native task completion must commit once while preserving its original result",
+      |observed| {
+        matches!(
+          *observed,
+          (
+            Ok(()),
+            TaskCompletion::Complete,
+            Poll::Pending,
+            Err(ServerError::MissingContentLength),
+            TaskCompletion::Complete
+          )
+        )
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[tokio::test]
-  async fn handler_join_distinguishes_intentional_transport_cancellation() -> Result<(), TestFailure> {
+  async fn handler_join_distinguishes_intentional_transport_cancellation() -> Result<(), Box<PredicateFailure<HandlerOutcomes>>> {
     let completed = tokio::spawn(async { Ok(()) });
-    ensure(
-      joined_task_result("handler", completed.await, false).is_ok(),
-      "a normally completed handler task must preserve its successful result",
-    )?;
-
     let failed = tokio::spawn(async { Err(ServerError::ExitBeforeShutdown) });
-    ensure(
-      matches!(
-        joined_task_result("handler", failed.await, false),
-        Err(ServerError::ExitBeforeShutdown)
-      ),
-      "a handler's typed server failure must propagate without conversion",
-    )?;
-
-    let intentionally_cancelled = tokio::spawn(pending::<Result<(), ServerError>>());
-    intentionally_cancelled.abort();
-    ensure(
-      joined_task_result("handler", intentionally_cancelled.await, true).is_ok(),
-      "transport shutdown must accept the cancellation it deliberately issued",
-    )?;
-
-    let unexpectedly_cancelled = tokio::spawn(pending::<Result<(), ServerError>>());
-    unexpectedly_cancelled.abort();
-    let error = ensure_some(
-      joined_task_result("handler", unexpectedly_cancelled.await, false).err(),
-      "a handler cancelled while the transport remains live must be reported",
-    )?;
-    ensure(
-      matches!(
-        error,
-        ServerError::TransportTaskTerminated {
-          task: "handler",
-          source
-        } if source.is_cancelled()
-      ),
-      "unexpected task cancellation must retain its role and typed Tokio source",
-    )
+    let intentional = tokio::spawn(pending::<Result<(), ServerError>>());
+    intentional.abort();
+    let unexpected = tokio::spawn(pending::<Result<(), ServerError>>());
+    unexpected.abort();
+    ensure_that([joined_task_result("handler", completed.await, false), joined_task_result("handler", failed.await, false), joined_task_result("handler", intentional.await, true), joined_task_result("handler", unexpected.await, false)], "handler joins must preserve completion, typed failure, and cancellation ownership", |observed| matches!(*observed, [Ok(()), Err(ServerError::ExitBeforeShutdown), Ok(()), Err(ServerError::TransportTaskTerminated { task: "handler", ref source })] if source.is_cancelled())).map(drop).map_err(Box::new)
   }
 
   #[test]
-  fn transport_termination_distinguishes_protocol_exit_from_external_stop() -> Result<(), TestFailure> {
-    ensure(
-      termination_result(true, false).is_ok(),
-      "a completed protocol shutdown must permit transport exit",
-    )?;
-    ensure(
-      termination_result(false, true).is_ok(),
-      "an external process stop must not fabricate an LSP shutdown request",
-    )?;
-    ensure(
-      matches!(termination_result(false, false), Err(ServerError::ExitBeforeShutdown)),
-      "an ordinary client exit before shutdown must remain a lifecycle error",
+  fn transport_termination_distinguishes_protocol_exit_from_external_stop() -> Result<(), Box<PredicateFailure<LifecycleOutcomes>>> {
+    ensure_that(
+      [
+        termination_result(true, false),
+        termination_result(false, true),
+        termination_result(false, false),
+      ],
+      "only completed protocol shutdown or an external process stop permits transport exit",
+      |observed| matches!(*observed, [Ok(()), Ok(()), Err(ServerError::ExitBeforeShutdown)]),
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn teardown_preserves_primary_failure_and_adopts_the_first_cleanup_failure() -> Result<(), TestFailure> {
+  fn teardown_preserves_primary_failure_and_adopts_the_first_cleanup_failure() -> Result<(), Box<PredicateFailure<LifecycleOutcomes>>> {
     let mut established = Err(ServerError::ExitBeforeShutdown);
     preserve_primary(&mut established, Err(ServerError::MissingContentLength));
-    ensure(
-      matches!(established, Err(ServerError::ExitBeforeShutdown)),
-      "transport teardown must not replace the established primary failure",
-    )?;
-
     let mut successful = Ok(());
     preserve_primary(&mut successful, Err(ServerError::MissingContentLength));
-    ensure(
-      matches!(successful, Err(ServerError::MissingContentLength)),
-      "transport teardown must adopt its first failure when primary work succeeded",
-    )?;
-
     let mut clean = Ok(());
     preserve_primary(&mut clean, Ok(()));
-    ensure(clean.is_ok(), "successful primary work and cleanup must remain successful")
+    ensure_that(
+      [established, successful, clean],
+      "teardown must preserve an established failure or adopt its first cleanup failure",
+      |observed| {
+        matches!(*observed, [
+          Err(ServerError::ExitBeforeShutdown),
+          Err(ServerError::MissingContentLength),
+          Ok(())
+        ])
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

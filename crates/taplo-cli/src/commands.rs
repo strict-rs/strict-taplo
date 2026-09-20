@@ -349,24 +349,50 @@ fn path_pattern(path: &Path) -> Result<String, CliError> {
 
 #[cfg(test)]
 mod tests {
+  use std::fmt::Debug;
+  #[cfg(feature = "lsp")]
+  use std::io;
+  use std::io::ErrorKind;
+  use std::iter::once;
+  #[cfg(feature = "lsp")]
+  use std::num::ParseIntError;
   use std::path::Path;
   use std::path::PathBuf;
+  use std::str::from_utf8;
   use std::sync::Arc;
 
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_contains;
-  use strict_test_support::ensure_eq;
-  use strict_test_support::ensure_lacks;
-  use strict_test_support::ensure_ok;
+  #[cfg(feature = "lsp")]
+  use futures::future::Either;
+  #[cfg(feature = "lsp")]
+  use futures::future::select;
+  #[cfg(feature = "lsp")]
+  use strict_test_support::OptionFailure;
+  #[cfg(feature = "lsp")]
+  use strict_test_support::PredicateFailure;
+  #[cfg(feature = "lsp")]
   use strict_test_support::ensure_some;
+  use strict_test_support::ensure_that;
+  use taplo::formatter::OptionParseError;
   use taplo_common::config::Config;
+  use taplo_common::environment::EnvironmentError;
   #[cfg(feature = "lsp")]
   use taplo_lsp_async::rpc;
   use taplo_test_support::drive;
+  #[cfg(feature = "lsp")]
+  use tokio::io::AsyncBufReadExt;
+  #[cfg(feature = "lsp")]
+  use tokio::io::AsyncReadExt;
+  #[cfg(feature = "lsp")]
+  use tokio::io::AsyncWriteExt;
+  #[cfg(feature = "lsp")]
+  use tokio::io::BufReader;
+  #[cfg(feature = "lsp")]
+  use tokio::runtime::Builder;
 
   use crate::CliError;
   use crate::CliFailure;
+  #[cfg(feature = "lsp")]
+  use crate::LocalCommandFuture;
   use crate::Taplo;
   use crate::TestEnvironment;
   use crate::args::Colors;
@@ -378,6 +404,10 @@ mod tests {
   use crate::args::GetCommand;
   #[cfg(feature = "lint")]
   use crate::args::LintCommand;
+  #[cfg(feature = "lsp")]
+  use crate::args::LspCommand;
+  #[cfg(feature = "lsp")]
+  use crate::args::LspCommandIo;
   use crate::args::OutputFormat;
   use crate::args::TaploArgs;
   use crate::args::TaploCommand;
@@ -463,165 +493,240 @@ mod tests {
 
   /// Construct one bounded standard-I/O language-server command.
   #[cfg(feature = "lsp")]
-  fn stdio_lsp_command() -> crate::args::LspCommand {
-    crate::args::LspCommand {
+  fn stdio_lsp_command() -> LspCommand {
+    LspCommand {
       general: general(),
-      io:      crate::args::LspCommandIo::Stdio {},
+      io:      LspCommandIo::Stdio {},
     }
   }
 
-  /// Write one complete framed JSON-RPC value to the interactive client pipe.
-  ///
-  /// # Errors
-  ///
-  /// Returns a test failure when serialization or interactive input fails.
+  /// Complete outbound request, serialization, and native pipe-write result.
   #[cfg(feature = "lsp")]
-  async fn send_lsp_message(
-    writer: &mut taplo_test_support::TestInputWriter,
-    message: &impl serde::Serialize,
-    context: &'static str,
-  ) -> Result<(), TestFailure> {
-    let body = ensure_ok(serde_json::to_vec(message), "the bounded LSP client message must serialize")?;
-    let mut frame = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
-    frame.extend_from_slice(&body);
-    ensure_ok(tokio::io::AsyncWriteExt::write_all(writer, &frame).await, context)
+  #[derive(Debug)]
+  struct SentMessage {
+    /// Typed JSON-RPC request or notification.
+    request: rpc::Request<serde_json::Value>,
+    /// Complete framed bytes or native serialization failure.
+    frame:   Result<Vec<u8>, serde_json::Error>,
+    /// Native write result when serialization succeeded.
+    written: Option<io::Result<()>>,
   }
 
-  /// Interactive framed client for one bounded CLI language-server session.
+  /// Header, body, and native results observed while reading one response frame.
   #[cfg(feature = "lsp")]
+  #[derive(Debug)]
+  struct ResponseFrame {
+    /// Complete header text.
+    header:         String,
+    /// Native header read result.
+    header_read:    io::Result<usize>,
+    /// Decimal content-length parsing result when the header shape is valid.
+    length:         Option<Result<usize, ParseIntError>>,
+    /// Complete separator text.
+    separator:      String,
+    /// Native separator read result.
+    separator_read: Option<io::Result<usize>>,
+    /// Complete or partially read body bytes.
+    body:           Vec<u8>,
+    /// Native body read result.
+    body_read:      Option<io::Result<usize>>,
+    /// Native message-decoding result.
+    decoded:        Option<Result<rpc::Message, rpc::MessageDecodeError>>,
+  }
+
+  /// Concrete failures of the bounded protocol client.
+  #[cfg(feature = "lsp")]
+  #[derive(Debug, thiserror::Error)]
+  enum ClientFailure {
+    /// Sending retained the request and failed serialization or I/O result.
+    #[error(transparent)]
+    Send(#[from] Box<PredicateFailure<SentMessage>>),
+    /// Reading retained all framing observations and native failures.
+    #[error(transparent)]
+    Frame(#[from] Box<PredicateFailure<ResponseFrame>>),
+    /// A decoded response failed its protocol contract.
+    #[error(transparent)]
+    Response(#[from] Box<PredicateFailure<rpc::Message>>),
+    /// A protocol barrier did not retain its required messages.
+    #[error(transparent)]
+    Messages(#[from] Box<PredicateFailure<Vec<rpc::Message>>>),
+    /// A decoded response was unexpectedly missing.
+    #[error(transparent)]
+    MissingMessage(#[from] Box<OptionFailure<rpc::Message>>),
+    /// A JSON result channel was unexpectedly missing.
+    #[error(transparent)]
+    MissingValue(#[from] Box<OptionFailure<serde_json::Value>>),
+    /// A selected JSON value failed its native predicate.
+    #[error(transparent)]
+    Value(#[from] Box<PredicateFailure<serde_json::Value>>),
+  }
+
+  /// Native selected-value assertion contract used by protocol requests.
+  #[cfg(feature = "lsp")]
+  type JsonContract = fn(serde_json::Value, &'static str) -> Result<serde_json::Value, PredicateFailure<serde_json::Value>>;
+
+  /// Interactive framed client retaining every sent frame and received message.
+  #[cfg(feature = "lsp")]
+  #[derive(Debug)]
   struct BoundedLspClient {
     /// Fixture-owned standard-input producer.
-    input:    taplo_test_support::TestInputWriter,
+    input:           taplo_test_support::TestInputWriter,
     /// Streaming reader over captured standard output.
-    output:   tokio::io::BufReader<taplo_test_support::TestOutputReader>,
+    output:          BufReader<taplo_test_support::TestOutputReader>,
     /// Every response and asynchronous message consumed from output.
-    observed: Vec<rpc::Message>,
+    observed:        Vec<rpc::Message>,
+    /// Messages present at the document-open response barrier.
+    opened_messages: Vec<rpc::Message>,
+    /// Complete successful outbound observations.
+    sent:            Vec<SentMessage>,
+    /// Complete successfully decoded input frames.
+    frames:          Vec<ResponseFrame>,
+    /// Native terminal input shutdown result.
+    shutdown:        Option<io::Result<()>>,
   }
 
   #[cfg(feature = "lsp")]
   impl BoundedLspClient {
+    /// Serialize and write a request, retaining both its input and complete native outcomes.
+    async fn send(&mut self, request: rpc::Request<serde_json::Value>, context: &'static str) -> Result<(), ClientFailure> {
+      let frame = serde_json::to_vec(&request).map(|body| {
+        let mut framed = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+        framed.extend_from_slice(&body);
+        framed
+      });
+      let written = if let Ok(ref bytes) = frame {
+        Some(AsyncWriteExt::write_all(&mut self.input, bytes).await)
+      } else {
+        None
+      };
+      let sent = ensure_that(
+        SentMessage {
+          request,
+          frame,
+          written,
+        },
+        context,
+        |actual| actual.frame.is_ok() && actual.written.as_ref().is_some_and(Result::is_ok),
+      )
+      .map_err(Box::new)?;
+      self.sent.push(sent);
+      Ok(())
+    }
+
     /// Send one typed JSON-RPC request without awaiting its response.
-    ///
-    /// # Errors
-    ///
-    /// Returns a test failure when serialization or interactive input fails.
     async fn send_request(
       &mut self,
       id: i32,
       method: &str,
       params: Option<serde_json::Value>,
       context: &'static str,
-    ) -> Result<(), TestFailure> {
-      let request = rpc::Request::new()
-        .with_method(method)
-        .with_id(Some(rpc::RequestId::Number(id)))
-        .with_params(params);
-      send_lsp_message(&mut self.input, &request, context).await
+    ) -> Result<(), ClientFailure> {
+      self
+        .send(
+          rpc::Request::new()
+            .with_method(method)
+            .with_id(Some(rpc::RequestId::Number(id)))
+            .with_params(params),
+          context,
+        )
+        .await
     }
 
     /// Send one typed JSON-RPC notification.
-    ///
-    /// # Errors
-    ///
-    /// Returns a test failure when serialization or interactive input fails.
-    async fn notify(&mut self, method: &str, params: Option<serde_json::Value>, context: &'static str) -> Result<(), TestFailure> {
-      let notification = rpc::Request::<serde_json::Value>::new().with_method(method).with_params(params);
-      send_lsp_message(&mut self.input, &notification, context).await
+    async fn notify(&mut self, method: &str, params: Option<serde_json::Value>, context: &'static str) -> Result<(), ClientFailure> {
+      self
+        .send(rpc::Request::new().with_method(method).with_params(params), context)
+        .await
     }
 
-    /// Read framed output until one correlated response arrives.
-    ///
-    /// Every intervening notification or server request is retained for later
-    /// asynchronous-effect assertions.
-    ///
-    /// # Errors
-    ///
-    /// Returns a test failure for invalid framing or malformed JSON-RPC output.
-    async fn response(&mut self, request_id: i32) -> Result<rpc::Message, TestFailure> {
-      loop {
-        let mut header = String::new();
-        let header_bytes = ensure_ok(
-          tokio::io::AsyncBufReadExt::read_line(&mut self.output, &mut header).await,
-          "the bounded LSP client must read a response header",
-        )?;
-        ensure(header_bytes > 0, "the server must not close output before the correlated response")?;
-        let encoded_length = ensure_some(
-          header
-            .strip_prefix("Content-Length: ")
-            .and_then(|value| value.strip_suffix("\r\n")),
-          "server output must use the standard content-length header",
-        )?;
-        let content_length = ensure_ok(
-          encoded_length.parse::<usize>(),
-          "the server content length must be a decimal byte count",
-        )?;
-
-        let mut separator = String::new();
-        let separator_bytes = ensure_ok(
-          tokio::io::AsyncBufReadExt::read_line(&mut self.output, &mut separator).await,
-          "the bounded LSP client must read the header separator",
-        )?;
-        ensure_eq(&separator_bytes, &2, "the server header separator must contain exactly CRLF")?;
-        ensure_eq(
-          &separator.as_str(),
-          &"\r\n",
-          "the server header must terminate before its JSON body",
-        )?;
-
-        let mut body = vec![0_u8; content_length];
-        let body_bytes = ensure_ok(
-          tokio::io::AsyncReadExt::read_exact(&mut self.output, &mut body).await,
-          "the bounded LSP client must read the complete response body",
-        )?;
-        ensure_eq(
-          &body_bytes,
-          &content_length,
-          "the framed response body must match its declared content length",
-        )?;
-        let message = ensure_ok(rpc::decode_slice(&body), "the server response body must decode as JSON-RPC")?;
-        let correlated = message.id == rpc::MessageId::Value(rpc::RequestId::Number(request_id));
-        if correlated {
-          self.observed.push(message.clone());
-          return Ok(message);
-        }
-        self.observed.push(message);
+    /// Read one frame, preserving every preceding read if a later framing boundary fails.
+    async fn frame(&mut self) -> Result<ResponseFrame, Box<PredicateFailure<ResponseFrame>>> {
+      let mut header = String::new();
+      let header_read = AsyncBufReadExt::read_line(&mut self.output, &mut header).await;
+      let length = header
+        .strip_prefix("Content-Length: ")
+        .and_then(|value| value.strip_suffix("\r\n"))
+        .map(str::parse::<usize>);
+      let mut frame = ResponseFrame {
+        header,
+        header_read,
+        length,
+        separator: String::new(),
+        separator_read: None,
+        body: Vec::new(),
+        body_read: None,
+        decoded: None,
+      };
+      let byte_count = frame.length.as_ref().and_then(|result| result.as_ref().ok()).copied();
+      if byte_count.is_some() {
+        frame.separator_read = Some(AsyncBufReadExt::read_line(&mut self.output, &mut frame.separator).await);
       }
+      if let Some(count) = byte_count.filter(|_| matches!(frame.separator_read, Some(Ok(2))) && frame.separator == "\r\n") {
+        frame.body.resize(count, 0);
+        frame.body_read = Some(AsyncReadExt::read_exact(&mut self.output, &mut frame.body).await);
+      }
+      if frame
+        .body_read
+        .as_ref()
+        .is_some_and(|read| read.as_ref().is_ok_and(|count| *count == frame.body.len()))
+      {
+        frame.decoded = Some(rpc::decode_slice(&frame.body));
+      }
+      ensure_that(
+        frame,
+        "response framing must retain a nonempty standard header, decimal length, exact CRLF separator, complete body, and typed JSON-RPC \
+         message",
+        |actual| {
+          actual
+            .header_read
+            .as_ref()
+            .is_ok_and(|count| *count > 0 && *count == actual.header.len())
+            && actual.length.as_ref().is_some_and(Result::is_ok)
+            && matches!(&actual.separator_read, Some(Ok(2)))
+            && actual.separator == "\r\n"
+            && actual
+              .body_read
+              .as_ref()
+              .is_some_and(|read| read.as_ref().is_ok_and(|count| *count == actual.body.len()))
+            && actual.decoded.as_ref().is_some_and(Result::is_ok)
+        },
+      )
+      .map_err(Box::new)
     }
 
-    /// Send one request and extract its successful correlated result.
-    ///
-    /// # Errors
-    ///
-    /// Returns a test failure when transport or decoding fails, the server
-    /// emits an RPC error, or the response omits its result channel.
+    /// Read framed output until the correlated response arrives, retaining all intervening
+    /// messages.
+    async fn response(&mut self, request_id: i32) -> Result<rpc::Message, ClientFailure> {
+      let mut correlated = None;
+      while correlated.is_none() {
+        let frame = self.frame().await?;
+        let message = frame.decoded.as_ref().and_then(|result| result.as_ref().ok()).cloned();
+        self.frames.push(frame);
+        let decoded_message = ensure_some(message, "a validated response frame must retain its decoded message").map_err(Box::new)?;
+        let requested = decoded_message.id == rpc::MessageId::Value(rpc::RequestId::Number(request_id));
+        self.observed.push(decoded_message.clone());
+        correlated = requested.then_some(decoded_message);
+      }
+      Ok(ensure_some(correlated, "the response loop must retain the correlated native message").map_err(Box::new)?)
+    }
+
+    /// Send a request and retain its complete successful response in the transcript.
     async fn request(
       &mut self,
       id: i32,
       method: &str,
       params: Option<serde_json::Value>,
       context: &'static str,
-    ) -> Result<serde_json::Value, TestFailure> {
+    ) -> Result<serde_json::Value, ClientFailure> {
       self.send_request(id, method, params, context).await?;
-      let response = self.response(id).await?;
-      if let Some(error) = response.error {
-        let cause = error
-          .details
-          .as_ref()
-          .map_or_else(|| error.to_string(), |details| format!("{error}; details: {details}"));
-        return Err(TestFailure::WasErr {
-          context,
-          cause,
-        });
-      }
-      ensure_some(response.result, context)
+      let response = ensure_that(self.response(id).await?, context, |message| {
+        message.error.is_none() && message.result.is_some()
+      })
+      .map_err(Box::new)?;
+      Ok(ensure_some(response.result, context).map_err(Box::new)?)
     }
 
-    /// Send one request and extract the JSON value at `pointer`.
-    ///
-    /// # Errors
-    ///
-    /// Returns a test failure from request transport, response decoding, or
-    /// JSON pointer selection.
+    /// Select JSON from a response whose complete native message remains in the transcript.
     async fn request_selected(
       &mut self,
       id: i32,
@@ -629,17 +734,13 @@ mod tests {
       params: Option<serde_json::Value>,
       pointer: &str,
       context: &'static str,
-    ) -> Result<serde_json::Value, TestFailure> {
+    ) -> Result<serde_json::Value, ClientFailure> {
       let result = self.request(id, method, params, context).await?;
-      ensure_some(result.pointer(pointer).cloned(), context)
+      let selected = ensure_that(result, context, |value| value.pointer(pointer).is_some()).map_err(Box::new)?;
+      Ok(ensure_some(selected.pointer(pointer).cloned(), context).map_err(Box::new)?)
     }
 
-    /// Require one selected request value to satisfy its JSON contract.
-    ///
-    /// # Errors
-    ///
-    /// Returns a test failure from request transport, response decoding, JSON
-    /// pointer selection, or the supplied value contract.
+    /// Check a selected native JSON subject while preserving the full response transcript.
     async fn request_selected_where(
       &mut self,
       id: i32,
@@ -647,18 +748,12 @@ mod tests {
       params: Option<serde_json::Value>,
       pointer: &str,
       context: &'static str,
-      validate: fn(&serde_json::Value, &'static str) -> Result<(), TestFailure>,
-    ) -> Result<(), TestFailure> {
-      let selected = self.request_selected(id, method, params, pointer, context).await?;
-      validate(&selected, context)
+      validate: JsonContract,
+    ) -> Result<serde_json::Value, ClientFailure> {
+      Ok(validate(self.request_selected(id, method, params, pointer, context).await?, context).map_err(Box::new)?)
     }
 
-    /// Require one request result's text field to contain expected content.
-    ///
-    /// # Errors
-    ///
-    /// Returns a test failure from request transport, response decoding, text
-    /// projection, or content comparison.
+    /// Check converted text while retaining its native JSON subject and full response transcript.
     async fn request_text_containing(
       &mut self,
       id: i32,
@@ -666,106 +761,116 @@ mod tests {
       source_text: &str,
       expected_text: &str,
       context: &'static str,
-    ) -> Result<(), TestFailure> {
-      let converted = self
-        .request_selected(
-          id,
-          method,
-          Some(serde_json::json!({
-            "text": source_text
-          })),
-          "/text",
-          context,
-        )
+    ) -> Result<serde_json::Value, ClientFailure> {
+      let result = self
+        .request_selected(id, method, Some(serde_json::json!({"text": source_text})), "/text", context)
         .await?;
-      let converted_text = ensure_some(converted.as_str(), context)?;
-      ensure_contains(converted_text, expected_text, context)
+      Ok(
+        ensure_that(result, context, |value| {
+          value.as_str().is_some_and(|text| text.contains(expected_text))
+        })
+        .map_err(Box::new)?,
+      )
     }
   }
 
-  /// Extract one required JSON array.
-  ///
-  /// # Errors
-  ///
-  /// Returns a test failure when `value` is not an array.
+  /// Require a native JSON array without discarding its contents.
   #[cfg(feature = "lsp")]
-  fn json_array<'value>(value: &'value serde_json::Value, context: &'static str) -> Result<&'value [serde_json::Value], TestFailure> {
-    ensure_some(value.as_array().map(Vec::as_slice), context)
+  fn json_array_contract(
+    value: serde_json::Value,
+    context: &'static str,
+  ) -> Result<serde_json::Value, PredicateFailure<serde_json::Value>> {
+    ensure_that(value, context, serde_json::Value::is_array)
   }
 
-  /// Require one JSON value to be an array.
-  ///
-  /// # Errors
-  ///
-  /// Returns a test failure when `value` is not an array.
+  /// Require a nonempty native JSON array without discarding its contents.
   #[cfg(feature = "lsp")]
-  fn json_array_contract(value: &serde_json::Value, context: &'static str) -> Result<(), TestFailure> {
-    let _values = json_array(value, context)?;
-    Ok(())
+  fn non_empty_json_array_contract(
+    value: serde_json::Value,
+    context: &'static str,
+  ) -> Result<serde_json::Value, PredicateFailure<serde_json::Value>> {
+    ensure_that(value, context, |subject| {
+      subject.as_array().is_some_and(|values| !values.is_empty())
+    })
   }
 
-  /// Require one JSON value to be a non-empty array.
-  ///
-  /// # Errors
-  ///
-  /// Returns a test failure when `value` is not an array or contains no items.
+  /// Require protocol null while returning its native JSON value.
   #[cfg(feature = "lsp")]
-  fn non_empty_json_array_contract(value: &serde_json::Value, context: &'static str) -> Result<(), TestFailure> {
-    let values = json_array(value, context)?;
-    ensure(!values.is_empty(), context)
+  fn json_null_contract(value: serde_json::Value, context: &'static str) -> Result<serde_json::Value, PredicateFailure<serde_json::Value>> {
+    ensure_that(value, context, serde_json::Value::is_null)
   }
 
-  /// Require one JSON value to be protocol `null`.
-  ///
-  /// # Errors
-  ///
-  /// Returns a test failure when `value` is not `null`.
-  #[cfg(feature = "lsp")]
-  fn json_null_contract(value: &serde_json::Value, context: &'static str) -> Result<(), TestFailure> {
-    ensure(value.is_null(), context)
+  /// Initialized CLI and its deterministic environment owner.
+  type InitializedCli = (TestEnvironment, Taplo<TestEnvironment>);
+
+  /// Native host, CLI initialization, and invalid configuration load observations.
+  type ConfigurationFailure = (
+    TestEnvironment,
+    Result<Taplo<TestEnvironment>, CliError>,
+    Option<Result<Arc<Config>, CliError>>,
+  );
+
+  /// Execute one independent invalid configuration fixture and retain its host and native outcomes.
+  fn configuration_failure((path, contents, reject_read, cwd): (Option<&str>, &[u8], bool, bool)) -> ConfigurationFailure {
+    let host = TestEnvironment::default();
+    if let Some(target) = path {
+      host.insert_file(target, contents.to_vec());
+    }
+    host.set_read_failure(reject_read);
+    if !cwd {
+      host.set_cwd(None);
+    }
+    let mut cli = Taplo::new(host.clone());
+    let loaded = cli
+      .as_mut()
+      .ok()
+      .map(|command| drive(command.load_config(&config_general(path, true))));
+    (host, cli, loaded)
   }
 
-  /// Construct initialized CLI state and retain the observable host handle.
-  fn initialized_cli() -> Result<(TestEnvironment, Taplo<TestEnvironment>), TestFailure> {
+  /// Construct initialized CLI state and retain its observable host.
+  fn initialized_cli() -> Result<InitializedCli, Box<CliError>> {
     let environment = TestEnvironment::default();
-    let taplo = ensure_ok(Taplo::new(environment.clone()), "deterministic CLI state must initialize")?;
+    let taplo = Taplo::new(environment.clone()).map_err(Box::new)?;
     Ok((environment, taplo))
   }
 
-  /// Decode captured standard output as UTF-8.
-  fn stdout_text(environment: &TestEnvironment) -> Result<String, TestFailure> {
-    ensure_ok(String::from_utf8(environment.stdout()), "captured standard output must be UTF-8")
+  /// Complete command outcome and its channel and filesystem effects.
+  #[derive(Debug)]
+  struct CommandObservation {
+    /// Native CLI completion result.
+    result: Result<(), CliError>,
+    /// Complete standard-output bytes at completion.
+    stdout: Vec<u8>,
+    /// Complete diagnostic bytes at completion.
+    stderr: Vec<u8>,
+    /// Ordered filesystem writes at completion.
+    writes: Vec<PathBuf>,
   }
 
-  /// Execute one standard-input query from a clean output state and return its text.
-  fn get_output(
-    environment: &TestEnvironment,
-    taplo: &Taplo<TestEnvironment>,
-    source: &[u8],
-    command: GetCommand,
-    context: &'static str,
-  ) -> Result<String, TestFailure> {
+  /// Capture a completed command without projecting its native result or effects.
+  fn observe(environment: &TestEnvironment, result: Result<(), CliError>) -> CommandObservation {
+    CommandObservation {
+      result,
+      stdout: environment.stdout(),
+      stderr: environment.stderr(),
+      writes: environment.writes(),
+    }
+  }
+
+  /// Execute one query after selecting input and clearing prior output.
+  fn get_output(environment: &TestEnvironment, taplo: &Taplo<TestEnvironment>, source: &[u8], command: GetCommand) -> CommandObservation {
     environment.clear_output();
     environment.set_stdin(source.to_vec());
-    ensure_ok(drive(taplo.execute_get(command)), context)?;
-    stdout_text(environment)
+    observe(environment, drive(taplo.execute_get(command)))
   }
 
-  /// Execute one text-producing query and compare its complete standard output.
-  fn ensure_get_output(
-    environment: &TestEnvironment,
-    taplo: &Taplo<TestEnvironment>,
-    source: &[u8],
-    command: GetCommand,
-    expected: &str,
-    execution_context: &'static str,
-    output_context: &'static str,
-  ) -> Result<(), TestFailure> {
-    let output = get_output(environment, taplo, source, command, execution_context)?;
-    ensure_eq(&output.as_str(), &expected, output_context)
+  /// Inspect a diagnostic substring while the owning observation retains every byte.
+  fn diagnostic_contains(observed: &CommandObservation, text: &str) -> bool {
+    from_utf8(&observed.stderr).is_ok_and(|diagnostics| diagnostics.contains(text))
   }
 
-  /// Install the shared schema requiring one string-valued `name` property.
+  /// Install the shared schema requiring one string-valued name property.
   #[cfg(feature = "lint")]
   fn install_required_string_schema(environment: &TestEnvironment) {
     environment.insert_file(
@@ -774,806 +879,539 @@ mod tests {
     );
   }
 
-  /// Decode captured standard error as UTF-8.
-  fn stderr_text(environment: &TestEnvironment) -> Result<String, TestFailure> {
-    ensure_ok(String::from_utf8(environment.stderr()), "captured standard error must be UTF-8")
-  }
-
-  /// Execute one formatter command and require its typed failure.
-  fn format_failure(taplo: &mut Taplo<TestEnvironment>, command: FormatCommand, context: &'static str) -> Result<CliError, TestFailure> {
-    ensure_some(drive(taplo.execute_format(command)).err(), context)
-  }
-
-  #[test]
-  fn local_dispatcher_executes_local_commands() -> Result<(), TestFailure> {
-    let (environment, mut taplo) = initialized_cli()?;
-    ensure_ok(
-      drive(taplo.execute_local(arguments(TaploCommand::Config {
-        cmd: ConfigCommand::Default,
-      }))),
-      "the local dispatcher must execute a local command",
-    )?;
-    let output = stdout_text(&environment)?;
-    let decoded = ensure_ok(
-      toml::from_str::<Config>(&output),
-      "default configuration output must decode as the public configuration type",
-    )?;
-    ensure(decoded.include.is_none(), "default output must retain implicit inclusion")?;
-    ensure(decoded.exclude.is_none(), "default output must retain implicit exclusion")?;
-    ensure(decoded.rule.is_empty(), "default output must contain no path-specific rules")?;
-    ensure(decoded.plugins.is_none(), "CLI defaults must omit plugin configuration")
+  /// Parse a test fixture URL through the CLI's native URL error boundary.
+  #[cfg(feature = "lint")]
+  fn fixture_url(input: &str) -> Result<url::Url, Box<CliError>> {
+    url::Url::parse(input).map_err(|source| {
+      Box::new(CliError::Url {
+        input: input.to_owned(),
+        source,
+      })
+    })
   }
 
   #[test]
-  fn configuration_commands_emit_both_documents_and_propagate_output_failure() -> Result<(), TestFailure> {
-    let (environment, taplo) = initialized_cli()?;
-    ensure_ok(
-      drive(taplo.execute_config(ConfigCommand::Default)),
-      "default configuration rendering must succeed",
-    )?;
-    let default_output = stdout_text(&environment)?;
-    ensure_eq(
-      &default_output.as_str(),
-      &"",
-      "all-default configuration must serialize as the empty override document",
-    )?;
-
-    environment.clear_output();
-    ensure_ok(
-      drive(taplo.execute_config(ConfigCommand::Schema)),
-      "configuration schema rendering must succeed",
-    )?;
-    let schema_output = stdout_text(&environment)?;
-    let schema = ensure_ok(
-      serde_json::from_str::<serde_json::Value>(&schema_output),
-      "configuration schema output must be valid JSON",
-    )?;
-    let title = ensure_some(schema.get("title"), "the configuration schema must carry its title")?;
-    ensure_eq(
-      title,
-      &serde_json::json!("Config"),
-      "the configuration schema must identify the public configuration type",
-    )?;
-    ensure(
-      schema.pointer("/properties/include").is_some(),
-      "the configuration schema must expose file inclusion",
-    )?;
-    ensure(
-      schema.pointer("/properties/formatting").is_some(),
-      "the configuration schema must expose formatter policy",
-    )?;
-
-    environment.set_stdout_failure(true);
-    let failure = drive(taplo.execute_config(ConfigCommand::Default));
-    ensure(
-      matches!(failure, Err(CliError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied),
-      "configuration output must preserve typed stream failures",
+  fn local_dispatcher_executes_local_commands() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let (environment, mut taplo) = initialized_cli()?;
+      let command = observe(
+        &environment,
+        drive(taplo.execute_local(arguments(TaploCommand::Config {
+          cmd: ConfigCommand::Default,
+        }))),
+      );
+      let decoded = from_utf8(&command.stdout).map(toml::from_str::<Config>);
+      Ok::<_, Box<CliError>>((taplo, command, decoded))
+    })();
+    ensure_that(
+      observed,
+      "local configuration dispatch must preserve the public default configuration",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        let Ok(Ok(ref config)) = actual.2 else {
+          return false;
+        };
+        actual.1.result.is_ok()
+          && config.include.is_none()
+          && config.exclude.is_none()
+          && config.rule.is_empty()
+          && config.plugins.is_none()
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn configuration_loading_discovers_prepares_caches_and_preserves_typed_failures() -> Result<(), TestFailure> {
-    let (environment, mut taplo) = initialized_cli()?;
-    environment.insert_file("/workspace/taplo.toml", b"include = [\"configured/*.toml\"]\n".to_vec());
-    environment.insert_file("/workspace/configured/value.toml", b"value=1\n".to_vec());
-    environment.insert_file("/workspace/ignored.toml", b"ignored=1\n".to_vec());
-    let automatic = config_general(None, false);
-    let discovered = ensure_ok(
-      drive(taplo.load_config(&automatic)),
-      "automatic configuration discovery must load and prepare the nearest file",
-    )?;
-    ensure(
-      (
-        discovered.is_included(Path::new("/workspace/configured/value.toml")),
-        discovered.is_included(Path::new("/workspace/ignored.toml")),
-        environment.discovery_bases(),
-      ) == (true, false, vec![PathBuf::from("/workspace")]),
-      "the discovered configuration must prepare relative includes against the searched working directory",
-    )?;
-
-    let configured_files = ensure_ok(
-      drive(
-        taplo.collect_files(
-          Path::new("/workspace"),
-          &discovered,
-          Vec::from([
-            String::from("/workspace/configured/*.toml"),
-            String::from("configured/*.toml"),
-            String::from("/workspace/configured/*.toml"),
-          ])
-          .into_iter(),
-        ),
-      ),
-      "absolute, relative, and duplicate CLI patterns must collect through one normalized set",
-    )?;
-    ensure(
-      configured_files == [PathBuf::from("/workspace/configured/value.toml")],
-      "file collection must deduplicate equivalent patterns and retain only configuration-included files",
-    )?;
-    let invalid_glob = ensure_some(
-      drive(taplo.collect_files(Path::new("/workspace"), &discovered, Vec::from([String::from("[")]).into_iter())).err(),
-      "an invalid CLI glob must fail before host enumeration",
-    )?;
-    ensure(
-      matches!(invalid_glob, CliError::Glob { pattern, .. } if pattern == "/workspace/["),
-      "file collection must retain the normalized rejected glob expression and typed parser source",
-    )?;
-
-    environment.insert_file("/workspace/taplo.toml", b"include = [\"replacement/*.toml\"]\n".to_vec());
-    let cached = ensure_ok(
-      drive(taplo.load_config(&automatic)),
-      "a prepared invocation configuration must remain reusable",
-    )?;
-    ensure(
-      (
-        Arc::ptr_eq(&discovered, &cached),
-        environment.discovery_bases(),
-        cached.is_included(Path::new("/workspace/configured/value.toml")),
-        cached.is_included(Path::new("/workspace/replacement/value.toml")),
-      ) == (true, vec![PathBuf::from("/workspace")], true, false),
-      "configuration reuse must return the prepared instance without rediscovery or mid-invocation drift",
-    )?;
-
-    let invalid_toml_environment = TestEnvironment::default();
-    invalid_toml_environment.insert_file("/config/invalid.toml", b"include = [".to_vec());
-    let mut invalid_toml_taplo = ensure_ok(
-      Taplo::new(invalid_toml_environment),
-      "the invalid-TOML configuration fixture must initialize",
-    )?;
-    let invalid_toml = ensure_some(
-      drive(invalid_toml_taplo.load_config(&config_general(Some("/config/invalid.toml"), true))).err(),
-      "invalid configuration TOML must fail decoding",
-    )?;
-    ensure(
-      matches!(
-        invalid_toml,
-        CliError::ConfigDecode {
-          path,
-          ..
-        } if path == PathBuf::from("/config/invalid.toml")
-      ),
-      "configuration decoding must retain the explicit source path and typed TOML error",
-    )?;
-
-    let invalid_utf8_environment = TestEnvironment::default();
-    invalid_utf8_environment.insert_file("/config/non-utf8.toml", vec![0xff]);
-    let mut invalid_utf8_taplo = ensure_ok(
-      Taplo::new(invalid_utf8_environment),
-      "the non-UTF-8 configuration fixture must initialize",
-    )?;
-    ensure(
-      matches!(
-        drive(invalid_utf8_taplo.load_config(&config_general(Some("/config/non-utf8.toml"), true,))),
-        Err(CliError::Utf8(_))
-      ),
-      "configuration loading must preserve invalid UTF-8 as a distinct typed boundary",
-    )?;
-
-    let read_failure_environment = TestEnvironment::default();
-    read_failure_environment.insert_file("/config/unreadable.toml", Vec::new());
-    read_failure_environment.set_read_failure(true);
-    let mut read_failure_taplo = ensure_ok(
-      Taplo::new(read_failure_environment),
-      "the unreadable configuration fixture must initialize",
-    )?;
-    ensure(
-      matches!(
-        drive(read_failure_taplo.load_config(&config_general(
-          Some("/config/unreadable.toml"),
-          true,
-        ))),
-        Err(CliError::Environment(
-          taplo_common::environment::EnvironmentError::Io {
-            operation: "read_file",
-            source,
-            ..
-          }
-        )) if source.kind() == std::io::ErrorKind::PermissionDenied
-      ),
-      "configuration loading must preserve the host read operation and I/O category",
-    )?;
-
-    let missing_cwd_environment = TestEnvironment::default();
-    missing_cwd_environment.set_cwd(None);
-    let mut missing_cwd_taplo = ensure_ok(
-      Taplo::new(missing_cwd_environment),
-      "the missing-working-directory configuration fixture must initialize",
-    )?;
-    ensure(
-      matches!(
-        drive(missing_cwd_taplo.load_config(&general())),
-        Err(CliError::Failure(CliFailure::WorkingDirectoryRequired))
-      ),
-      "configuration preparation without an explicit base must require a working directory",
+  fn configuration_commands_emit_both_documents_and_propagate_output_failure() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let (environment, taplo) = initialized_cli()?;
+      let defaults = observe(&environment, drive(taplo.execute_config(ConfigCommand::Default)));
+      environment.clear_output();
+      let schema = observe(&environment, drive(taplo.execute_config(ConfigCommand::Schema)));
+      let decoded = serde_json::from_slice::<serde_json::Value>(&schema.stdout);
+      environment.set_stdout_failure(true);
+      let rejected = observe(&environment, drive(taplo.execute_config(ConfigCommand::Default)));
+      Ok::<_, Box<CliError>>((taplo, defaults, schema, decoded, rejected))
+    })();
+    ensure_that(
+      observed,
+      "configuration commands must emit default and schema documents and retain native stream failures",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        actual.1.result.is_ok()
+          && actual.1.stdout.is_empty()
+          && actual.2.result.is_ok()
+          && actual.3.as_ref().is_ok_and(|schema| {
+            schema.get("title") == Some(&serde_json::json!("Config"))
+              && schema.pointer("/properties/include").is_some()
+              && schema.pointer("/properties/formatting").is_some()
+          })
+          && matches!(&actual.4.result, Err(CliError::Io(error)) if error.kind() == ErrorKind::PermissionDenied)
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn stdin_formatting_writes_exact_output_and_enforces_check_mode() -> Result<(), TestFailure> {
-    let (environment, mut taplo) = initialized_cli()?;
-    ensure_ok(
-      drive(taplo.execute_format(stdin_format_command(&environment, b"value=1\n"))),
-      "standard-input formatting must succeed",
-    )?;
-    ensure_eq(
-      &stdout_text(&environment)?.as_str(),
-      &"value = 1\n",
-      "standard-input formatting must emit the complete normalized document",
-    )?;
+  fn configuration_loading_discovers_prepares_caches_and_preserves_typed_failures() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let (environment, mut taplo) = initialized_cli()?;
+      environment.insert_file("/workspace/taplo.toml", b"include = [\"configured/*.toml\"]\n".to_vec());
+      environment.insert_file("/workspace/configured/value.toml", b"value=1\n".to_vec());
+      environment.insert_file("/workspace/ignored.toml", b"ignored=1\n".to_vec());
+      let automatic = config_general(None, false);
+      let discovered = drive(taplo.load_config(&automatic));
+      let bases = environment.discovery_bases();
+      let collected = discovered.as_ref().ok().map(|config| {
+        (
+          drive(
+            taplo.collect_files(
+              Path::new("/workspace"),
+              config,
+              [
+                "/workspace/configured/*.toml", "configured/*.toml", "/workspace/configured/*.toml",
+              ]
+              .into_iter()
+              .map(str::to_owned),
+            ),
+          ),
+          drive(taplo.collect_files(Path::new("/workspace"), config, once(String::from("[")))),
+        )
+      });
+      environment.insert_file("/workspace/taplo.toml", b"include = [\"replacement/*.toml\"]\n".to_vec());
+      let cached = drive(taplo.load_config(&automatic));
+      let cached_bases = environment.discovery_bases();
+      let failures = [
+        (Some("/config/invalid.toml"), b"include = [".as_slice(), false, true),
+        (Some("/config/non-utf8.toml"), &[0xff], false, true),
+        (Some("/config/unreadable.toml"), &[], true, true),
+        (None, &[], false, false),
+      ]
+      .map(configuration_failure);
+      Ok::<_, Box<CliError>>((taplo, discovered, bases, collected, cached, cached_bases, failures))
+    })();
+    ensure_that(observed, "configuration discovery must prepare and cache one immutable invocation config while preserving decode, Unicode, read, and cwd failures", |result| {
+      result.as_ref().is_ok_and(|actual| actual.1.as_ref().is_ok_and(|config| config.is_included(Path::new("/workspace/configured/value.toml")) && !config.is_included(Path::new("/workspace/ignored.toml"))
+        && actual.4.as_ref().is_ok_and(|cached| Arc::ptr_eq(config, cached) && cached.is_included(Path::new("/workspace/configured/value.toml")) && !cached.is_included(Path::new("/workspace/replacement/value.toml"))))
+        && actual.2 == [PathBuf::from("/workspace")] && actual.5 == actual.2
+        && actual.3.as_ref().is_some_and(|files| files.0.as_ref().is_ok_and(|paths| paths == &[PathBuf::from("/workspace/configured/value.toml")]) && matches!(&files.1, Err(CliError::Glob { pattern, .. }) if pattern == "/workspace/["))
+        && actual.6.as_slice().first_chunk::<4>().is_some_and(|failures| {
+          let [ref toml, ref utf8, ref read, ref cwd] = *failures;
+          matches!(&toml.2, Some(Err(CliError::ConfigDecode { path, .. })) if path == Path::new("/config/invalid.toml"))
+            && matches!(&utf8.2, Some(Err(CliError::Utf8(_))))
+            && matches!(&read.2, Some(Err(CliError::Environment(EnvironmentError::Io { operation: "read_file", source, .. }))) if source.kind() == ErrorKind::PermissionDenied)
+            && matches!(&cwd.2, Some(Err(CliError::Failure(CliFailure::WorkingDirectoryRequired))))
+        }))
+    }).map(drop).map_err(Box::new)
+  }
 
-    environment.clear_output();
-    let mut check_command = stdin_format_command(&environment, b"value = 1\n");
-    check_command.output.check = true;
-    ensure_ok(
-      drive(taplo.execute_format(check_command.clone())),
-      "check mode must accept an already formatted document",
-    )?;
-    ensure(
-      environment.stdout().is_empty(),
-      "successful check mode must not emit formatted output",
-    )?;
-
-    environment.set_stdin(b"value=1\n".to_vec());
-    let mismatch = format_failure(
-      &mut taplo,
-      check_command,
-      "check mode must return a typed mismatch for unformatted standard input",
-    )?;
-    ensure(
-      matches!(mismatch, CliError::Failure(CliFailure::FormattingMismatch)),
-      "check mode must reject an unformatted standard-input document",
-    )?;
-
-    environment.clear_output();
-    let mut aligned = stdin_format_command(&environment, b"short=1\nlonger=2\n");
-    aligned.options.push(String::from("align_entries=true"));
-    ensure_ok(
-      drive(taplo.execute_format(aligned)),
-      "a valid command-line formatter option must override the default policy",
-    )?;
-    ensure_eq(
-      &stdout_text(&environment)?.as_str(),
-      &"short  = 1\nlonger = 2\n",
-      "formatter option overrides must affect the emitted document",
+  #[test]
+  fn stdin_formatting_writes_exact_output_and_enforces_check_mode() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let (environment, mut taplo) = initialized_cli()?;
+      let formatted = observe(
+        &environment,
+        drive(taplo.execute_format(stdin_format_command(&environment, b"value=1\n"))),
+      );
+      environment.clear_output();
+      let mut check = stdin_format_command(&environment, b"value = 1\n");
+      check.output.check = true;
+      let accepted = observe(&environment, drive(taplo.execute_format(check.clone())));
+      environment.set_stdin(b"value=1\n".to_vec());
+      let mismatch = observe(&environment, drive(taplo.execute_format(check)));
+      environment.clear_output();
+      let mut aligned = stdin_format_command(&environment, b"short=1\nlonger=2\n");
+      aligned.options.push(String::from("align_entries=true"));
+      let overridden = observe(&environment, drive(taplo.execute_format(aligned)));
+      Ok::<_, Box<CliError>>((taplo, formatted, accepted, mismatch, overridden))
+    })();
+    ensure_that(
+      observed,
+      "stdin formatting must preserve exact output, silent check success, typed mismatch, and command-line overrides",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        actual.1.result.is_ok()
+          && actual.1.stdout == b"value = 1\n"
+          && actual.2.result.is_ok()
+          && actual.2.stdout.is_empty()
+          && matches!(&actual.3.result, Err(CliError::Failure(CliFailure::FormattingMismatch)))
+          && actual.4.result.is_ok()
+          && actual.4.stdout == b"short  = 1\nlonger = 2\n"
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn stdin_formatting_reports_malformed_input_and_supports_explicit_force() -> Result<(), TestFailure> {
-    let (environment, mut taplo) = initialized_cli()?;
-    let blocked = format_failure(
-      &mut taplo,
-      stdin_format_command(&environment, b"value =\n"),
-      "malformed standard-input formatting must return a typed failure",
-    )?;
-    ensure(
-      matches!(blocked, CliError::Failure(CliFailure::FormattingBlocked)),
-      "malformed standard input must be blocked by default",
-    )?;
-    ensure_contains(
-      &stderr_text(&environment)?,
-      "invalid TOML",
-      "blocked formatting must emit the parser diagnostic",
-    )?;
-    ensure(
-      environment.stdout().is_empty(),
-      "blocked formatting must not emit a partial document",
-    )?;
-
-    environment.clear_output();
-    let mut forced = stdin_format_command(&environment, b"value =\n");
-    forced.input.force = true;
-    ensure_ok(
-      drive(taplo.execute_format(forced)),
-      "explicit force must format around recoverable syntax diagnostics",
-    )?;
-    ensure_eq(
-      &stdout_text(&environment)?.as_str(),
-      &"value =\n",
-      "forced formatting must preserve the malformed source span",
-    )?;
-    ensure_contains(
-      &stderr_text(&environment)?,
-      "invalid TOML",
-      "forced formatting must still report the syntax diagnostic",
+  fn stdin_formatting_reports_malformed_input_and_supports_explicit_force() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let (environment, mut taplo) = initialized_cli()?;
+      let blocked = observe(
+        &environment,
+        drive(taplo.execute_format(stdin_format_command(&environment, b"value =\n"))),
+      );
+      environment.clear_output();
+      let mut forced = stdin_format_command(&environment, b"value =\n");
+      forced.input.force = true;
+      let accepted = observe(&environment, drive(taplo.execute_format(forced)));
+      Ok::<_, Box<CliError>>((taplo, blocked, accepted))
+    })();
+    ensure_that(
+      observed,
+      "malformed stdin must be blocked by default and explicit force must preserve both its source span and diagnostic",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        matches!(&actual.1.result, Err(CliError::Failure(CliFailure::FormattingBlocked)))
+          && actual.1.stdout.is_empty()
+          && diagnostic_contains(&actual.1, "invalid TOML")
+          && actual.2.result.is_ok()
+          && actual.2.stdout == b"value =\n"
+          && diagnostic_contains(&actual.2, "invalid TOML")
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn file_formatting_updates_only_changed_files_and_check_diff_never_writes() -> Result<(), TestFailure> {
-    let (environment, mut taplo) = initialized_cli()?;
-    environment.insert_file("/workspace/changed.toml", b"value=1\n".to_vec());
-    environment.insert_file("/workspace/stable.toml", b"stable = true\n".to_vec());
-    ensure_ok(
-      drive(taplo.execute_format(format_command(Vec::from([String::from("*.toml")])))),
-      "file formatting must process selected deterministic files",
-    )?;
-    ensure(
-      ensure_ok(
+  fn file_formatting_updates_only_changed_files_and_check_diff_never_writes() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let (environment, mut taplo) = initialized_cli()?;
+      let (check_environment, mut check_taplo) = initialized_cli()?;
+      environment.insert_file("/workspace/changed.toml", b"value=1\n".to_vec());
+      environment.insert_file("/workspace/stable.toml", b"stable = true\n".to_vec());
+      let formatted = observe(
+        &environment,
+        drive(taplo.execute_format(format_command(Vec::from([String::from("*.toml")])))),
+      );
+      let files = [
         environment.read_file(Path::new("/workspace/changed.toml")),
-        "the changed file must remain readable",
-      )? == b"value = 1\n",
-      "file formatting must persist the normalized changed document",
-    )?;
-    ensure(
-      ensure_ok(
         environment.read_file(Path::new("/workspace/stable.toml")),
-        "the stable file must remain readable",
-      )? == b"stable = true\n",
-      "file formatting must leave an already formatted document unchanged",
-    )?;
-    ensure(
-      environment.writes() == [PathBuf::from("/workspace/changed.toml")],
-      "only changed files must be written",
-    )?;
-
-    let (check_environment, mut check_taplo) = initialized_cli()?;
-    check_environment.insert_file("/workspace/input.toml", b"value=1\n".to_vec());
-    let mut check = format_command(Vec::from([String::from("input.toml")]));
-    check.output.check = true;
-    check.output.diff = true;
-    let result = drive(check_taplo.execute_format(check));
-    ensure(
-      matches!(result, Err(CliError::Failure(CliFailure::FileFormattingFailed))),
-      "check mode must aggregate an unformatted-file failure",
-    )?;
-    ensure(
-      check_environment.writes().is_empty(),
-      "check-plus-diff mode must never modify the input file",
-    )?;
-    let diff = stdout_text(&check_environment)?;
-    ensure_contains(&diff, "diff a/", "diff mode must emit the selected file header")?;
-    ensure_contains(&diff, "-value=1", "diff mode must retain the removed source line")?;
-    ensure_contains(&diff, "+value = 1", "diff mode must retain the inserted formatted line")
+      ];
+      check_environment.insert_file("/workspace/input.toml", b"value=1\n".to_vec());
+      let mut check = format_command(Vec::from([String::from("input.toml")]));
+      check.output.check = true;
+      check.output.diff = true;
+      let checked = observe(&check_environment, drive(check_taplo.execute_format(check)));
+      Ok::<_, Box<CliError>>((taplo, check_taplo, formatted, files, checked))
+    })();
+    ensure_that(
+      observed,
+      "file formatting must write only changed documents and check-plus-diff must retain edits without writing",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        let [ref changed, ref stable] = actual.3;
+        actual.2.result.is_ok()
+          && changed.as_ref().is_ok_and(|bytes| bytes == b"value = 1\n")
+          && stable.as_ref().is_ok_and(|bytes| bytes == b"stable = true\n")
+          && actual.2.writes == [PathBuf::from("/workspace/changed.toml")]
+          && matches!(&actual.4.result, Err(CliError::Failure(CliFailure::FileFormattingFailed)))
+          && actual.4.writes.is_empty()
+          && from_utf8(&actual.4.stdout).is_ok_and(|diff| ["diff a/", "-value=1", "+value = 1"].iter().all(|part| diff.contains(part)))
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn file_formatting_aggregates_malformed_inputs_and_force_preserves_diagnostics() -> Result<(), TestFailure> {
-    let (environment, mut taplo) = initialized_cli()?;
-    environment.insert_file("/workspace/broken.toml", b"value=\n".to_vec());
-    environment.insert_file("/workspace/changed.toml", b"changed=1\n".to_vec());
-    let mut command = format_command(Vec::from([String::from("*.toml")]));
-    command.stdin_filepath = Some(String::from("/ignored/stdin.toml"));
-    let aggregate_failure = format_failure(
-      &mut taplo,
-      command,
-      "malformed file formatting must return the aggregate typed failure",
-    )?;
-    ensure(
-      matches!(aggregate_failure, CliError::Failure(CliFailure::FileFormattingFailed)),
-      "one malformed file must fail the aggregate command without aborting later files",
-    )?;
-    ensure(
-      ensure_ok(
+  fn file_formatting_aggregates_malformed_inputs_and_force_preserves_diagnostics() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let (environment, mut taplo) = initialized_cli()?;
+      let (forced_environment, mut forced_taplo) = initialized_cli()?;
+      environment.insert_file("/workspace/broken.toml", b"value=\n".to_vec());
+      environment.insert_file("/workspace/changed.toml", b"changed=1\n".to_vec());
+      let mut command = format_command(Vec::from([String::from("*.toml")]));
+      command.stdin_filepath = Some(String::from("/ignored/stdin.toml"));
+      let blocked = observe(&environment, drive(taplo.execute_format(command)));
+      let files = [
         environment.read_file(Path::new("/workspace/broken.toml")),
-        "the blocked malformed file must remain readable",
-      )? == b"value=\n",
-      "default file formatting must leave malformed input unchanged",
-    )?;
-    ensure(
-      ensure_ok(
         environment.read_file(Path::new("/workspace/changed.toml")),
-        "the valid sibling file must remain readable",
-      )? == b"changed = 1\n",
-      "aggregate failure must not prevent a later valid file from being formatted",
-    )?;
-    let diagnostics = stderr_text(&environment)?;
-    ensure_contains(
-      &diagnostics,
-      "/workspace/broken.toml",
-      "file diagnostics must identify the real selected path",
-    )?;
-    ensure_lacks(
-      &diagnostics,
-      "/ignored/stdin.toml",
-      "a standard-input identity must not replace file diagnostic paths",
-    )?;
-
-    let (forced_environment, mut forced_taplo) = initialized_cli()?;
-    forced_environment.insert_file("/workspace/broken.toml", b"value=\n".to_vec());
-    let mut forced = format_command(Vec::from([String::from("broken.toml")]));
-    forced.input.force = true;
-    ensure_ok(
-      drive(forced_taplo.execute_format(forced)),
-      "explicit force must format a file around recoverable syntax diagnostics",
-    )?;
-    ensure(
-      ensure_ok(
-        forced_environment.read_file(Path::new("/workspace/broken.toml")),
-        "the forced malformed file must remain readable",
-      )? == b"value=\n",
-      "forced file formatting must preserve a source consisting entirely of the retained error span",
-    )?;
-    ensure(
-      forced_environment.writes().is_empty(),
-      "forced formatting must not rewrite a malformed file when its recoverable output is unchanged",
-    )?;
-    ensure_contains(
-      &stderr_text(&forced_environment)?,
-      "invalid TOML",
-      "forced file formatting must still report its syntax diagnostic",
+      ];
+      forced_environment.insert_file("/workspace/broken.toml", b"value=\n".to_vec());
+      let mut forced_command = format_command(Vec::from([String::from("broken.toml")]));
+      forced_command.input.force = true;
+      let forced = observe(&forced_environment, drive(forced_taplo.execute_format(forced_command)));
+      let preserved = forced_environment.read_file(Path::new("/workspace/broken.toml"));
+      Ok::<_, Box<CliError>>((taplo, forced_taplo, blocked, files, forced, preserved))
+    })();
+    ensure_that(
+      observed,
+      "file formatting must preserve malformed sources, format valid siblings, and retain source-specific diagnostics under force",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        let [ref broken, ref changed] = actual.3;
+        matches!(&actual.2.result, Err(CliError::Failure(CliFailure::FileFormattingFailed)))
+          && broken.as_ref().is_ok_and(|bytes| bytes == b"value=\n")
+          && changed.as_ref().is_ok_and(|bytes| bytes == b"changed = 1\n")
+          && diagnostic_contains(&actual.2, "/workspace/broken.toml")
+          && !diagnostic_contains(&actual.2, "/ignored/stdin.toml")
+          && actual.4.result.is_ok()
+          && actual.4.writes.is_empty()
+          && diagnostic_contains(&actual.4, "invalid TOML")
+          && actual.5.as_ref().is_ok_and(|bytes| bytes == b"value=\n")
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn formatting_validates_input_identity_options_and_host_failures() -> Result<(), TestFailure> {
-    let (environment, mut taplo) = initialized_cli()?;
-    let mut relative = stdin_format_command(&environment, b"value =\n");
-    relative.stdin_filepath = Some(String::from("nested/input.toml"));
-    let relative_failure = format_failure(
-      &mut taplo,
-      relative,
-      "malformed relative standard input must return a typed failure",
-    )?;
-    ensure(
-      matches!(relative_failure, CliError::Failure(CliFailure::FormattingBlocked)),
-      "a malformed standard-input document with a relative identity must remain blocked",
-    )?;
-    ensure_contains(
-      &stderr_text(&environment)?,
-      "/workspace/nested/input.toml",
-      "a relative standard-input identity must resolve against the current working directory",
-    )?;
+  fn formatting_validates_input_identity_options_and_host_failures() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let (environment, mut taplo) = initialized_cli()?;
+      let (missing_environment, mut missing_taplo) = initialized_cli()?;
+      let (output_environment, mut output_taplo) = initialized_cli()?;
+      let identities = ["nested/input.toml", "/virtual/input.toml"].map(|path| {
+        environment.clear_output();
+        let mut command = stdin_format_command(&environment, b"value =\n");
+        command.stdin_filepath = Some(path.to_owned());
+        observe(&environment, drive(taplo.execute_format(command)))
+      });
+      missing_environment.set_cwd(None);
+      let mut relative = stdin_format_command(&missing_environment, b"value = 1\n");
+      relative.stdin_filepath = Some(String::from("relative.toml"));
+      let unresolved = observe(&missing_environment, drive(missing_taplo.execute_format(relative)));
+      let options = ["not-an-assignment", "align_entries=not-a-bool"].map(|option| {
+        let mut command = stdin_format_command(&environment, b"value=1\n");
+        command.options.push(option.to_owned());
+        observe(&environment, drive(taplo.execute_format(command)))
+      });
+      let no_cwd = observe(
+        &missing_environment,
+        drive(missing_taplo.execute_format(format_command(Vec::new()))),
+      );
+      let command = stdin_format_command(&output_environment, b"value=1\n");
+      output_environment.set_stdout_failure(true);
+      let output_failure = observe(&output_environment, drive(output_taplo.execute_format(command)));
+      Ok::<_, Box<CliError>>((
+        taplo, missing_taplo, output_taplo, identities, unresolved, options, no_cwd, output_failure,
+      ))
+    })();
+    ensure_that(observed, "formatting must retain input identities, typed option failures, required cwd, and output I/O failures", |result| {
+      let Ok(ref actual) = *result else { return false; };
+        let [ref relative, ref absolute] = actual.3;
+        let [ref option, ref value] = actual.5;
+        actual.3.iter().all(|command| matches!(&command.result, Err(CliError::Failure(CliFailure::FormattingBlocked))))
+          && diagnostic_contains(relative, "/workspace/nested/input.toml") && diagnostic_contains(absolute, "/virtual/input.toml") && !diagnostic_contains(absolute, "/workspace/virtual/input.toml")
+          && [&actual.4, &actual.6].iter().all(|command| matches!(&command.result, Err(CliError::Failure(CliFailure::WorkingDirectoryRequired))))
+          && matches!(&option.result, Err(CliError::FormatOption(OptionParseError::InvalidOption(input))) if input == "not-an-assignment")
+          && matches!(&value.result, Err(CliError::FormatOption(OptionParseError::InvalidValue { key, input, expected, .. })) if key == "align_entries" && input == "not-a-bool" && *expected == "bool")
+          && matches!(&actual.7.result, Err(CliError::Io(error)) if error.kind() == ErrorKind::PermissionDenied)
 
-    environment.clear_output();
-    let mut absolute = stdin_format_command(&environment, b"value =\n");
-    absolute.stdin_filepath = Some(String::from("/virtual/input.toml"));
-    let absolute_failure = format_failure(
-      &mut taplo,
-      absolute,
-      "malformed absolute standard input must return a typed failure",
-    )?;
-    ensure(
-      matches!(absolute_failure, CliError::Failure(CliFailure::FormattingBlocked)),
-      "a malformed standard-input document with an absolute identity must remain blocked",
-    )?;
-    ensure_contains(
-      &stderr_text(&environment)?,
-      "/virtual/input.toml",
-      "an absolute standard-input identity must be preserved in diagnostics",
-    )?;
-    ensure_lacks(
-      &stderr_text(&environment)?,
-      "/workspace/virtual/input.toml",
-      "an absolute standard-input identity must not be joined to the current working directory",
-    )?;
+    }).map(drop).map_err(Box::new)
+  }
 
-    let (missing_cwd, mut missing_cwd_taplo) = initialized_cli()?;
-    missing_cwd.set_cwd(None);
-    let mut unresolved = stdin_format_command(&missing_cwd, b"value = 1\n");
-    unresolved.stdin_filepath = Some(String::from("relative.toml"));
-    let unresolved_failure = format_failure(
-      &mut missing_cwd_taplo,
-      unresolved,
-      "an unresolved standard-input identity must return a typed failure",
-    )?;
-    ensure(
-      matches!(unresolved_failure, CliError::Failure(CliFailure::WorkingDirectoryRequired)),
-      "a relative standard-input identity must fail when no working directory can resolve it",
-    )?;
+  #[test]
+  fn queries_render_value_json_and_toml_contracts() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let (environment, taplo) = initialized_cli()?;
+      let source = b"name = \"taplo\"\nvalues = [1, 2]\n[table]\nkey = \"value\"\n";
+      let scalar = get_output(&environment, &taplo, source, get_command(Some("name")));
+      let mut array_command = get_command(Some("values"));
+      array_command.separator = Some(String::from(","));
+      let array = get_output(&environment, &taplo, source, array_command);
+      let mut json_command = formatted_get_command(Some("table"), OutputFormat::Json);
+      json_command.strip_newline = true;
+      let json = get_output(&environment, &taplo, source, json_command);
+      let decoded = serde_json::from_slice::<serde_json::Value>(&json.stdout);
+      let toml = get_output(
+        &environment,
+        &taplo,
+        source,
+        formatted_get_command(Some("table"), OutputFormat::Toml),
+      );
+      Ok::<_, Box<CliError>>((taplo, scalar, array, json, decoded, toml))
+    })();
+    ensure_that(
+      observed,
+      "value, JSON, and TOML queries must preserve scalar, array-order, and complete-table output contracts",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        actual.1.result.is_ok()
+          && actual.1.stdout == b"taplo\n"
+          && actual.2.result.is_ok()
+          && actual.2.stdout == b"1,2\n"
+          && actual.3.result.is_ok()
+          && actual.4.as_ref().is_ok_and(|json| json == &serde_json::json!({"key": "value"}))
+          && actual.5.result.is_ok()
+          && actual.5.stdout == b"key = \"value\"\n"
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
+  }
 
-    let mut reject_option = |option: &str, context: &'static str| {
-      let mut command = stdin_format_command(&environment, b"value=1\n");
-      command.options.push(option.to_owned());
-      format_failure(&mut taplo, command, context)
-    };
-    let option_failure = reject_option("not-an-assignment", "an invalid formatter-option shape must return a typed failure")?;
-    let value_failure = reject_option(
-      "align_entries=not-a-bool",
-      "an invalid formatter-option value must return a typed failure",
-    )?;
-    let option_observation = match option_failure {
-      CliError::FormatOption(taplo::formatter::OptionParseError::InvalidOption(option)) => Some(option),
-      _ => None,
-    };
-    let value_observation = match value_failure {
-      CliError::FormatOption(taplo::formatter::OptionParseError::InvalidValue {
-        key,
-        input,
-        expected,
-        ..
-      }) => Some((key, input, expected)),
-      _ => None,
-    };
-    ensure(
-      (option_observation, value_observation)
-        == (
-          Some(String::from("not-an-assignment")),
-          Some((String::from("align_entries"), String::from("not-a-bool"), "bool")),
+  #[test]
+  fn queries_render_whole_documents_multi_matches_and_scalar_families() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let (environment, taplo) = initialized_cli()?;
+      let source = b"item_a = 1\nitem_b = 2\nother = 3\n";
+      let whole = get_output(&environment, &taplo, source, formatted_get_command(None, OutputFormat::Json));
+      let whole_json = serde_json::from_slice::<serde_json::Value>(&whole.stdout);
+      let multi = get_output(
+        &environment,
+        &taplo,
+        source,
+        formatted_get_command(Some("item_*"), OutputFormat::Json),
+      );
+      let multi_json = serde_json::from_slice::<serde_json::Value>(&multi.stdout);
+      let toml = get_output(
+        &environment,
+        &taplo,
+        source,
+        formatted_get_command(Some("item_*"), OutputFormat::Toml),
+      );
+      let scalars = [
+        (".enabled", "true\n"),
+        ("ratio", "1.5\n"),
+        ("timestamp", "1979-05-27T07:32:00Z\n"),
+      ]
+      .map(|(pattern, expected)| {
+        (
+          get_output(
+            &environment,
+            &taplo,
+            b"enabled = true\nratio = 1.5\ntimestamp = 1979-05-27T07:32:00Z\n",
+            get_command(Some(pattern)),
+          ),
+          expected,
+        )
+      });
+      let mut strip = formatted_get_command(None, OutputFormat::Toml);
+      strip.strip_newline = true;
+      let stripped = get_output(&environment, &taplo, b"value = 1\n", strip);
+      Ok::<_, Box<CliError>>((taplo, whole, whole_json, multi, multi_json, toml, scalars, stripped))
+    })();
+    ensure_that(
+      observed,
+      "whole-document and multi-match queries must retain envelopes, scalar families, order, and newline policy",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        actual.1.result.is_ok()
+          && actual.1.stdout.ends_with(b"\n")
+          && actual
+            .2
+            .as_ref()
+            .is_ok_and(|json| json == &serde_json::json!({"item_a": 1, "item_b": 2, "other": 3}))
+          && actual.3.result.is_ok()
+          && actual.4.as_ref().is_ok_and(|json| json == &serde_json::json!([1, 2]))
+          && actual.5.result.is_ok()
+          && actual.5.stdout == b"[\n  1,\n  2,\n]\n"
+          && actual
+            .6
+            .iter()
+            .all(|entry| entry.0.result.is_ok() && entry.0.stdout == entry.1.as_bytes())
+          && actual.7.result.is_ok()
+          && actual.7.stdout == b"value = 1"
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
+  }
+
+  #[test]
+  fn queries_reject_incompatible_missing_table_and_invalid_documents() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let (environment, taplo) = initialized_cli()?;
+      let mut separator_command = formatted_get_command(Some("value"), OutputFormat::Json);
+      separator_command.separator = Some(String::from(","));
+      let separator = get_output(&environment, &taplo, b"value = 1\n", separator_command);
+      let cases = [
+        ("value = 1\n", Some("missing"), CliFailure::NoQueryMatches, None),
+        ("[table]\nvalue = 1\n", Some("table"), CliFailure::TableValueOutput, None),
+        ("value = 1\n", None, CliFailure::TableValueOutput, None),
+        ("value =\n", Some("value"), CliFailure::SyntaxErrors, Some("invalid TOML")),
+        (
+          "value = 1\nvalue = 2\n",
+          Some("value"),
+          CliFailure::SemanticErrors,
+          Some("conflicting keys"),
         ),
-      "formatter option failures must distinguish malformed assignments from invalid typed values",
-    )?;
-
-    let (missing_cwd, mut missing_cwd_taplo) = initialized_cli()?;
-    missing_cwd.set_cwd(None);
-    let cwd_failure = format_failure(
-      &mut missing_cwd_taplo,
-      format_command(Vec::new()),
-      "file formatting without a current directory must return a typed failure",
-    )?;
-    ensure(
-      matches!(cwd_failure, CliError::Failure(CliFailure::WorkingDirectoryRequired)),
-      "file formatting must require a current working directory",
-    )?;
-
-    let (output_failure, mut output_taplo) = initialized_cli()?;
-    let output_command = stdin_format_command(&output_failure, b"value=1\n");
-    output_failure.set_stdout_failure(true);
-    let stream_failure = format_failure(
-      &mut output_taplo,
-      output_command,
-      "formatter output failure must cross the CLI boundary",
-    )?;
-    ensure(
-      matches!(
-        stream_failure,
-        CliError::Io(error) if error.kind() == std::io::ErrorKind::PermissionDenied
-      ),
-      "formatted standard output must propagate its typed stream failure",
+      ]
+      .map(|(source, pattern, expected, diagnostic)| {
+        (
+          get_output(&environment, &taplo, source.as_bytes(), get_command(pattern)),
+          expected,
+          diagnostic,
+        )
+      });
+      Ok::<_, Box<CliError>>((taplo, separator, cases))
+    })();
+    ensure_that(
+      observed,
+      "queries must retain distinct separator, absence, table, syntax, and semantic failures with required diagnostics",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        matches!(&actual.1.result, Err(CliError::Failure(CliFailure::InvalidSeparator)))
+          && actual.2.iter().all(|case| {
+            matches!(&case.0.result, Err(CliError::Failure(failure)) if *failure == case.1)
+              && case.2.is_none_or(|text| diagnostic_contains(&case.0, text))
+          })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn queries_render_value_json_and_toml_contracts() -> Result<(), TestFailure> {
-    let (environment, taplo) = initialized_cli()?;
-    let source = b"name = \"taplo\"\nvalues = [1, 2]\n[table]\nkey = \"value\"\n".to_vec();
-
-    environment.set_stdin(source.clone());
-    ensure_ok(
-      drive(taplo.execute_get(get_command(Some("name")))),
-      "scalar value queries must succeed",
-    )?;
-    ensure_eq(
-      &stdout_text(&environment)?.as_str(),
-      &"taplo\n",
-      "scalar value queries must strip TOML quoting",
-    )?;
-
-    environment.clear_output();
-    environment.set_stdin(source.clone());
-    let mut array_query = get_command(Some("values"));
-    array_query.separator = Some(String::from(","));
-    ensure_ok(
-      drive(taplo.execute_get(array_query)),
-      "array value queries must support an explicit separator",
-    )?;
-    ensure_eq(
-      &stdout_text(&environment)?.as_str(),
-      &"1,2\n",
-      "array values must retain order and separator policy",
-    )?;
-
-    environment.clear_output();
-    environment.set_stdin(source.clone());
-    let mut json_query = get_command(Some("table"));
-    json_query.output_format = OutputFormat::Json;
-    json_query.strip_newline = true;
-    ensure_ok(drive(taplo.execute_get(json_query)), "JSON table queries must succeed")?;
-    let json = ensure_ok(
-      serde_json::from_slice::<serde_json::Value>(&environment.stdout()),
-      "JSON query output must be valid JSON",
-    )?;
-    ensure_eq(
-      &json,
-      &serde_json::json!({"key": "value"}),
-      "JSON query output must preserve the selected table",
-    )?;
-
-    ensure_get_output(
-      &environment,
-      &taplo,
-      &source,
-      formatted_get_command(Some("table"), OutputFormat::Toml),
-      "key = \"value\"\n",
-      "TOML table queries must succeed",
-      "TOML query output must emit the complete selected table",
+  fn queries_read_files_strip_newlines_and_propagate_output_failures() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let (environment, taplo) = initialized_cli()?;
+      environment.insert_file("/workspace/query.toml", b"value = \"file\"\n".to_vec());
+      let mut command = get_command(Some("value"));
+      command.file_path = Some(PathBuf::from("/workspace/query.toml"));
+      command.strip_newline = true;
+      let file = observe(&environment, drive(taplo.execute_get(command)));
+      environment.set_stdout_failure(true);
+      let rejected = get_output(&environment, &taplo, b"value = 1\n", get_command(Some("value")));
+      Ok::<_, Box<CliError>>((taplo, file, rejected))
+    })();
+    ensure_that(
+      observed,
+      "file queries must honor newline stripping and propagate output failures without fabricating syntax diagnostics",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        actual.1.result.is_ok()
+          && actual.1.stdout == b"file"
+          && matches!(&actual.2.result, Err(CliError::Io(error)) if error.kind() == ErrorKind::PermissionDenied)
+          && !diagnostic_contains(&actual.2, "invalid TOML")
+      },
     )
-  }
-
-  #[test]
-  fn queries_render_whole_documents_multi_matches_and_scalar_families() -> Result<(), TestFailure> {
-    let (environment, taplo) = initialized_cli()?;
-    let source = b"item_a = 1\nitem_b = 2\nother = 3\n".to_vec();
-
-    environment.set_stdin(source.clone());
-    let mut whole_json = get_command(None);
-    whole_json.output_format = OutputFormat::Json;
-    ensure_ok(drive(taplo.execute_get(whole_json)), "whole-document JSON output must succeed")?;
-    let whole_json_output = stdout_text(&environment)?;
-    ensure(
-      whole_json_output.ends_with('\n'),
-      "whole-document JSON output must retain the default trailing newline",
-    )?;
-    ensure_eq(
-      &ensure_ok(
-        serde_json::from_str::<serde_json::Value>(&whole_json_output),
-        "whole-document JSON output must decode",
-      )?,
-      &serde_json::json!({
-        "item_a": 1,
-        "item_b": 2,
-        "other": 3
-      }),
-      "whole-document JSON output must preserve every root entry",
-    )?;
-
-    environment.clear_output();
-    environment.set_stdin(source.clone());
-    let mut multi_json = get_command(Some("item_*"));
-    multi_json.output_format = OutputFormat::Json;
-    ensure_ok(drive(taplo.execute_get(multi_json)), "multi-match JSON output must succeed")?;
-    ensure_eq(
-      &ensure_ok(
-        serde_json::from_slice::<serde_json::Value>(&environment.stdout()),
-        "multi-match JSON output must decode",
-      )?,
-      &serde_json::json!([1, 2]),
-      "multi-match JSON output must use an ordered list envelope",
-    )?;
-
-    ensure_get_output(
-      &environment,
-      &taplo,
-      &source,
-      formatted_get_command(Some("item_*"), OutputFormat::Toml),
-      "[\n  1,\n  2,\n]\n",
-      "multi-match TOML output must succeed",
-      "multi-match TOML output must retain its ordered list envelope and trailing newline",
-    )?;
-
-    for (pattern, expected, context) in [
-      (
-        ".enabled",
-        "true\n",
-        "leading-dot Boolean queries must normalize and render their scalar value",
-      ),
-      ("ratio", "1.5\n", "floating-point queries must render their canonical scalar value"),
-      (
-        "timestamp",
-        "1979-05-27T07:32:00Z\n",
-        "date-time queries must render their semantic scalar value",
-      ),
-    ] {
-      environment.clear_output();
-      environment.set_stdin(b"enabled = true\nratio = 1.5\ntimestamp = 1979-05-27T07:32:00Z\n".to_vec());
-      ensure_ok(drive(taplo.execute_get(get_command(Some(pattern)))), context)?;
-      ensure_eq(&stdout_text(&environment)?.as_str(), &expected, context)?;
-    }
-
-    environment.clear_output();
-    environment.set_stdin(b"value = 1\n".to_vec());
-    let mut whole_toml = get_command(None);
-    whole_toml.output_format = OutputFormat::Toml;
-    whole_toml.strip_newline = true;
-    ensure_ok(
-      drive(taplo.execute_get(whole_toml)),
-      "whole-document TOML output must support newline stripping",
-    )?;
-    ensure_eq(
-      &stdout_text(&environment)?.as_str(),
-      &"value = 1",
-      "whole-document TOML output must remove only its trailing newline",
-    )
-  }
-
-  #[test]
-  fn queries_reject_incompatible_missing_table_and_invalid_documents() -> Result<(), TestFailure> {
-    let (environment, taplo) = initialized_cli()?;
-    environment.set_stdin(b"value = 1\n".to_vec());
-    let mut invalid_separator = get_command(Some("value"));
-    invalid_separator.output_format = OutputFormat::Json;
-    invalid_separator.separator = Some(String::from(","));
-    ensure(
-      matches!(
-        drive(taplo.execute_get(invalid_separator)),
-        Err(CliError::Failure(CliFailure::InvalidSeparator))
-      ),
-      "a separator must be rejected for non-value output",
-    )?;
-
-    for (source, pattern, expected, context) in [
-      (
-        "value = 1\n",
-        "missing",
-        CliFailure::NoQueryMatches,
-        "a query with no matches must retain its typed command failure",
-      ),
-      (
-        "[table]\nvalue = 1\n",
-        "table",
-        CliFailure::TableValueOutput,
-        "value output must reject table nodes",
-      ),
-    ] {
-      environment.set_stdin(source.as_bytes().to_vec());
-      ensure(
-        matches!(
-          drive(taplo.execute_get(get_command(Some(pattern)))),
-          Err(CliError::Failure(actual)) if actual == expected
-        ),
-        context,
-      )?;
-    }
-
-    environment.set_stdin(b"value = 1\n".to_vec());
-    ensure(
-      matches!(
-        drive(taplo.execute_get(get_command(None))),
-        Err(CliError::Failure(CliFailure::TableValueOutput))
-      ),
-      "whole-document value output must reject the root table rather than inventing a scalar representation",
-    )?;
-
-    for (source, expected, diagnostic, failure_context, diagnostic_context) in [
-      (
-        "value =\n",
-        CliFailure::SyntaxErrors,
-        "invalid TOML",
-        "queries must reject syntax-invalid input",
-        "syntax-invalid queries must emit diagnostics",
-      ),
-      (
-        "value = 1\nvalue = 2\n",
-        CliFailure::SemanticErrors,
-        "conflicting keys",
-        "queries must reject semantically conflicting input",
-        "semantic query failures must emit diagnostics",
-      ),
-    ] {
-      environment.clear_output();
-      environment.set_stdin(source.as_bytes().to_vec());
-      ensure(
-        matches!(
-          drive(taplo.execute_get(get_command(Some("value")))),
-          Err(CliError::Failure(actual)) if actual == expected
-        ),
-        failure_context,
-      )?;
-      ensure_contains(&stderr_text(&environment)?, diagnostic, diagnostic_context)?;
-    }
-    Ok(())
-  }
-
-  #[test]
-  fn queries_read_files_strip_newlines_and_propagate_output_failures() -> Result<(), TestFailure> {
-    let (environment, taplo) = initialized_cli()?;
-    environment.insert_file("/workspace/query.toml", b"value = \"file\"\n".to_vec());
-    let mut file_query = get_command(Some("value"));
-    file_query.file_path = Some(PathBuf::from("/workspace/query.toml"));
-    file_query.strip_newline = true;
-    ensure_ok(
-      drive(taplo.execute_get(file_query)),
-      "queries must read an explicitly selected file",
-    )?;
-    ensure_eq(
-      &stdout_text(&environment)?.as_str(),
-      &"file",
-      "strip-newline mode must omit the final line feed",
-    )?;
-
-    environment.clear_output();
-    environment.set_stdin(b"value = 1\n".to_vec());
-    environment.set_stdout_failure(true);
-    ensure(
-      matches!(
-        drive(taplo.execute_get(get_command(Some("value")))),
-        Err(CliError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied
-      ),
-      "query output must propagate its typed stream failure",
-    )?;
-    ensure_lacks(
-      &stderr_text(&environment)?,
-      "invalid TOML",
-      "a transport failure after a valid query must not fabricate diagnostics",
-    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[cfg(feature = "toml-test")]
   #[test]
-  fn toml_test_serializes_scalar_families_and_nested_containers() -> Result<(), TestFailure> {
-    let (environment, taplo) = initialized_cli()?;
-    environment.set_stdin(
-      br#"string = "value"
+  fn toml_test_serializes_scalar_families_and_nested_containers() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let (environment, taplo) = initialized_cli()?;
+      environment.set_stdin(
+        br#"string = "value"
 integer = 7
 float = 1.5
 boolean = true
@@ -1583,623 +1421,621 @@ local_date = 1979-05-27
 local_time = 07:32:00
 array = [1, "two"]
 "#
-      .to_vec(),
-    );
-    ensure_ok(drive(taplo.execute_toml_test()), "valid TOML-test input must serialize")?;
-    let output = ensure_ok(
-      serde_json::from_slice::<serde_json::Value>(&environment.stdout()),
-      "TOML-test output must be valid JSON",
-    )?;
-    ensure_eq(
-      ensure_some(output.pointer("/string/type"), "string type must be present")?,
-      &serde_json::json!("string"),
-      "strings must use the TOML-test string label",
-    )?;
-    ensure_eq(
-      ensure_some(output.pointer("/integer/value"), "integer value must be present")?,
-      &serde_json::json!("7"),
-      "integers must use their canonical textual value",
-    )?;
-    ensure_eq(
-      ensure_some(output.pointer("/offset/type"), "offset date-time type must be present")?,
-      &serde_json::json!("datetime"),
-      "offset date-times must use the TOML-test datetime label",
-    )?;
-    ensure_eq(
-      ensure_some(output.pointer("/local_datetime/type"), "local date-time type must be present")?,
-      &serde_json::json!("datetime-local"),
-      "local date-times must retain their distinct label",
-    )?;
-    ensure_eq(
-      ensure_some(output.pointer("/local_date/type"), "local date type must be present")?,
-      &serde_json::json!("date-local"),
-      "local dates must retain their distinct label",
-    )?;
-    ensure_eq(
-      ensure_some(output.pointer("/local_time/type"), "local time type must be present")?,
-      &serde_json::json!("time-local"),
-      "local times must retain their distinct label",
-    )?;
-    ensure_eq(
-      ensure_some(output.pointer("/array/1/value"), "nested array value must be present")?,
-      &serde_json::json!("two"),
-      "nested containers must recursively use the TOML-test envelope",
+        .to_vec(),
+      );
+      let command = observe(&environment, drive(taplo.execute_toml_test()));
+      let decoded = serde_json::from_slice::<serde_json::Value>(&command.stdout);
+      Ok::<_, Box<CliError>>((taplo, command, decoded))
+    })();
+    ensure_that(
+      observed,
+      "TOML-test output must preserve scalar labels, canonical values, and recursive container envelopes",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        actual.1.result.is_ok()
+          && actual.2.as_ref().is_ok_and(|json| {
+            [
+              ("/string/type", "string"),
+              ("/integer/value", "7"),
+              ("/offset/type", "datetime"),
+              ("/local_datetime/type", "datetime-local"),
+              ("/local_date/type", "date-local"),
+              ("/local_time/type", "time-local"),
+              ("/array/1/value", "two"),
+            ]
+            .iter()
+            .all(|&(pointer, expected)| json.pointer(pointer).and_then(serde_json::Value::as_str) == Some(expected))
+          })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[cfg(feature = "toml-test")]
   #[test]
-  fn toml_test_rejects_syntax_semantics_and_output_failures() -> Result<(), TestFailure> {
-    let (environment, taplo) = initialized_cli()?;
-    environment.set_stdin(b"value =\n".to_vec());
-    ensure(
-      matches!(
-        drive(taplo.execute_toml_test()),
-        Err(CliError::Failure(CliFailure::InvalidTomlTestInput))
-      ),
-      "TOML-test must reject syntax-invalid input",
-    )?;
-    ensure(
-      !environment.stderr().is_empty(),
-      "syntax-invalid TOML-test input must emit diagnostics",
-    )?;
-
-    environment.clear_output();
-    environment.set_stdin(b"value = 1\nvalue = 2\n".to_vec());
-    ensure(
-      matches!(
-        drive(taplo.execute_toml_test()),
-        Err(CliError::Failure(CliFailure::InvalidTomlTestInput))
-      ),
-      "TOML-test must reject semantically conflicting input",
-    )?;
-    ensure_contains(
-      &stderr_text(&environment)?,
-      "conflicting keys",
-      "semantic TOML-test failures must retain their diagnostic",
-    )?;
-
-    environment.clear_output();
-    environment.set_stdin(b"value = 1\n".to_vec());
-    environment.set_stdout_failure(true);
-    ensure(
-      matches!(
-        drive(taplo.execute_toml_test()),
-        Err(CliError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied
-      ),
-      "TOML-test output must propagate its typed stream failure",
+  fn toml_test_rejects_syntax_semantics_and_output_failures() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let (environment, taplo) = initialized_cli()?;
+      let invalid = [b"value =\n".as_slice(), b"value = 1\nvalue = 2\n".as_slice()].map(|source| {
+        environment.clear_output();
+        environment.set_stdin(source.to_vec());
+        observe(&environment, drive(taplo.execute_toml_test()))
+      });
+      environment.clear_output();
+      environment.set_stdin(b"value = 1\n".to_vec());
+      environment.set_stdout_failure(true);
+      let output = observe(&environment, drive(taplo.execute_toml_test()));
+      Ok::<_, Box<CliError>>((taplo, invalid, output))
+    })();
+    ensure_that(
+      observed,
+      "TOML-test must reject syntax and semantic failures with diagnostics and retain output I/O failures",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        let [ref syntax, ref semantic] = actual.1;
+        actual
+          .1
+          .iter()
+          .all(|command| matches!(&command.result, Err(CliError::Failure(CliFailure::InvalidTomlTestInput))))
+          && !syntax.stderr.is_empty()
+          && diagnostic_contains(semantic, "conflicting keys")
+          && matches!(&actual.2.result, Err(CliError::Io(error)) if error.kind() == ErrorKind::PermissionDenied)
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[cfg(feature = "lint")]
   #[test]
-  fn lint_accepts_clean_input_and_reports_syntax_and_semantic_failures() -> Result<(), TestFailure> {
-    let (environment, mut taplo) = initialized_cli()?;
-    environment.set_stdin(b"value = 1\n".to_vec());
-    ensure_ok(
-      drive(taplo.execute_lint(lint_command())),
-      "schema-disabled lint must accept clean standard input",
-    )?;
-    ensure(environment.stderr().is_empty(), "clean lint input must not emit diagnostics")?;
-
-    environment.set_stdin(b"value =\n".to_vec());
-    ensure(
-      matches!(
-        drive(taplo.execute_lint(lint_command())),
-        Err(CliError::Failure(CliFailure::SyntaxErrors))
-      ),
-      "lint must reject syntax-invalid input",
-    )?;
-    ensure_contains(
-      &stderr_text(&environment)?,
-      "invalid TOML",
-      "syntax-invalid lint input must emit parser diagnostics",
-    )?;
-
-    environment.clear_output();
-    environment.set_stdin(b"value = 1\nvalue = 2\n".to_vec());
-    ensure(
-      matches!(
-        drive(taplo.execute_lint(lint_command())),
-        Err(CliError::Failure(CliFailure::SemanticErrors))
-      ),
-      "lint must reject semantic conflicts",
-    )?;
-    ensure_contains(
-      &stderr_text(&environment)?,
-      "conflicting keys",
-      "semantic lint failures must emit structural diagnostics",
+  fn lint_accepts_clean_input_and_reports_syntax_and_semantic_failures() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let (environment, mut taplo) = initialized_cli()?;
+      let commands = [
+        b"value = 1\n".as_slice(),
+        b"value =\n".as_slice(),
+        b"value = 1\nvalue = 2\n".as_slice(),
+      ]
+      .map(|source| {
+        environment.clear_output();
+        environment.set_stdin(source.to_vec());
+        observe(&environment, drive(taplo.execute_lint(lint_command())))
+      });
+      Ok::<_, Box<CliError>>((taplo, commands))
+    })();
+    ensure_that(
+      observed,
+      "schema-disabled lint must accept clean input and retain distinct syntax and semantic diagnostics",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        let [ref clean, ref syntax, ref semantic] = actual.1;
+        clean.result.is_ok()
+          && clean.stderr.is_empty()
+          && matches!(&syntax.result, Err(CliError::Failure(CliFailure::SyntaxErrors)))
+          && diagnostic_contains(syntax, "invalid TOML")
+          && matches!(&semantic.result, Err(CliError::Failure(CliFailure::SemanticErrors)))
+          && diagnostic_contains(semantic, "conflicting keys")
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[cfg(feature = "lint")]
   #[test]
-  fn lint_validates_explicit_schema_and_aggregates_file_failures() -> Result<(), TestFailure> {
-    let (environment, mut taplo) = initialized_cli()?;
-    install_required_string_schema(&environment);
-    environment.set_stdin(b"name = 7\n".to_vec());
-    let mut schema_command = lint_command();
-    schema_command.no_schema = false;
-    schema_command.schema = Some(ensure_ok(
-      url::Url::parse("file:///workspace/schema.json"),
-      "the schema fixture URL must parse",
-    )?);
-    ensure(
-      matches!(
-        drive(taplo.execute_lint(schema_command.clone())),
-        Err(CliError::Failure(CliFailure::SchemaValidation))
-      ),
-      "an explicit schema must reject a mismatched document",
-    )?;
-    ensure(!environment.stderr().is_empty(), "schema validation failure must emit diagnostics")?;
-
-    environment.clear_output();
-    environment.set_stdin(b"name = \"taplo\"\n".to_vec());
-    ensure_ok(
-      drive(taplo.execute_lint(schema_command)),
-      "an explicit schema must accept a matching document",
-    )?;
-    ensure(
-      environment.stderr().is_empty(),
-      "successful schema validation must emit no diagnostics",
-    )?;
-
-    let (file_environment, mut file_taplo) = initialized_cli()?;
-    file_environment.insert_file("/workspace/invalid.toml", b"value =\n".to_vec());
-    let mut files = lint_command();
-    files.files = Vec::from([String::from("invalid.toml")]);
-    let result = drive(file_taplo.execute_lint(files));
-    ensure(
-      matches!(result, Err(CliError::Failure(CliFailure::FileValidationFailed))),
-      "file linting must aggregate individual validation failures",
-    )?;
-    ensure_contains(
-      &stderr_text(&file_environment)?,
-      "invalid TOML",
-      "invalid files must emit their source diagnostics",
+  fn lint_validates_explicit_schema_and_aggregates_file_failures() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let (environment, mut taplo) = initialized_cli()?;
+      let (file_environment, mut file_taplo) = initialized_cli()?;
+      let mut schema = lint_command();
+      schema.no_schema = false;
+      schema.schema = Some(fixture_url("file:///workspace/schema.json")?);
+      install_required_string_schema(&environment);
+      let checked = [b"name = 7\n".as_slice(), b"name = \"taplo\"\n".as_slice()].map(|source| {
+        environment.clear_output();
+        environment.set_stdin(source.to_vec());
+        observe(&environment, drive(taplo.execute_lint(schema.clone())))
+      });
+      file_environment.insert_file("/workspace/invalid.toml", b"value =\n".to_vec());
+      let mut files = lint_command();
+      files.files = Vec::from([String::from("invalid.toml")]);
+      let file = observe(&file_environment, drive(file_taplo.execute_lint(files)));
+      Ok::<_, Box<CliError>>((taplo, file_taplo, checked, file))
+    })();
+    ensure_that(
+      observed,
+      "explicit schema lint must preserve both validation polarities and aggregate file failures with source diagnostics",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        let [ref rejected, ref accepted] = actual.2;
+        matches!(&rejected.result, Err(CliError::Failure(CliFailure::SchemaValidation)))
+          && !rejected.stderr.is_empty()
+          && accepted.result.is_ok()
+          && accepted.stderr.is_empty()
+          && matches!(&actual.3.result, Err(CliError::Failure(CliFailure::FileValidationFailed)))
+          && diagnostic_contains(&actual.3, "invalid TOML")
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[cfg(feature = "lint")]
   #[test]
-  fn lint_file_mode_and_schema_configuration_preserve_host_and_policy_boundaries() -> Result<(), TestFailure> {
-    let (file_environment, mut file_taplo) = initialized_cli()?;
-    file_environment.insert_file("/workspace/valid.toml", b"value = 1\n".to_vec());
-    let mut valid_file = lint_command();
-    valid_file.files = Vec::from([String::from("valid.toml")]);
-    ensure_ok(
-      drive(file_taplo.execute_lint(valid_file)),
-      "file linting must accept a clean selected file",
-    )?;
-    ensure(
-      file_environment.stderr().is_empty(),
-      "successful file linting must not emit diagnostics",
-    )?;
-
-    let (missing_cwd, mut missing_cwd_taplo) = initialized_cli()?;
-    missing_cwd.set_cwd(None);
-    let mut unresolved_file = lint_command();
-    unresolved_file.files = Vec::from([String::from("relative.toml")]);
-    ensure(
-      matches!(
-        drive(missing_cwd_taplo.execute_lint(unresolved_file)),
-        Err(CliError::Failure(CliFailure::WorkingDirectoryRequired))
-      ),
-      "file linting must require a current directory for relative selection",
-    )?;
-
-    let (invalid_utf8, mut invalid_utf8_taplo) = initialized_cli()?;
-    invalid_utf8.insert_file("/workspace/non-utf8.toml", vec![0xff]);
-    let mut invalid_file = lint_command();
-    invalid_file.files = Vec::from([String::from("non-utf8.toml")]);
-    ensure(
-      matches!(
-        drive(invalid_utf8_taplo.execute_lint(invalid_file)),
-        Err(CliError::Failure(CliFailure::FileValidationFailed))
-      ),
-      "file linting must aggregate a selected file's typed UTF-8 failure",
-    )?;
-
-    let (disabled_environment, mut disabled_taplo) = initialized_cli()?;
-    install_required_string_schema(&disabled_environment);
-    disabled_environment.insert_file(
-      "/workspace/disabled-schema.toml",
-      b"[schema]\nenabled = false\npath = \"/workspace/schema.json\"\n".to_vec(),
-    );
-    disabled_environment.set_stdin(b"name = 7\n".to_vec());
-    let mut disabled_schema = lint_command();
-    disabled_schema.general = config_general(Some("/workspace/disabled-schema.toml"), true);
-    disabled_schema.no_schema = false;
-    ensure_ok(
-      drive(disabled_taplo.execute_lint(disabled_schema)),
-      "configuration-disabled schema validation must accept a document that its configured schema would reject",
-    )?;
-    ensure(
-      disabled_environment.stderr().is_empty(),
-      "configuration-disabled schema validation must not emit schema diagnostics",
-    )?;
-
-    let (catalog_environment, mut catalog_taplo) = initialized_cli()?;
-    install_required_string_schema(&catalog_environment);
-    catalog_environment.insert_file(
-      "/workspace/catalog.json",
-      br#"{"schemas":[{"title":"fixture","description":"","url":"file:///workspace/schema.json","urlHash":"","authors":[],"version":null,"patterns":[".*\\.toml$"]}]}"#.to_vec(),
-    );
-    catalog_environment.set_stdin(b"name = 7\n".to_vec());
-    let mut catalog_schema = lint_command();
-    catalog_schema.no_schema = false;
-    catalog_schema.schema_catalog = Vec::from([ensure_ok(
-      url::Url::parse("file:///workspace/catalog.json"),
-      "the file-backed schema catalog URL must parse",
-    )?]);
-    ensure(
-      matches!(
-        drive(catalog_taplo.execute_lint(catalog_schema.clone())),
-        Err(CliError::Failure(CliFailure::SchemaValidation))
-      ),
-      "a command-selected schema catalog must reject a mismatched document",
-    )?;
-    catalog_environment.clear_output();
-    catalog_environment.set_stdin(b"name = \"taplo\"\n".to_vec());
-    ensure_ok(
-      drive(catalog_taplo.execute_lint(catalog_schema)),
-      "a command-selected schema catalog must accept a matching document",
-    )?;
-    ensure(
-      catalog_environment.stderr().is_empty(),
-      "successful catalog-backed validation must not emit diagnostics",
+  fn lint_file_mode_and_schema_configuration_preserve_host_and_policy_boundaries() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let (file_environment, mut file_taplo) = initialized_cli()?;
+      let (missing_cwd, mut missing_taplo) = initialized_cli()?;
+      let (invalid_utf8, mut invalid_taplo) = initialized_cli()?;
+      let (disabled_environment, mut disabled_taplo) = initialized_cli()?;
+      let (catalog_environment, mut catalog_taplo) = initialized_cli()?;
+      let catalog_url = fixture_url("file:///workspace/catalog.json")?;
+      file_environment.insert_file("/workspace/valid.toml", b"value = 1\n".to_vec());
+      let mut valid_file = lint_command();
+      valid_file.files = Vec::from([String::from("valid.toml")]);
+      let valid = observe(&file_environment, drive(file_taplo.execute_lint(valid_file)));
+      missing_cwd.set_cwd(None);
+      let mut unresolved = lint_command();
+      unresolved.files = Vec::from([String::from("relative.toml")]);
+      let missing = observe(&missing_cwd, drive(missing_taplo.execute_lint(unresolved)));
+      invalid_utf8.insert_file("/workspace/non-utf8.toml", vec![0xff]);
+      let mut invalid_file = lint_command();
+      invalid_file.files = Vec::from([String::from("non-utf8.toml")]);
+      let invalid = observe(&invalid_utf8, drive(invalid_taplo.execute_lint(invalid_file)));
+      install_required_string_schema(&disabled_environment);
+      disabled_environment.insert_file(
+        "/workspace/disabled-schema.toml",
+        b"[schema]\nenabled = false\npath = \"/workspace/schema.json\"\n".to_vec(),
+      );
+      disabled_environment.set_stdin(b"name = 7\n".to_vec());
+      let mut disabled_command = lint_command();
+      disabled_command.general = config_general(Some("/workspace/disabled-schema.toml"), true);
+      disabled_command.no_schema = false;
+      let disabled = observe(&disabled_environment, drive(disabled_taplo.execute_lint(disabled_command)));
+      install_required_string_schema(&catalog_environment);
+      catalog_environment.insert_file("/workspace/catalog.json", br#"{"schemas":[{"title":"fixture","description":"","url":"file:///workspace/schema.json","urlHash":"","authors":[],"version":null,"patterns":[".*\\.toml$"]}]}"#.to_vec());
+      let mut catalog = lint_command();
+      catalog.no_schema = false;
+      catalog.schema_catalog = Vec::from([catalog_url]);
+      let catalogs = [b"name = 7\n".as_slice(), b"name = \"taplo\"\n".as_slice()].map(|source| {
+        catalog_environment.clear_output();
+        catalog_environment.set_stdin(source.to_vec());
+        observe(&catalog_environment, drive(catalog_taplo.execute_lint(catalog.clone())))
+      });
+      Ok::<_, Box<CliError>>((
+        (file_taplo, missing_taplo, invalid_taplo, disabled_taplo, catalog_taplo),
+        valid,
+        missing,
+        invalid,
+        disabled,
+        catalogs,
+      ))
+    })();
+    ensure_that(
+      observed,
+      "file lint, disabled schemas, and selected catalogs must preserve host and policy boundaries",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        let [ref catalog_rejected, ref catalog_accepted] = actual.5;
+        actual.1.result.is_ok()
+          && actual.1.stderr.is_empty()
+          && matches!(&actual.2.result, Err(CliError::Failure(CliFailure::WorkingDirectoryRequired)))
+          && matches!(&actual.3.result, Err(CliError::Failure(CliFailure::FileValidationFailed)))
+          && actual.4.result.is_ok()
+          && actual.4.stderr.is_empty()
+          && matches!(&catalog_rejected.result, Err(CliError::Failure(CliFailure::SchemaValidation)))
+          && catalog_accepted.result.is_ok()
+          && catalog_accepted.stderr.is_empty()
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn dispatcher_applies_all_color_policies() -> Result<(), TestFailure> {
-    let (environment, mut taplo) = initialized_cli()?;
-    let mut automatic = arguments(TaploCommand::Config {
-      cmd: ConfigCommand::Default,
-    });
-    automatic.colors = Colors::Auto;
-    ensure_ok(drive(taplo.execute_local(automatic)), "automatic color selection must execute")?;
-    ensure(!taplo.colors, "the deterministic non-terminal host must disable automatic colors")?;
-
-    environment.clear_output();
-    let mut always = arguments(TaploCommand::Config {
-      cmd: ConfigCommand::Default,
-    });
-    always.colors = Colors::Always;
-    ensure_ok(drive(taplo.execute_local(always)), "forced color selection must execute")?;
-    ensure(taplo.colors, "the always policy must enable colors")?;
-
-    environment.clear_output();
-    ensure_ok(
-      drive(taplo.execute_local(arguments(TaploCommand::Config {
-        cmd: ConfigCommand::Default,
-      }))),
-      "disabled color selection must execute",
-    )?;
-    ensure(!taplo.colors, "the never policy must disable colors")
+  fn dispatcher_applies_all_color_policies() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let (environment, mut taplo) = initialized_cli()?;
+      let commands = [Colors::Auto, Colors::Always, Colors::Never].map(|colors| {
+        environment.clear_output();
+        let mut command = arguments(TaploCommand::Config {
+          cmd: ConfigCommand::Default,
+        });
+        command.colors = colors;
+        (observe(&environment, drive(taplo.execute_local(command))), taplo.colors)
+      });
+      Ok::<_, Box<CliError>>((taplo, commands))
+    })();
+    ensure_that(
+      observed,
+      "the dispatcher must select automatic, always, and never color policies",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        actual.1.iter().all(|entry| entry.0.result.is_ok()) && actual.1.each_ref().map(|entry| entry.1) == [false, true, false]
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[cfg(feature = "completions")]
   #[test]
-  fn dispatcher_rejects_an_unknown_completion_shell() -> Result<(), TestFailure> {
-    let (_, mut taplo) = initialized_cli()?;
-    let result = drive(taplo.execute_local(arguments(TaploCommand::Completions {
-      shell: String::from("unknown-shell"),
-    })));
-    ensure(
-      matches!(result, Err(CliError::InvalidShell { shell, .. }) if shell == "unknown-shell"),
-      "completion dispatch must retain the rejected shell in its typed error",
+  fn dispatcher_rejects_an_unknown_completion_shell() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let (environment, mut taplo) = initialized_cli()?;
+      let command = observe(
+        &environment,
+        drive(taplo.execute_local(arguments(TaploCommand::Completions {
+          shell: String::from("unknown-shell"),
+        }))),
+      );
+      Ok::<_, Box<CliError>>((taplo, command))
+    })();
+    ensure_that(
+      observed,
+      "completion dispatch must retain its rejected shell in the typed error",
+      |result| {
+        result
+          .as_ref()
+          .is_ok_and(|actual| matches!(&actual.1.result, Err(CliError::InvalidShell { shell, .. }) if shell == "unknown-shell"))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[cfg(feature = "lsp")]
   #[test]
-  fn local_dispatcher_rejects_concurrent_command() -> Result<(), TestFailure> {
-    let environment = TestEnvironment::default();
-    let mut taplo = ensure_ok(Taplo::new(environment), "local CLI state must initialize")?;
-    let result = drive(taplo.execute_local(arguments(TaploCommand::Lsp {
-      cmd: stdio_lsp_command()
-    })));
-    ensure(
-      matches!(result, Err(CliError::Failure(CliFailure::ConcurrentEnvironmentRequired))),
-      "the local dispatcher must preserve the typed concurrent-capability boundary",
+  fn local_dispatcher_rejects_concurrent_command() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let (environment, mut taplo) = initialized_cli()?;
+      let command = observe(
+        &environment,
+        drive(taplo.execute_local(arguments(TaploCommand::Lsp {
+          cmd: stdio_lsp_command()
+        }))),
+      );
+      Ok::<_, Box<CliError>>((taplo, command))
+    })();
+    ensure_that(
+      observed,
+      "local dispatch must retain the concurrent-capability boundary",
+      |result| {
+        result
+          .as_ref()
+          .is_ok_and(|actual| matches!(&actual.1.result, Err(CliError::Failure(CliFailure::ConcurrentEnvironmentRequired))))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
+  /// Successful native checks returned by each phase of the bounded protocol transaction.
   #[cfg(feature = "lsp")]
-  #[test]
-  fn full_dispatcher_completes_a_bounded_protocol_transaction() -> Result<(), TestFailure> {
-    let (environment, mut taplo) = initialized_cli()?;
-    let bounded_client = BoundedLspClient {
-      input:    environment.interactive_stdin(),
-      output:   tokio::io::BufReader::new(environment.stdout_reader()),
-      observed: Vec::new(),
-    };
-    let runtime = ensure_ok(
-      tokio::runtime::Builder::new_current_thread().enable_all().build(),
-      "the native LSP transaction runtime must initialize",
-    )?;
+  type ProtocolChecks = (
+    (rpc::Message, Vec<serde_json::Value>),
+    Vec<serde_json::Value>,
+    Vec<serde_json::Value>,
+    (serde_json::Value, serde_json::Value),
+    Vec<serde_json::Value>,
+  );
 
-    runtime.block_on(async {
+  /// Native completion state of both peers; an unpolled completion remains absent on failure.
+  #[cfg(feature = "lsp")]
+  type ProtocolExecution = (Option<Result<(), CliError>>, Option<Result<ProtocolChecks, ClientFailure>>);
+
+  /// Reject ordinary work before initialization, then install deterministic schema configuration.
+  #[cfg(feature = "lsp")]
+  async fn initialize_protocol(
+    client: &mut BoundedLspClient,
+    document_uri: &str,
+    positioned: &serde_json::Value,
+  ) -> Result<(rpc::Message, Vec<serde_json::Value>), ClientFailure> {
+    client
+      .send_request(
+        -1,
+        "textDocument/hover",
+        Some(positioned.clone()),
+        "send the pre-initialization request",
+      )
+      .await?;
+    let rejected = ensure_that(
+      client.response(-1).await?,
+      "reject ordinary work before initialization without a success result",
+      |message| message.result.is_none() && message.error.as_ref() == Some(&rpc::RpcError::server_not_initialized()),
+    )
+    .map_err(Box::new)?;
+    let initialized = client
+      .request_selected(
+        0,
+        "initialize",
+        Some(serde_json::json!({"processId": null, "rootUri": null, "capabilities": {}, "workspaceFolders": []})),
+        "/capabilities/textDocumentSync",
+        "advertise full document synchronization",
+      )
+      .await?;
+    client
+      .notify(
+        "workspace/didChangeConfiguration",
+        Some(serde_json::json!({"settings": {"schema": {"catalogs": []}}})),
+        "push deterministic configuration",
+      )
+      .await?;
+    let schemas = client
+      .request_selected_where(
+        1,
+        "taplo/listSchemas",
+        Some(serde_json::json!({"documentUri": document_uri})),
+        "/schemas",
+        "observe a schema collection after pushed configuration",
+        json_array_contract,
+      )
+      .await?;
+    Ok((rejected, Vec::from([initialized, schemas])))
+  }
+
+  /// Open a real document and observe diagnostics, symbols, folding, and formatting at response
+  /// barriers.
+  #[cfg(feature = "lsp")]
+  async fn open_protocol_document(
+    client: &mut BoundedLspClient,
+    document_uri: &str,
+    document: &serde_json::Value,
+  ) -> Result<Vec<serde_json::Value>, ClientFailure> {
+    client.notify("textDocument/didOpen", Some(serde_json::json!({"textDocument": {"uri": document_uri, "languageId": "toml", "version": 1, "text": "name=\"taplo\"\nvalues = [1, 2]\n"}})), "open the bounded document").await?;
+    let folding = client
+      .request_selected_where(
+        2,
+        "textDocument/foldingRange",
+        Some(document.clone()),
+        "",
+        "produce a folding-range collection",
+        json_array_contract,
+      )
+      .await?;
+    client.opened_messages = ensure_that(
+      client.observed.clone(),
+      "opening the document must publish replacement diagnostics",
+      |messages| {
+        messages
+          .iter()
+          .any(|message| message.method.as_deref() == Some("textDocument/publishDiagnostics"))
+      },
+    )
+    .map_err(Box::new)?;
+    let symbols = client
+      .request_selected_where(
+        3,
+        "textDocument/documentSymbol",
+        Some(document.clone()),
+        "",
+        "expose named symbols",
+        non_empty_json_array_contract,
+      )
+      .await?;
+    let edits = client
+      .request_selected_where(
+        4,
+        "textDocument/formatting",
+        Some(serde_json::json!({"textDocument": {"uri": document_uri}, "options": {"tabSize": 2, "insertSpaces": true}})),
+        "",
+        "produce a replacement formatting edit",
+        non_empty_json_array_contract,
+      )
+      .await?;
+    Ok(Vec::from([folding, symbols, edits]))
+  }
+
+  /// Preserve schema-dependent absence and the registered semantic-token data collection.
+  #[cfg(feature = "lsp")]
+  async fn inspect_protocol_document(
+    client: &mut BoundedLspClient,
+    document: &serde_json::Value,
+    positioned: &serde_json::Value,
+  ) -> Result<Vec<serde_json::Value>, ClientFailure> {
+    let mut values = Vec::new();
+    for (id, method, params) in [
+      (5, "textDocument/completion", positioned),
+      (6, "textDocument/hover", positioned),
+      (7, "textDocument/documentLink", document),
+    ] {
+      values.push(
+        client
+          .request_selected_where(
+            id,
+            method,
+            Some(params.clone()),
+            "",
+            "schema-dependent output must remain absent",
+            json_null_contract,
+          )
+          .await?,
+      );
+    }
+    values.push(
+      client
+        .request_selected_where(
+          8,
+          "textDocument/semanticTokens/full",
+          Some(document.clone()),
+          "/data",
+          "retain semantic-token wire data",
+          json_array_contract,
+        )
+        .await?,
+    );
+    Ok(values)
+  }
+
+  /// Prepare a rename target and preserve the resulting workspace edit.
+  #[cfg(feature = "lsp")]
+  async fn rename_protocol_document(
+    client: &mut BoundedLspClient,
+    document_uri: &str,
+    positioned: &serde_json::Value,
+  ) -> Result<(serde_json::Value, serde_json::Value), ClientFailure> {
+    let prepared = client
+      .request(
+        9,
+        "textDocument/prepareRename",
+        Some(positioned.clone()),
+        "prepare an identifier rename target",
+      )
+      .await?;
+    let target = ensure_that(prepared, "prepare an identifier rename target", |value| !value.is_null()).map_err(Box::new)?;
+    let changes = client
+      .request_selected(
+        10,
+        "textDocument/rename",
+        Some(serde_json::json!({"textDocument": {"uri": document_uri}, "position": {"line": 0, "character": 1}, "newName": "renamed"})),
+        "/changes",
+        "return a workspace edit for the selected identifier",
+      )
+      .await?;
+    Ok((target, changes))
+  }
+
+  /// Exercise both conversion directions, then shut down and close input after terminal exit.
+  #[cfg(feature = "lsp")]
+  async fn finish_protocol(client: &mut BoundedLspClient, document_uri: &str) -> Result<Vec<serde_json::Value>, ClientFailure> {
+    let mut values = Vec::new();
+    for (id, method, source, expected) in [
+      (11, "taplo/convertToJson", "name = \"taplo\"\n", "\"name\""),
+      (12, "taplo/convertToToml", "{\"name\":\"taplo\"}", "name"),
+    ] {
+      values.push(
+        client
+          .request_text_containing(id, method, source, expected, "return converted text")
+          .await?,
+      );
+    }
+    values.push(
+      client
+        .request_selected_where(
+          13,
+          "taplo/associatedSchema",
+          Some(serde_json::json!({"documentUri": document_uri})),
+          "/schema",
+          "retain no effective schema",
+          json_null_contract,
+        )
+        .await?,
+    );
+    values.push(
+      client
+        .request_selected_where(
+          99,
+          "shutdown",
+          None,
+          "",
+          "emit the standard null shutdown result",
+          json_null_contract,
+        )
+        .await?,
+    );
+    client.notify("exit", None, "send terminal exit").await?;
+    client.shutdown = Some(AsyncWriteExt::shutdown(&mut client.input).await);
+    Ok(values)
+  }
+
+  /// Drive the bounded protocol phases while the client retains their entire native transcript.
+  #[cfg(feature = "lsp")]
+  async fn exercise_protocol(client: &mut BoundedLspClient) -> Result<ProtocolChecks, ClientFailure> {
+    let document_uri = "file:///workspace/document.toml";
+    let document = serde_json::json!({"textDocument": {"uri": document_uri}});
+    let positioned = serde_json::json!({"textDocument": {"uri": document_uri}, "position": {"line": 0, "character": 1}});
+    let initialized = initialize_protocol(client, document_uri, &positioned).await?;
+    let opened = open_protocol_document(client, document_uri, &document).await?;
+    let inspected = inspect_protocol_document(client, &document, &positioned).await?;
+    let renamed = rename_protocol_document(client, document_uri, &positioned).await?;
+    let finished = finish_protocol(client, document_uri).await?;
+    Ok((initialized, opened, inspected, renamed, finished))
+  }
+
+  /// Poll both peers, retaining partial client state when either side fails before shutdown.
+  #[cfg(feature = "lsp")]
+  fn drive_protocol<'operation>(
+    taplo: &'operation mut Taplo<TestEnvironment>,
+    client: &'operation mut BoundedLspClient,
+  ) -> LocalCommandFuture<'operation, ProtocolExecution> {
+    Box::pin(async move {
       let command = taplo.execute(arguments(TaploCommand::Lsp {
         cmd: stdio_lsp_command()
       }));
-      let client = async move {
-        let mut client = bounded_client;
-        let document_uri = "file:///workspace/document.toml";
-        let document = serde_json::json!({
-          "textDocument": {
-            "uri": document_uri
-          }
-        });
-        let positioned = serde_json::json!({
-          "textDocument": {
-            "uri": document_uri
-          },
-          "position": {
-            "line": 0,
-            "character": 1
-          }
-        });
-
-        client
-          .send_request(
-            -1,
-            "textDocument/hover",
-            Some(positioned.clone()),
-            "the bounded client must send its pre-initialization request",
-          )
-          .await?;
-        let rejected = client.response(-1).await?;
-        ensure(
-          rejected.result.is_none(),
-          "a pre-initialization rejection must not fabricate a success result",
-        )?;
-        let initialization_error = ensure_some(rejected.error, "the pre-initialization request must carry its typed RPC error")?;
-        ensure_eq(
-          &initialization_error,
-          &rpc::RpcError::server_not_initialized(),
-          "the CLI server must reject ordinary work before initialization",
-        )?;
-
-        let _text_document_sync = client
-          .request_selected(
-            0,
-            "initialize",
-            Some(serde_json::json!({
-              "processId": null,
-              "rootUri": null,
-              "capabilities": {},
-              "workspaceFolders": []
-            })),
-            "/capabilities/textDocumentSync",
-            "the CLI server must advertise full document synchronization",
-          )
-          .await?;
-
-        client
-          .notify(
-            "workspace/didChangeConfiguration",
-            Some(serde_json::json!({
-              "settings": {
-                "schema": {
-                  "catalogs": []
-                }
-              }
-            })),
-            "the bounded client must push deterministic configuration",
-          )
-          .await?;
-        client
-          .request_selected_where(
-            1,
-            "taplo/listSchemas",
-            Some(serde_json::json!({
-              "documentUri": document_uri
-            })),
-            "/schemas",
-            "the request after pushed configuration must observe a schema collection",
-            json_array_contract,
-          )
-          .await?;
-
-        client
-          .notify(
-            "textDocument/didOpen",
-            Some(serde_json::json!({
-              "textDocument": {
-                "uri": document_uri,
-                "languageId": "toml",
-                "version": 1,
-                "text": "name=\"taplo\"\nvalues = [1, 2]\n"
-              }
-            })),
-            "the bounded client must open its document",
-          )
-          .await?;
-        client
-          .request_selected_where(
-            2,
-            "textDocument/foldingRange",
-            Some(document.clone()),
-            "",
-            "the opened document must produce a folding-range collection",
-            json_array_contract,
-          )
-          .await?;
-        ensure(
-          client
-            .observed
-            .iter()
-            .any(|message| message.method.as_deref() == Some("textDocument/publishDiagnostics")),
-          "opening the document must publish replacement diagnostics through standard output",
-        )?;
-
-        client
-          .request_selected_where(
-            3,
-            "textDocument/documentSymbol",
-            Some(document.clone()),
-            "",
-            "the opened document must expose its named symbols",
-            non_empty_json_array_contract,
-          )
-          .await?;
-
-        client
-          .request_selected_where(
-            4,
-            "textDocument/formatting",
-            Some(serde_json::json!({
-              "textDocument": {
-                "uri": document_uri
-              },
-              "options": {
-                "tabSize": 2,
-                "insertSpaces": true
-              }
-            })),
-            "",
-            "the unformatted opened document must produce a replacement edit",
-            non_empty_json_array_contract,
-          )
-          .await?;
-
-        for (id, method, params, absence_context) in [
-          (
-            5,
-            "textDocument/completion",
-            positioned.clone(),
-            "completion without an effective schema must remain absent",
-          ),
-          (
-            6,
-            "textDocument/hover",
-            positioned.clone(),
-            "hover without an effective schema must remain absent",
-          ),
-          (
-            7,
-            "textDocument/documentLink",
-            document.clone(),
-            "document links without an effective schema must remain absent",
-          ),
-        ] {
-          client
-            .request_selected_where(id, method, Some(params), "", absence_context, json_null_contract)
-            .await?;
-        }
-
-        client
-          .request_selected_where(
-            8,
-            "textDocument/semanticTokens/full",
-            Some(document.clone()),
-            "/data",
-            "semantic-token output must retain the registered wire data collection",
-            json_array_contract,
-          )
-          .await?;
-
-        let prepare_rename = client
-          .request(
-            9,
-            "textDocument/prepareRename",
-            Some(positioned.clone()),
-            "an identifier position must prepare a rename target",
-          )
-          .await?;
-        ensure(!prepare_rename.is_null(), "an identifier position must prepare a rename target")?;
-
-        let _changes = client
-          .request_selected(
-            10,
-            "textDocument/rename",
-            Some(serde_json::json!({
-              "textDocument": {
-                "uri": document_uri
-              },
-              "position": {
-                "line": 0,
-                "character": 1
-              },
-              "newName": "renamed"
-            })),
-            "/changes",
-            "rename must return a workspace edit for the selected identifier",
-          )
-          .await?;
-
-        for (id, method, source_text, expected_text, conversion_context) in [
-          (
-            11,
-            "taplo/convertToJson",
-            "name = \"taplo\"\n",
-            "\"name\"",
-            "TOML-to-JSON conversion must return converted text",
-          ),
-          (
-            12,
-            "taplo/convertToToml",
-            "{\"name\":\"taplo\"}",
-            "name",
-            "JSON-to-TOML conversion must return converted text",
-          ),
-        ] {
-          client
-            .request_text_containing(id, method, source_text, expected_text, conversion_context)
-            .await?;
-        }
-
-        client
-          .request_selected_where(
-            13,
-            "taplo/associatedSchema",
-            Some(serde_json::json!({
-              "documentUri": document_uri
-            })),
-            "/schema",
-            "the schema-disabled transaction must report no effective schema",
-            json_null_contract,
-          )
-          .await?;
-
-        client
-          .request_selected_where(
-            99,
-            "shutdown",
-            None,
-            "",
-            "shutdown must emit the standard null result",
-            json_null_contract,
-          )
-          .await?;
-        client
-          .notify("exit", None, "the bounded client must send terminal exit")
-          .await?;
-        ensure_ok(
-          tokio::io::AsyncWriteExt::shutdown(&mut client.input).await,
-          "the bounded client must close standard input after terminal exit",
-        )
-      };
-
+      let transaction = exercise_protocol(client);
       tokio::pin!(command);
-      tokio::pin!(client);
-      tokio::select! {
-        command_result = &mut command => {
-          ensure_ok(command_result, "the full CLI dispatcher must complete its LSP transaction")?;
-          client.await
-        }
-        client_result = &mut client => {
-          client_result?;
-          ensure_ok(command.await, "the full CLI dispatcher must complete after terminal exit")
-        }
+      tokio::pin!(transaction);
+      match select(command, transaction).await {
+        Either::Left((Ok(()), pending_client)) => (Some(Ok(())), Some(pending_client.await)),
+        Either::Left((Err(error), _)) => (Some(Err(error)), None),
+        Either::Right((Ok(checks), pending_command)) => (Some(pending_command.await), Some(Ok(checks))),
+        Either::Right((Err(error), _)) => (None, Some(Err(error))),
       }
-    })?;
+    })
+  }
 
-    ensure(
-      environment.stderr().is_empty(),
-      "the successful bounded LSP transaction must not emit command diagnostics",
+  #[cfg(feature = "lsp")]
+  #[test]
+  fn full_dispatcher_completes_a_bounded_protocol_transaction() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let (environment, mut taplo) = initialized_cli()?;
+      let runtime = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| Box::new(CliError::Io(error)))?;
+      let mut client = BoundedLspClient {
+        input:           environment.interactive_stdin(),
+        output:          BufReader::new(environment.stdout_reader()),
+        observed:        Vec::new(),
+        opened_messages: Vec::new(),
+        sent:            Vec::new(),
+        frames:          Vec::new(),
+        shutdown:        None,
+      };
+      let (command_result, client_result) = runtime.block_on(drive_protocol(&mut taplo, &mut client));
+      let stderr = environment.stderr();
+      Ok::<_, Box<CliError>>((taplo, runtime, command_result, client_result, client, stderr))
+    })();
+
+    ensure_that(
+      observed,
+      "the bounded LSP transaction must complete both peers, retain its protocol transcript, close input after exit, and emit no command \
+       diagnostics",
+      |result| {
+        let Ok(ref actual) = *result else {
+          return false;
+        };
+        actual.2.as_ref().is_some_and(Result::is_ok)
+          && actual.3.as_ref().is_some_and(Result::is_ok)
+          && actual.4.shutdown.as_ref().is_some_and(Result::is_ok)
+          && actual
+            .4
+            .sent
+            .first()
+            .is_some_and(|sent| sent.request.method == "textDocument/hover")
+          && actual.4.sent.last().is_some_and(|sent| sent.request.method == "exit")
+          && actual
+            .4
+            .opened_messages
+            .iter()
+            .any(|message| message.method.as_deref() == Some("textDocument/publishDiagnostics"))
+          && actual.5.is_empty()
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

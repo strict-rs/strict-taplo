@@ -40,14 +40,12 @@ pub(super) fn mapping_rpc_error(error: &MappingError) -> RpcError {
 
 #[cfg(test)]
 mod tests {
+  use std::fmt::Debug;
   use std::str::FromStr as _;
 
   use lsp_types::Position;
   use lsp_types::Uri;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_ok;
-  use strict_test_support::ensure_some;
+  use strict_test_support::ensure_that;
   use taplo::rowan::TextRange;
   use taplo::rowan::TextSize;
   use taplo_lsp_async::util::Mapper;
@@ -59,39 +57,51 @@ mod tests {
   use super::to_url;
 
   #[test]
-  fn uri_conversion_accepts_absolute_urls_and_rejects_relative_wire_uris() -> Result<(), TestFailure> {
-    let url = ensure_ok(Url::parse("file:///workspace/file.toml"), "the absolute URL fixture must parse")?;
-    let uri = ensure_some(to_uri(&url), "an absolute URL must convert to a wire URI")?;
-    ensure(
-      to_url(&uri) == Some(url),
-      "the URL and URI boundary must round-trip absolute document locations",
-    )?;
-
-    let relative = ensure_ok(
-      Uri::from_str("workspace/file.toml"),
-      "the relative URI reference fixture must parse",
-    )?;
-    ensure(
-      to_url(&relative).is_none(),
-      "a relative wire URI must not become an internal absolute URL",
+  fn uri_conversion_accepts_absolute_urls_and_rejects_relative_wire_uris() -> Result<(), impl Debug> {
+    let absolute = Url::parse("file:///workspace/file.toml").map(|url| {
+      let wire = to_uri(&url);
+      let restored = wire.as_ref().and_then(to_url);
+      (url, wire, restored)
+    });
+    let relative = Uri::from_str("workspace/file.toml").map(|wire| {
+      let converted = to_url(&wire);
+      (wire, converted)
+    });
+    ensure_that(
+      (absolute, relative),
+      "absolute document locations must round-trip while relative wire URIs remain unresolved",
+      |observed| {
+        observed
+          .0
+          .as_ref()
+          .is_ok_and(|roundtrip| roundtrip.1.is_some() && roundtrip.2.as_ref() == Some(&roundtrip.0))
+          && observed.1.as_ref().is_ok_and(|rejected| rejected.1.is_none())
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn range_conversion_is_exact_or_typed() -> Result<(), TestFailure> {
-    let mapper = ensure_ok(Mapper::new_utf16("alpha\n\u{3b2}eta"), "the mapper fixture must build")?;
-    let source_range = TextRange::new(TextSize::from(0), TextSize::from(5));
-    let lsp_range = ensure_ok(to_lsp_range(&mapper, source_range), "a source-backed range must map")?;
-    ensure(
-      lsp_range == lsp_types::Range::new(Position::new(0, 0), Position::new(0, 5)),
-      "mapped source coordinates must remain exact",
-    )?;
-    ensure(
-      matches!(
-        to_lsp_range(&mapper, TextRange::new(TextSize::new(100), TextSize::new(101))),
-        Err(MappingError::OffsetOutOfBounds { .. })
-      ),
-      "source offsets absent from the mapper must return a typed failure",
+  fn range_conversion_is_exact_or_typed() -> Result<(), impl Debug> {
+    let observed = Mapper::new_utf16("alpha\n\u{3b2}eta").map(|mapper| {
+      let source_range = TextRange::new(TextSize::from(0), TextSize::from(5));
+      let mapped = to_lsp_range(&mapper, source_range);
+      let rejected = to_lsp_range(&mapper, TextRange::new(TextSize::new(100), TextSize::new(101)));
+      (mapper, mapped, rejected)
+    });
+    ensure_that(
+      observed,
+      "source ranges must map exactly or preserve the typed out-of-bounds failure",
+      |result| {
+        let Ok(ref ranges) = *result else {
+          return false;
+        };
+        ranges.1 == Ok(lsp_types::Range::new(Position::new(0, 0), Position::new(0, 5)))
+          && matches!(ranges.2, Err(MappingError::OffsetOutOfBounds { .. }))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

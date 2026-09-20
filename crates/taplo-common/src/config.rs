@@ -409,16 +409,16 @@ pub struct Plugin {
 
 #[cfg(test)]
 mod tests {
+  use std::fmt::Debug;
   use std::path::Path;
 
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_eq;
+  use strict_test_support::PredicateFailure;
+  use strict_test_support::ensure_that;
   use taplo::formatter::Options as FormatOptions;
   use taplo::formatter::OptionsIncomplete;
-  use taplo_test_support::ensure_result;
 
   use super::Config;
+  use super::ConfigError;
   use super::Options;
   use super::Rule;
   use super::SchemaOptions;
@@ -454,97 +454,122 @@ mod tests {
     }
   }
 
+  /// A complete configuration and the result of preparing it.
+  #[derive(Debug)]
+  struct PreparedConfig {
+    /// Configuration retaining any partial normalization on failure.
+    config: Config,
+    /// Native preparation outcome.
+    result: Result<(), ConfigError>,
+  }
+
   /// Construct and prepare one configuration fixture at the shared workspace root.
-  fn prepared_config(global_options: Options, rule: Vec<Rule>) -> Result<Config, TestFailure> {
+  fn prepared_config(global_options: Options, rule: Vec<Rule>) -> PreparedConfig {
     let mut config = Config {
       rule,
       global_options,
       ..Config::default()
     };
-    ensure_result(
-      config.prepare(&TestEnvironment::default(), Path::new("/workspace")),
-      "the configuration fixture must prepare",
-    )?;
-    Ok(config)
+    let result = config.prepare(&TestEnvironment::default(), Path::new("/workspace"));
+    PreparedConfig {
+      config,
+      result,
+    }
   }
 
+  /// Prepared rules and both complete formatter option sets.
+  type FormattingObservations = (PreparedConfig, FormatOptions, FormatOptions);
+
   #[test]
-  fn whole_document_formatting_uses_only_matching_file_rules() -> Result<(), TestFailure> {
-    let config = prepared_config(
+  fn whole_document_formatting_uses_only_matching_file_rules() -> Result<(), Box<PredicateFailure<FormattingObservations>>> {
+    let prepared = prepared_config(
       formatting(80),
       Vec::from([
         rule("**/match.toml", None, formatting(100)),
         rule("**/other.toml", None, formatting(120)),
         rule("**/match.toml", Some(Vec::from(["package.metadata".into()])), formatting(140)),
       ]),
-    )?;
-
+    );
     let mut matching = FormatOptions::default();
-    config.update_format_options(Path::new("/workspace/match.toml"), &mut matching);
-    ensure_eq(
-      &matching.column_width,
-      &100,
-      "a matching file-only rule must override the global option",
-    )?;
-
+    prepared
+      .config
+      .update_format_options(Path::new("/workspace/match.toml"), &mut matching);
     let mut unrelated = FormatOptions::default();
-    config.update_format_options(Path::new("/workspace/unrelated.toml"), &mut unrelated);
-    ensure_eq(
-      &unrelated.column_width,
-      &80,
-      "nonmatching and key-scoped rules must not alter whole-document options",
+    prepared
+      .config
+      .update_format_options(Path::new("/workspace/unrelated.toml"), &mut unrelated);
+    ensure_that(
+      (prepared, matching, unrelated),
+      "only matching whole-document rules must override global formatting",
+      |actual| actual.0.result.is_ok() && actual.1.column_width == 100 && actual.2.column_width == 80,
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn schema_disablement_is_matching_file_scoped_and_only_narrows() -> Result<(), TestFailure> {
-    let enabled_config = prepared_config(
+  fn schema_disablement_is_matching_file_scoped_and_only_narrows() -> Result<(), impl Debug> {
+    let enabled = prepared_config(
       schema(true),
       Vec::from([
         rule("**/disabled.toml", None, schema(false)),
         rule("**/key-scoped.toml", Some(Vec::from(["nested".into()])), schema(false)),
       ]),
-    )?;
-    ensure(
-      !enabled_config.is_schema_enabled(Path::new("/workspace/disabled.toml")),
-      "a matching file-only rule must disable schema validation",
-    )?;
-    ensure(
-      enabled_config.is_schema_enabled(Path::new("/workspace/other.toml")),
-      "the same disabling rule must not affect a nonmatching file",
-    )?;
-    ensure(
-      enabled_config.is_schema_enabled(Path::new("/workspace/key-scoped.toml")),
-      "a key-scoped rule must not disable whole-document validation",
-    )?;
-
-    let globally_disabled = prepared_config(schema(false), Vec::from([rule("**/*.toml", None, schema(true))]))?;
-    ensure(
-      !globally_disabled.is_schema_enabled(Path::new("/workspace/file.toml")),
-      "a matching explicit enable must not override global disablement",
+    );
+    let disabled = prepared_config(schema(false), Vec::from([rule("**/*.toml", None, schema(true))]));
+    ensure_that(
+      [enabled, disabled],
+      "file rules must narrow schema enablement without affecting unrelated or key-scoped files",
+      |actual| {
+        let [ref enabled_config, ref disabled_config] = *actual;
+        enabled_config.result.is_ok()
+          && disabled_config.result.is_ok()
+          && !enabled_config.config.is_schema_enabled(Path::new("/workspace/disabled.toml"))
+          && enabled_config.config.is_schema_enabled(Path::new("/workspace/other.toml"))
+          && enabled_config.config.is_schema_enabled(Path::new("/workspace/key-scoped.toml"))
+          && !disabled_config.config.is_schema_enabled(Path::new("/workspace/file.toml"))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
+  /// URL parsing and the configuration prepared from it.
+  type SchemaPathObservations = (Result<url::Url, url::ParseError>, Option<PreparedConfig>);
+
   #[test]
-  fn schema_paths_use_platform_file_url_conversion_and_override_urls() -> Result<(), TestFailure> {
-    let config = prepared_config(
-      Options {
-        schema:     Some(SchemaOptions {
-          enabled: None,
-          path:    Some("schemas/project.json".into()),
-          url:     Some(ensure_result(
-            url::Url::parse("https://example.com/ignored.json"),
-            "the ignored URL fixture must parse",
-          )?),
-        }),
-        formatting: None,
+  fn schema_paths_use_platform_file_url_conversion_and_override_urls() -> Result<(), Box<PredicateFailure<SchemaPathObservations>>> {
+    let url = url::Url::parse("https://example.com/ignored.json");
+    let prepared = url.as_ref().ok().map(|ignored| {
+      prepared_config(
+        Options {
+          schema:     Some(SchemaOptions {
+            enabled: None,
+            path:    Some("schemas/project.json".into()),
+            url:     Some(ignored.clone()),
+          }),
+          formatting: None,
+        },
+        Vec::new(),
+      )
+    });
+    ensure_that(
+      (url, prepared),
+      "a schema path must become an absolute file URL and override the URL field",
+      |actual| {
+        actual.1.as_ref().is_some_and(|observed| {
+          observed.result.is_ok()
+            && observed
+              .config
+              .global_options
+              .schema
+              .as_ref()
+              .and_then(|schema_options| schema_options.url.as_ref())
+              .is_some_and(|schema_url| schema_url.as_str() == "file:///workspace/schemas/project.json")
+        })
       },
-      Vec::new(),
-    )?;
-    let prepared = config.global_options.schema.as_ref().and_then(|schema| schema.url.as_ref());
-    ensure(
-      prepared.is_some_and(|url| url.as_str() == "file:///workspace/schemas/project.json"),
-      "a schema path must become an absolute file URL and take precedence over the URL field",
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

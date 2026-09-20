@@ -256,27 +256,44 @@ fn fold_range(
 
 #[cfg(test)]
 mod tests {
+  use std::fmt::Debug;
+
   use lsp_types::FoldingRange;
   use lsp_types::FoldingRangeKind;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_ok;
-  use strict_test_support::ensure_some;
+  use strict_test_support::ensure_that;
   use taplo::parser;
+  use taplo::parser::Parse;
+  use taplo::parser::ParseFailure;
   use taplo_lsp_async::util::Mapper;
   use taplo_lsp_async::util::MappingError;
 
   use super::create_folding_ranges;
 
-  /// Build folding ranges from one parsed source and an independently selectable mapper source.
-  fn ranges(source: &str, mapper_source: &str) -> Result<Vec<FoldingRange>, TestFailure> {
-    let dom = ensure_ok(parser::parse(source), "the folding fixture tree must build")?.into_dom();
-    let syntax = ensure_some(
-      dom.syntax().and_then(|syntax| syntax.as_node()),
-      "the folding fixture must retain root syntax",
-    )?;
-    let mapper = ensure_ok(Mapper::new_utf16(mapper_source), "the folding mapper must build")?;
-    ensure_ok(create_folding_ranges(syntax, &mapper), "the folding ranges must map")
+  /// Complete parser, mapper, and range observations for one source pair.
+  #[derive(Debug)]
+  struct FoldingObservation {
+    /// Lossless parse and recoverable syntax diagnostics.
+    parsed: Parse,
+    /// Independently constructed coordinate model or its native failure.
+    mapper: Result<Mapper, MappingError>,
+    /// Range projection attempted when the coordinate model was constructed.
+    ranges: Option<Result<Vec<FoldingRange>, MappingError>>,
+  }
+
+  /// Build folding ranges while retaining their parse, coordinate model, and native failures.
+  fn ranges(source: &str, mapper_source: &str) -> Result<FoldingObservation, ParseFailure> {
+    let parsed = parser::parse(source)?;
+    let syntax = parsed.clone().into_syntax();
+    let mapper = Mapper::new_utf16(mapper_source);
+    let ranges = mapper
+      .as_ref()
+      .ok()
+      .map(|coordinates| create_folding_ranges(&syntax, coordinates));
+    Ok(FoldingObservation {
+      parsed,
+      mapper,
+      ranges,
+    })
   }
 
   /// Project ranges onto the behaviorally relevant line and kind tuple.
@@ -288,73 +305,98 @@ mod tests {
   }
 
   #[test]
-  fn table_folds_respect_dotted_ancestry_not_textual_prefixes() -> Result<(), TestFailure> {
+  fn table_folds_respect_dotted_ancestry_not_textual_prefixes() -> Result<(), impl Debug> {
     let source = "[a]\nx = 1\n[a.b]\ny = 2\n[ab]\nz = 3\n[a]\nw = 4\n";
-    let actual = ranges(source, source)?;
-    ensure(
-      line_ranges(&actual)
-        == vec![
-          (0, 3, Some(FoldingRangeKind::Region)),
-          (2, 3, Some(FoldingRangeKind::Region)),
-          (4, 5, Some(FoldingRangeKind::Region)),
-          (6, 7, Some(FoldingRangeKind::Region)),
-        ],
+    ensure_that(
+      ranges(source, source),
       "nested headers must stay open while equal, sibling, and textual-prefix headers close",
+      |result| {
+        let Ok(ref observed) = *result else {
+          return false;
+        };
+        observed.parsed.diagnostics().is_empty()
+          && observed.mapper.is_ok()
+          && observed
+            .ranges
+            .as_ref()
+            .and_then(|mapped| mapped.as_ref().ok())
+            .is_some_and(|actual| {
+              line_ranges(actual)
+                == vec![
+                  (0, 3, Some(FoldingRangeKind::Region)),
+                  (2, 3, Some(FoldingRangeKind::Region)),
+                  (4, 5, Some(FoldingRangeKind::Region)),
+                  (6, 7, Some(FoldingRangeKind::Region)),
+                ]
+            })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn multiline_values_and_comment_blocks_fold_but_single_lines_do_not() -> Result<(), TestFailure> {
+  fn multiline_values_and_comment_blocks_fold_but_single_lines_do_not() -> Result<(), impl Debug> {
     let source = concat!(
       "single = [1]\n", "multi = [\n", "  1,\n", "]\n", "one = \"x\"\n", "text = \"\"\"\n", "x\n", "\"\"\"\n", "# first\n", "# second\n",
       "\n", "# isolated\n", "value = 1\n",
     );
-    let actual = ranges(source, source)?;
-    ensure(
-      line_ranges(&actual)
-        == vec![
-          (1, 3, Some(FoldingRangeKind::Region)),
-          (5, 7, Some(FoldingRangeKind::Region)),
-          (8, 9, Some(FoldingRangeKind::Comment)),
-        ],
-      "only multiline arrays, strings, and contiguous comment blocks must fold",
-    )?;
-    ensure(
-      actual
-        .iter()
-        .take(2)
-        .all(|range| (range.start_character.is_some(), range.end_character.is_some()) == (true, true)),
-      "multiline value folds must retain exact character endpoints",
-    )?;
-    ensure(
-      actual.get(2).map(|range| (range.start_character, range.end_character)) == Some((None, None)),
-      "comment blocks must remain line-only folds",
+    ensure_that(
+      ranges(source, source),
+      "multiline values and contiguous comments must preserve fold kinds and endpoint precision",
+      |result| {
+        let Ok(ref observed) = *result else {
+          return false;
+        };
+        observed
+          .ranges
+          .as_ref()
+          .and_then(|mapped| mapped.as_ref().ok())
+          .is_some_and(|actual| {
+            line_ranges(actual)
+              == vec![
+                (1, 3, Some(FoldingRangeKind::Region)),
+                (5, 7, Some(FoldingRangeKind::Region)),
+                (8, 9, Some(FoldingRangeKind::Comment)),
+              ]
+              && actual
+                .iter()
+                .take(2)
+                .all(|range| (range.start_character.is_some(), range.end_character.is_some()) == (true, true))
+              && actual.get(2).map(|range| (range.start_character, range.end_character)) == Some((None, None))
+          })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn incomplete_syntax_is_skipped_and_unmappable_ranges_are_typed_failures() -> Result<(), TestFailure> {
+  fn incomplete_syntax_is_skipped_and_unmappable_ranges_are_typed_failures() -> Result<(), impl Debug> {
     let incomplete = "array = [\n";
-    ensure(
-      ranges(incomplete, incomplete)?.is_empty(),
-      "an incomplete one-line array must not fabricate a fold",
-    )?;
-
     let multiline = "array = [\n  1,\n]\n";
-    let dom = ensure_ok(parser::parse(multiline), "the unmappable folding fixture tree must build")?.into_dom();
-    let syntax = ensure_some(
-      dom.syntax().and_then(|syntax| syntax.as_node()),
-      "the unmappable folding fixture must retain root syntax",
-    )?;
-    let empty_mapper = ensure_ok(Mapper::new_utf16(""), "the empty folding mapper must build")?;
-    let mapping_failure = ensure_some(
-      create_folding_ranges(syntax, &empty_mapper).err(),
-      "a folding range outside its mapper must return a typed failure",
-    )?;
-    ensure(
-      matches!(mapping_failure, MappingError::OffsetOutOfBounds { .. }),
-      "syntax endpoints absent from the mapper must retain the mapping error family",
-    )?;
-    ensure(ranges("", "")?.is_empty(), "an empty syntax tree must produce no folds")
+    ensure_that(
+      (ranges(incomplete, incomplete), ranges(multiline, ""), ranges("", "")),
+      "incomplete and empty syntax must not fabricate folds while missing mapper endpoints retain their typed failure",
+      |observed| {
+        observed.0.as_ref().is_ok_and(|incomplete_ranges| {
+          incomplete_ranges
+            .ranges
+            .as_ref()
+            .is_some_and(|mapped| mapped.as_ref().is_ok_and(Vec::is_empty))
+        }) && observed
+          .1
+          .as_ref()
+          .is_ok_and(|unmappable| matches!(unmappable.ranges, Some(Err(MappingError::OffsetOutOfBounds { .. }))))
+          && observed.2.as_ref().is_ok_and(|empty| {
+            empty
+              .ranges
+              .as_ref()
+              .is_some_and(|mapped| mapped.as_ref().is_ok_and(Vec::is_empty))
+          })
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

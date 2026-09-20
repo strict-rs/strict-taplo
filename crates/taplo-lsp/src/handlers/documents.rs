@@ -51,6 +51,7 @@ pub(super) enum DocumentNotificationError {
 }
 
 /// Client-visible output resulting from one committed document mutation.
+#[derive(Debug)]
 pub(super) struct DocumentEffects {
   /// Updated schema associations.
   pub(super) associations: Vec<DidChangeSchemaAssociationParams>,
@@ -210,7 +211,7 @@ pub(super) fn publish_params(batch: DiagnosticBatch) -> PublishDiagnosticsParams
 
 #[cfg(test)]
 mod tests {
-  use std::str::FromStr as _;
+  use std::fmt::Debug;
   use std::sync::Arc;
 
   use futures::executor::block_on;
@@ -220,9 +221,9 @@ mod tests {
   use lsp_types::Uri;
   use lsp_types::VersionedTextDocumentIdentifier;
   use serde_json::json;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
+  use strict_test_support::ResultFailure;
   use strict_test_support::ensure_ok;
+  use strict_test_support::ensure_that;
   use taplo_common::config::Config;
   use taplo_lsp_async::Params;
   use url::Url;
@@ -231,122 +232,117 @@ mod tests {
   use super::document_change_local;
   use super::document_open_local;
   use super::document_url;
+  use crate::handlers::test_support::FixtureFailure;
   use crate::handlers::test_support::local_world;
   use crate::world::DocumentDisposition;
 
   /// Parse one wire document URI.
-  fn uri(value: &str) -> Result<Uri, TestFailure> {
-    ensure_ok(Uri::from_str(value), "the document-notification URI fixture must parse")
-  }
-
-  #[test]
-  fn document_uri_and_change_validation_reject_missing_content_before_mutation() -> Result<(), TestFailure> {
-    let absolute = uri("file:///workspace/document.toml")?;
-    ensure(
-      ensure_ok(document_url(&absolute), "the absolute document URI must convert to a URL")?
-        == ensure_ok(
-          Url::parse("file:///workspace/document.toml"),
-          "the absolute document URL fixture must parse",
-        )?,
-      "an absolute document URI must retain its URL identity",
-    )?;
-    ensure(
-      matches!(
-        document_url(&uri("workspace/relative.toml")?),
-        Err(DocumentNotificationError::UnsupportedUri { .. })
-      ),
-      "a relative document URI reference must be rejected before state mutation",
-    )?;
-
-    let world = local_world()?;
-    let missing_change = DidChangeTextDocumentParams {
-      text_document:   VersionedTextDocumentIdentifier {
-        uri:     absolute,
-        version: 2,
-      },
-      content_changes: Vec::new(),
-    };
-    ensure(
-      matches!(
-        block_on(document_change_local(&world, Params::from(Some(missing_change)))),
-        Err(DocumentNotificationError::MissingContentChange)
-      ),
-      "a full-sync change without replacement text must retain its typed validation failure",
-    )?;
-    ensure(
-      matches!(
-        block_on(document_change_local(&world, Params::<DidChangeTextDocumentParams>::from(None),)),
-        Err(DocumentNotificationError::MissingParameters)
-      ),
-      "a change without parameters must retain its distinct typed validation failure",
+  fn uri(value: &str) -> Result<Uri, ResultFailure<serde_json::Error>> {
+    ensure_ok(
+      serde_json::from_value(json!(value)),
+      "the document-notification URI fixture must parse",
     )
   }
 
   #[test]
-  fn excluded_document_open_retains_state_and_publishes_one_explanatory_hint() -> Result<(), TestFailure> {
-    block_on(async {
+  fn document_uri_and_change_validation_reject_missing_content_before_mutation() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let absolute = uri("file:///workspace/document.toml")?;
+      let relative = uri("workspace/relative.toml")?;
       let world = local_world()?;
+      let expected = ensure_ok(
+        Url::parse("file:///workspace/document.toml"),
+        "the absolute document URL fixture must parse",
+      )?;
+      let converted = document_url(&absolute);
+      let rejected = document_url(&relative);
+      let missing_change = DidChangeTextDocumentParams {
+        text_document:   VersionedTextDocumentIdentifier {
+          uri:     absolute.clone(),
+          version: 2,
+        },
+        content_changes: Vec::new(),
+      };
+      let missing_content = block_on(document_change_local(&world, Params::from(Some(missing_change))));
+      let missing_parameters = block_on(document_change_local(&world, Params::<DidChangeTextDocumentParams>::from(None)));
+      Ok::<_, FixtureFailure>((
+        world, absolute, relative, expected, converted, rejected, missing_content, missing_parameters,
+      ))
+    })();
+    ensure_that(
+      observed,
+      "document validation must preserve absolute identity and distinguish unsupported URIs, missing content and missing parameters",
+      |result| {
+        let Ok(ref scenario) = *result else {
+          return false;
+        };
+        scenario.4.as_ref().is_ok_and(|url| *url == scenario.3)
+          && matches!(scenario.5, Err(DocumentNotificationError::UnsupportedUri { .. }))
+          && matches!(scenario.6, Err(DocumentNotificationError::MissingContentChange))
+          && matches!(scenario.7, Err(DocumentNotificationError::MissingParameters))
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
+  }
+
+  #[test]
+  fn excluded_document_open_retains_state_and_publishes_one_explanatory_hint() -> Result<(), impl Debug> {
+    let observed = block_on(async {
+      let world = local_world()?;
+      let document_uri = uri("file:///workspace/excluded.toml")?;
       world.set_default_config(Arc::new(Config {
         include: Some(vec![String::from("included.toml")]),
         ..Config::default()
       }));
-      let schema_disabled = json!({
-        "schema": {
-          "enabled": false,
-          "catalogs": []
-        }
-      });
-      drop(ensure_ok(
-        world.apply_configuration_values_local(Some(&schema_disabled), &[]).await,
-        "the excluded-document configuration must commit",
-      )?);
-
-      let effects = ensure_ok(
-        document_open_local(
-          &world,
-          Params::from(Some(DidOpenTextDocumentParams {
-            text_document: TextDocumentItem {
-              uri:         uri("file:///workspace/excluded.toml")?,
-              language_id: String::from("toml"),
-              version:     1,
-              text:        String::from("value = 1\n"),
-            },
-          })),
-        )
-        .await,
-        "an excluded document must remain a successful open transition",
-      )?;
-      let association_facts = effects.associations.first().map(|association| {
-        (
-          association.document_uri.as_str(),
-          association.schema_uri.is_none(),
-          association.meta.is_none(),
-        )
-      });
-      ensure(
-        (effects.associations.len(), association_facts) == (1, Some(("file:///workspace/excluded.toml", true, true))),
-        "an excluded open must publish one null effective-schema notification that clears stale client state",
-      )?;
-      let diagnostic_message = effects
-        .diagnostics
-        .diagnostics
-        .first()
-        .map(|diagnostic| diagnostic.message.as_str());
-      ensure(
-        (effects.diagnostics.diagnostics.len(), diagnostic_message) == (1, Some("this document has been excluded")),
-        "an excluded open must publish exactly one explanatory hint",
-      )?;
-      let dispositions = world.open_document_dispositions().await;
-      ensure(
-        dispositions.len() == 1,
-        "an excluded open must remain represented in the world document set",
-      )?;
-      ensure(
-        dispositions
-          .first()
-          .is_some_and(|disposition_entry| disposition_entry.1 == DocumentDisposition::Excluded),
-        "the retained excluded document must expose its exclusion disposition",
+      let schema_disabled = json!({ "schema": { "enabled": false, "catalogs": [] } });
+      let configured = world.apply_configuration_values_local(Some(&schema_disabled), &[]).await;
+      let effects = document_open_local(
+        &world,
+        Params::from(Some(DidOpenTextDocumentParams {
+          text_document: TextDocumentItem {
+            uri:         document_uri,
+            language_id: String::from("toml"),
+            version:     1,
+            text:        String::from("value = 1\n"),
+          },
+        })),
       )
-    })
+      .await;
+      let dispositions = world.open_document_dispositions().await;
+      Ok::<_, FixtureFailure>((world, configured, effects, dispositions))
+    });
+    ensure_that(
+      observed,
+      "an excluded open must retain world ownership, publish one null association and one explanatory hint",
+      |result| {
+        let Ok(ref scenario) = *result else {
+          return false;
+        };
+        let Ok(ref effects) = scenario.2 else {
+          return false;
+        };
+        scenario.1.is_ok()
+          && effects.associations.len() == 1
+          && effects.associations.first().is_some_and(|association| {
+            association.document_uri.as_str() == "file:///workspace/excluded.toml"
+              && association.schema_uri.is_none()
+              && association.meta.is_none()
+          })
+          && effects.diagnostics.diagnostics.len() == 1
+          && effects
+            .diagnostics
+            .diagnostics
+            .first()
+            .is_some_and(|diagnostic| diagnostic.message == "this document has been excluded")
+          && scenario.3.len() == 1
+          && scenario
+            .3
+            .first()
+            .is_some_and(|disposition| disposition.1 == DocumentDisposition::Excluded)
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

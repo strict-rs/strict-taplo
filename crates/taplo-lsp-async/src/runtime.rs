@@ -979,11 +979,8 @@ mod tests {
   use futures::executor::block_on;
   use futures::future::Ready;
   use futures::future::ready;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_contains;
-  use strict_test_support::ensure_ok;
-  use strict_test_support::ensure_some;
+  use strict_test_support::PredicateFailure;
+  use strict_test_support::ensure_that;
 
   use super::RequestOutcome;
   use super::ServerError;
@@ -991,91 +988,74 @@ mod tests {
   use super::invoke_notification;
   use super::invoke_request;
   use super::rpc;
+  use crate::Params;
   use crate::SerializationFailureFixture;
 
+  /// Complete decoding outcomes for absent, compatible, and rejected parameters.
+  type ParameterOutcomes = [Result<Params<u64>, String>; 3];
+
   #[test]
-  fn parameter_deserialization_preserves_absence_values_and_typed_rejection() -> Result<(), TestFailure> {
-    let absent = ensure_some(deserialize_params::<u64>(None).ok(), "absent optional parameters must deserialize")?;
-    ensure(
-      absent.optional().is_none(),
-      "absent wire parameters must remain absent for the typed handler",
-    )?;
-
-    let present = ensure_some(
-      deserialize_params::<u64>(Some(serde_json::json!(41))).ok(),
-      "a compatible wire value must deserialize",
-    )?;
-    ensure(
-      present.optional() == Some(41_u64),
-      "a compatible wire value must reach the typed handler unchanged",
-    )?;
-
-    let rejection = ensure_some(
-      deserialize_params::<u64>(Some(serde_json::json!("not-a-number"))).err(),
-      "an incompatible wire value must return its decoder failure",
-    )?;
-    ensure_contains(
-      &rejection,
-      "invalid type",
-      "parameter rejection must retain the serde type mismatch",
+  fn parameter_deserialization_preserves_absence_values_and_typed_rejection() -> Result<(), PredicateFailure<ParameterOutcomes>> {
+    ensure_that(
+      [
+        deserialize_params::<u64>(None),
+        deserialize_params::<u64>(Some(serde_json::json!(41))),
+        deserialize_params::<u64>(Some(serde_json::json!("not-a-number"))),
+      ],
+      "parameter decoding must preserve absence, native values, and the rejected serde detail",
+      |observed| {
+        let [ref absent, ref present, ref rejected] = *observed;
+        matches!(*absent, Ok(Params(None)))
+          && matches!(*present, Ok(Params(Some(41))))
+          && rejected.as_ref().is_err_and(|detail| detail.contains("invalid type"))
+      },
     )
+    .map(drop)
   }
 
-  #[test]
-  fn request_invocation_distinguishes_success_rpc_parameter_and_serialization_outcomes() -> Result<(), TestFailure> {
-    let success = block_on(invoke_request::<u64, _>(Ok(ready(Ok(73_u64)))));
-    ensure(
-      matches!(success, RequestOutcome::Success(value) if value == serde_json::json!(73)),
-      "a successful typed handler result must become its JSON value",
-    )?;
+  /// Complete native request invocation outcomes across all four branches.
+  type RequestOutcomes = [RequestOutcome; 4];
 
+  #[test]
+  fn request_invocation_distinguishes_success_rpc_parameter_and_serialization_outcomes()
+  -> Result<(), Box<PredicateFailure<RequestOutcomes>>> {
     let rpc_error = rpc::RpcError::invalid_request().with_details("fixture request rejected");
-    let rejected = block_on(invoke_request::<u64, _>(Ok(ready(Err(rpc_error.clone())))));
-    ensure(
-      matches!(rejected, RequestOutcome::RpcError(error) if error == rpc_error),
-      "a typed RPC handler failure must cross the erasure boundary unchanged",
-    )?;
-
     let invalid_params: Result<Ready<Result<u64, rpc::RpcError>>, String> = Err(String::from("fixture params rejected"));
-    let invalid = block_on(invoke_request(invalid_params));
-    ensure(
-      matches!(
-        invalid,
-        RequestOutcome::InvalidParams(detail) if detail == "fixture params rejected"
-      ),
-      "parameter decoding failure must remain distinct from handler execution",
-    )?;
-
-    let unserializable = block_on(invoke_request::<SerializationFailureFixture, _>(Ok(ready(Ok(
-      SerializationFailureFixture,
-    )))));
-    ensure(
-      matches!(
-        unserializable,
-        RequestOutcome::SerializationFailure(detail)
-          if detail.contains("fixture value cannot be serialized")
-      ),
-      "successful values that cannot serialize must become an internal response failure",
-    )
+    ensure_that(
+      [
+        block_on(invoke_request::<u64, _>(Ok(ready(Ok(73_u64))))),
+        block_on(invoke_request::<u64, _>(Ok(ready(Err(rpc_error.clone()))))),
+        block_on(invoke_request(invalid_params)),
+        block_on(invoke_request::<SerializationFailureFixture, _>(Ok(ready(Ok(SerializationFailureFixture))))),
+      ],
+      "request invocation must preserve successful values and distinct RPC, parameter, and serialization failures",
+      |observed| {
+        let [ref success, ref rejected, ref invalid, ref serialization] = *observed;
+        matches!(*success, RequestOutcome::Success(ref value) if *value == serde_json::json!(73))
+          && matches!(*rejected, RequestOutcome::RpcError(ref error) if *error == rpc_error)
+          && matches!(*invalid, RequestOutcome::InvalidParams(ref detail) if detail == "fixture params rejected")
+          && matches!(*serialization, RequestOutcome::SerializationFailure(ref detail) if detail.contains("fixture value cannot be serialized"))
+      },
+    ).map(drop).map_err(Box::new)
   }
 
+  /// Native valid, failed, and ignored notification outcomes.
+  type NotificationOutcomes = [Result<(), ServerError>; 3];
+
   #[test]
-  fn notification_invocation_runs_valid_handlers_propagates_failures_and_ignores_bad_params() -> Result<(), TestFailure> {
-    ensure_ok(
-      block_on(invoke_notification(Ok(ready(Ok(()))))),
-      "a valid notification handler must complete",
-    )?;
-
-    let handler_failure = block_on(invoke_notification(Ok(ready(Err(ServerError::ExitBeforeShutdown)))));
-    ensure(
-      matches!(handler_failure, Err(ServerError::ExitBeforeShutdown)),
-      "a notification handler failure must cross the erased boundary",
-    )?;
-
+  fn notification_invocation_runs_valid_handlers_propagates_failures_and_ignores_bad_params()
+  -> Result<(), Box<PredicateFailure<NotificationOutcomes>>> {
     let invalid_params: Result<Ready<Result<(), ServerError>>, String> = Err(String::from("fixture notification params rejected"));
-    ensure_ok(
-      block_on(invoke_notification(invalid_params)),
-      "invalid notification parameters must be ignored before handler execution",
+    ensure_that(
+      [
+        block_on(invoke_notification(Ok(ready(Ok(()))))),
+        block_on(invoke_notification(Ok(ready(Err(ServerError::ExitBeforeShutdown))))),
+        block_on(invoke_notification(invalid_params)),
+      ],
+      "notifications must run valid handlers, retain their typed failures, and contain invalid parameters",
+      |observed| matches!(*observed, [Ok(()), Err(ServerError::ExitBeforeShutdown), Ok(())]),
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

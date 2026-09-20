@@ -104,16 +104,18 @@ fn path_argument(path: &Path) -> Result<String, StaskError> {
 )]
 fn prepare_runner(context: &CommandContext<impl Workspace>, artifact: &Artifact) -> Result<PathBuf, StaskError> {
   let tool_directory = PathBuf::from(TOOL_DIRECTORY);
-  context.file_system().create_dir_all(&tool_directory).map_err(CoreError::from)?;
+  drop(context.file_system().create_dir_all(&tool_directory).map_err(CoreError::from)?);
 
   let compressed_path = tool_directory.join(artifact.file_name);
   let executable_path = compressed_path.with_extension("");
   let checksum_path = compressed_path.with_extension("sha256");
   let checksum = format!("{}  {}\n", artifact.sha256, compressed_path.display());
-  context
-    .file_system()
-    .write_bytes(&checksum_path, checksum.as_bytes())
-    .map_err(CoreError::from)?;
+  drop(
+    context
+      .file_system()
+      .write_bytes(&checksum_path, checksum.as_bytes())
+      .map_err(CoreError::from)?,
+  );
 
   command::run(
     context,
@@ -211,6 +213,7 @@ mod tests {
   use std::env::consts::ARCH;
   use std::env::consts::OS;
   use std::ffi::OsString;
+  use std::fmt::Debug;
   use std::path::Path;
   use std::path::PathBuf;
 
@@ -286,26 +289,17 @@ mod tests {
        mark it executable in order",
       |observed| {
         let events = observed.1.events();
-        let checksum = events.iter().find_map(|event| {
-          let &EffectEvent::WriteBytes {
-            ref path,
-            ref contents,
-            atomic: None,
-          } = event
-          else {
-            return None;
-          };
-          path
-            .extension()
-            .is_some_and(|extension| extension == "sha256")
-            .then_some(contents)
+        let checksum = events.iter().find(|event| {
+          matches!(**event, EffectEvent::WriteBytes { ref path, atomic: None, .. }
+            if path.extension().is_some_and(|extension| extension == "sha256"))
         });
         let requests = observed.1.process_requests();
         observed
           .0
           .as_ref()
           .is_ok_and(|runner| runner.as_path() == Path::new("target/stask-tools/toml-test-v2.2.0/toml-test-v2.2.0-linux-amd64"))
-          && checksum.is_some_and(|contents| contents == expected_checksum.as_bytes())
+          && checksum
+            .is_some_and(|event| matches!(*event, EffectEvent::WriteBytes { ref contents, .. } if contents == expected_checksum.as_bytes()))
           && requests.iter().map(|request| request.program.clone()).collect::<Vec<_>>()
             == ["curl", artifact.checksum_program, "gzip", "chmod"].map(OsString::from)
       },
@@ -382,29 +376,36 @@ mod tests {
   }
 
   #[test]
-  fn process_paths_accept_unicode_and_reject_unrepresentable_host_paths() -> Result<(), PredicateFailure<Result<String, StaskError>>> {
-    drop(ensure_that(
-      path_argument(Path::new("target/tool")),
-      "Unicode process paths must preserve exact text",
-      |observed| observed.as_ref().is_ok_and(|argument| argument == "target/tool"),
-    )?);
+  fn process_paths_accept_unicode_and_reject_unrepresentable_host_paths() -> Result<(), impl Debug> {
+    let unicode = path_argument(Path::new("target/tool"));
 
     #[cfg(unix)]
     {
       use std::os::unix::ffi::OsStringExt as _;
 
       let invalid = PathBuf::from(OsString::from_vec(vec![0xff]));
-      drop(ensure_that(
-        path_argument(&invalid),
-        "a non-Unicode process path must retain the rejected path in its native error",
+      let rejected = path_argument(&invalid);
+      ensure_that(
+        (unicode, invalid, rejected),
+        "process paths must preserve exact Unicode text and retain a rejected non-Unicode path in its native error",
         |observed| {
-          matches!(observed, &Err(StaskError::PathUnicode { ref path }) if path == &invalid)
+          matches!(observed.0, Ok(ref argument) if argument == "target/tool")
+            && matches!(observed.2, Err(StaskError::PathUnicode { ref path }) if path == &observed.1)
             && observed
+              .2
               .as_ref()
               .is_err_and(|error| error.to_string().contains("not valid Unicode"))
         },
-      )?);
+      )
+      .map(drop)
+      .map_err(Box::new)
     }
-    Ok(())
+
+    #[cfg(not(unix))]
+    ensure_that(unicode, "Unicode process paths must preserve exact text", |observed| {
+      observed.as_ref().is_ok_and(|argument| argument == "target/tool")
+    })
+    .map(drop)
+    .map_err(Box::new)
   }
 }

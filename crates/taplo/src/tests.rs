@@ -1,10 +1,14 @@
 //! Cross-module parser and formatter behavior tests.
 
-use strict_test_support::TestFailure;
-use strict_test_support::ensure;
-use strict_test_support::ensure_ok;
+use strict_test_support::PredicateFailure;
+use strict_test_support::ensure_that;
 
+use crate::parser::Parse;
+use crate::parser::ParseFailure;
 use crate::parser::parse;
+
+/// A complete parse result retained when a valid-input contract fails.
+type ValidParseFailure = PredicateFailure<Result<Parse, ParseFailure>>;
 
 /// Runtime validation of the checked-in valid and invalid TOML corpora.
 mod fixtures;
@@ -15,35 +19,33 @@ mod properties;
 
 /// Accept local-time values inside inline arrays without diagnostics.
 #[test]
-fn time_in_arrays() -> Result<(), TestFailure> {
+fn time_in_arrays() -> Result<(), ValidParseFailure> {
   let src = "
     a = [00:00:01, 02:03:04]
     ";
 
-  let parsed = ensure_ok(parse(src), "the time-array syntax tree must construct")?;
-  ensure(
-    parsed.diagnostics().is_empty(),
-    "valid times in arrays must not produce diagnostics",
-  )
+  ensure_that(parse(src), "valid times in arrays must not produce diagnostics", |parsed| {
+    parsed.as_ref().is_ok_and(|value| value.diagnostics().is_empty())
+  })
+  .map(drop)
 }
 
 /// Accept trailing comments on regular and array-of-tables headers.
 #[test]
-fn comments_after_tables() -> Result<(), TestFailure> {
+fn comments_after_tables() -> Result<(), ValidParseFailure> {
   let src = "
 [[array]] # foo
 [table] # foo
 ";
-  let parsed = ensure_ok(parse(src), "the table-comment syntax tree must construct")?;
-  ensure(
-    parsed.diagnostics().is_empty(),
-    "comments after table headers must not produce diagnostics",
-  )
+  ensure_that(parse(src), "comments after table headers must not produce diagnostics", |parsed| {
+    parsed.as_ref().is_ok_and(|value| value.diagnostics().is_empty())
+  })
+  .map(drop)
 }
 
 /// Treat date-shaped tokens as legal table and entry keys.
 #[test]
-fn dates_in_table_keys() -> Result<(), TestFailure> {
+fn dates_in_table_keys() -> Result<(), ValidParseFailure> {
   let src = "
 [2024-01-01]
 2024-01-01 = true
@@ -51,25 +53,25 @@ fn dates_in_table_keys() -> Result<(), TestFailure> {
 [[2024-01-02]]
 2024-01-01 = true
 ";
-  let parsed = ensure_ok(parse(src), "the date-key syntax tree must construct")?;
-  ensure(
-    parsed.diagnostics().is_empty(),
-    "dates used as table keys must not produce diagnostics",
-  )
+  ensure_that(parse(src), "dates used as table keys must not produce diagnostics", |parsed| {
+    parsed.as_ref().is_ok_and(|value| value.diagnostics().is_empty())
+  })
+  .map(drop)
 }
 
 /// Accept the supported multiline inline-table form with a trailing comma.
 #[test]
-fn inline_table_with_linebreaks_and_trailing_comma() -> Result<(), TestFailure> {
+fn inline_table_with_linebreaks_and_trailing_comma() -> Result<(), ValidParseFailure> {
   let src = r#"
 cooldowns = { 
     foo = "foo",
     bar = "bar",
 }
 "#;
-  let parsed = ensure_ok(parse(src), "the multiline inline-table syntax tree must construct")?;
-  ensure(
-    parsed.diagnostics().is_empty(),
+  ensure_that(
+    parse(src),
     "supported multiline inline tables must not produce diagnostics",
+    |parsed| parsed.as_ref().is_ok_and(|value| value.diagnostics().is_empty()),
   )
+  .map(drop)
 }

@@ -2528,20 +2528,19 @@ fn render_table_blocks(blocks: &[TableBlockFragment], gaps: &[TableBlockGap]) ->
 #[cfg(test)]
 /// Exact-path query, fragment, transaction, trivia, and structural reconciliation contracts.
 mod tests {
+  use core::fmt::Debug;
   use core::iter::empty;
   use core::ops::Range;
+  use core::slice::from_ref;
 
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_eq;
-  use strict_test_support::ensure_ok;
-  use strict_test_support::ensure_some;
+  use strict_test_support::ensure_that;
 
   use super::ArrayElementFragment;
   use super::EditOutcome;
   use super::EntryFragment;
   use super::ExactPath;
   use super::FragmentKind;
+  use super::PendingPatch;
   use super::RemoveEmptyParents;
   use super::Rewrite;
   use super::RewriteError;
@@ -2555,98 +2554,57 @@ mod tests {
   use crate::dom::error::QueryError;
   use crate::parser::parse;
 
-  /// Construct a rewrite fixture from a cleanly parsed document.
-  fn rewrite(source: &str) -> Result<Rewrite, TestFailure> {
-    let parsed = ensure_ok(parse(source), "the rewrite fixture tree must construct")?;
-    ensure(parsed.diagnostics().is_empty(), "the rewrite fixture must parse cleanly")?;
-    ensure_ok(Rewrite::new(parsed.into_dom()), "a parsed document root must be rewriteable")
+  /// A complete transaction, its native edit observations, and its render result.
+  type RenderedTransaction<T> = Result<(Rewrite, T, Result<String, RewriteError>), RewriteError>;
+
+  /// Entry validation and the resulting native insertion outcome.
+  type EntryInsertion = Result<(EntryFragment, Result<EditOutcome, RewriteError>), RewriteError>;
+
+  /// Original and reordered array fragments with their native reconciliation outcome.
+  type ArrayReordering = Result<
+    (
+      Vec<ArrayElementFragment>,
+      Vec<ArrayElementFragment>,
+      Result<EditOutcome, RewriteError>,
+    ),
+    RewriteError,
+  >;
+
+  /// Patch snapshots from all four ordered key renames.
+  type RenameObservations = [Result<Vec<PendingPatch>, RewriteError>; 4];
+
+  /// Preserve an edit's native observations alongside its owning transaction and render result.
+  fn edit_document<T>(source: &str, edit: impl FnOnce(&mut Rewrite) -> T) -> RenderedTransaction<T> {
+    Rewrite::parse(source).map(|mut document| {
+      let observations = edit(&mut document);
+      let rendered = document.render();
+      (document, observations, rendered)
+    })
   }
 
-  /// Parse an exact path in tests without obscuring its failure context.
-  fn path(source: &str) -> Result<ExactPath, TestFailure> {
-    ensure_ok(ExactPath::parse(source), "the fixture path must be exact")
+  /// Insert an entry while retaining both its validated fragment and native edit result.
+  fn insert_document(source: &str, parent: &ExactPath, entry_source: &str) -> RenderedTransaction<EntryInsertion> {
+    edit_document(source, |document| {
+      EntryFragment::parse(entry_source).map(|entry| {
+        let inserted = document.insert_entry(parent, &entry);
+        (entry, inserted)
+      })
+    })
   }
 
-  /// Require three optional source positions to exist in strict order.
-  fn ensure_ordered_positions(
-    first: Option<usize>,
-    second: Option<usize>,
-    third: Option<usize>,
-    context: &'static str,
-  ) -> Result<(), TestFailure> {
-    let first_position = ensure_some(first, context)?;
-    let second_position = ensure_some(second, context)?;
-    let third_position = ensure_some(third, context)?;
-    ensure(
-      (first_position < second_position, second_position < third_position) == (true, true),
-      context,
-    )
+  /// Preserve extracted array fragments and their reordered copies with the native edit result.
+  fn reorder_array(document: &mut Rewrite, values: &ExactPath) -> ArrayReordering {
+    document.array_elements(values).map(|mut fragments| {
+      let original = fragments.clone();
+      fragments.reverse();
+      let outcome = document.reconcile_array(values, &fragments);
+      (original, fragments, outcome)
+    })
   }
 
-  /// Require one rewrite operation to succeed with its exact structural effect.
-  fn ensure_edit_outcome(
-    result: Result<EditOutcome, RewriteError>,
-    expected: EditOutcome,
-    operation_context: &'static str,
-    outcome_context: &'static str,
-  ) -> Result<(), TestFailure> {
-    ensure_eq(&ensure_ok(result, operation_context)?, &expected, outcome_context)
-  }
-
-  /// Project every real DOM diagnostic from one tolerant parse into rewrite-owned data.
-  #[allow(
-    clippy::single_call_fn,
-    reason = "the fixture keeps tolerant-parse validation and diagnostic projection out of the per-family assertions"
-  )]
-  fn semantic_diagnostics(source: &str) -> Result<Vec<SemanticDiagnostic>, TestFailure> {
-    let parsed = ensure_ok(parse(source), "the semantic-diagnostic fixture tree must construct")?;
-    let root = parsed.into_dom();
-    let diagnostics = ensure_some(
-      root.validate().err(),
-      "the semantic-diagnostic fixture must be rejected by DOM validation",
-    )?;
-    Ok(diagnostics.into_iter().map(SemanticDiagnostic::from_dom).collect())
-  }
-
-  /// Insert one validated entry and render the committed source transaction.
-  fn render_entry_insertion(source: &str, parent: &ExactPath, entry_source: &str) -> Result<String, TestFailure> {
-    let mut document = ensure_ok(Rewrite::parse(source), "the entry-insertion fixture must parse")?;
-    let entry = ensure_ok(EntryFragment::parse(entry_source), "the inserted entry fragment must validate")?;
-    ensure_eq(
-      &ensure_ok(
-        document.insert_entry(parent, &entry),
-        "the entry must be insertable at its selected parent",
-      )?,
-      &EditOutcome::Inserted,
-      "entry insertion must report newly inserted source",
-    )?;
-    ensure_ok(document.render(), "the entry insertion must render")
-  }
-
-  /// Queue one raw patch and return the failed transaction with its typed render error.
-  fn failed_patch_render(source: &str, range: Range<usize>, replacement: &str) -> Result<(Rewrite, RewriteError), TestFailure> {
-    let mut document = ensure_ok(Rewrite::parse(source), "the invalid-range fixture must parse")?;
-    ensure_ok(
-      document.push_std_patch(range, replacement.into()),
-      "the Rowan-representable patch must be queued",
-    )?;
-    let error = ensure_some(document.render().err(), "the invalid patch must fail rendering")?;
-    Ok((document, error))
-  }
-
-  /// Apply one structural reconciliation and render its exact committed source.
-  fn render_reconciliation(
-    source: &str,
-    expected_outcome: EditOutcome,
-    reconcile: impl FnOnce(&mut Rewrite) -> Result<EditOutcome, RewriteError>,
-  ) -> Result<String, TestFailure> {
-    let mut document = ensure_ok(Rewrite::parse(source), "the reconciliation fixture must parse")?;
-    ensure_eq(
-      &ensure_ok(reconcile(&mut document), "the structural reconciliation must succeed")?,
-      &expected_outcome,
-      "the reconciliation must report its structural source effect",
-    )?;
-    ensure_ok(document.render(), "the reconciled source must render")
+  /// Retain raw patch admission and rendering together with the uncommitted transaction.
+  fn raw_patch_document(source: &str, range: Range<usize>, replacement: &str) -> RenderedTransaction<Result<(), RewriteError>> {
+    edit_document(source, |document| document.push_std_patch(range, replacement.into()))
   }
 
   /// Enforce the rewrite API's concurrent-ownership contract at compile time.
@@ -2656,100 +2614,108 @@ mod tests {
   )]
   fn require_send_sync<T: Send + Sync>() {}
 
-  /// Apply the shared nested-key rename transaction and render its result.
-  fn render_nested_renames(source: &str, deepest_query: &str) -> Result<String, TestFailure> {
-    let mut patches = rewrite(source)?;
-    let root_renamed = ensure_ok(patches.rename_keys("table", "table_new"), "the root key must be renameable")?;
-    let middle_renamed = ensure_ok(
-      root_renamed.rename_keys("table.middle", "middle_new"),
-      "the middle key must be renameable",
-    )?;
-    let inner_renamed = ensure_ok(
-      middle_renamed.rename_keys("table.middle.inner", "inner_new"),
-      "the inner key must be renameable",
-    )?;
-    let deepest_renamed = ensure_ok(
-      inner_renamed.rename_keys(deepest_query, "inner2_new"),
-      "the deepest key must be renameable",
-    )?;
-    ensure_ok(deepest_renamed.render(), "the nested-key patches must render")
+  /// Retain each accepted rename's patch snapshot before rendering the complete transaction.
+  fn nested_renames(source: &str, deepest_query: &str) -> RenderedTransaction<RenameObservations> {
+    edit_document(source, |document| {
+      [
+        ("table", "table_new"),
+        ("table.middle", "middle_new"),
+        ("table.middle.inner", "inner_new"),
+        (deepest_query, "inner2_new"),
+      ]
+      .map(|(query, replacement)| {
+        document
+          .rename_keys(query, replacement)
+          .map(|updated| updated.patches().to_vec())
+      })
+    })
   }
 
   /// Apply differently sized key replacements in descending source order.
   #[test]
-  fn rename_keys() -> Result<(), TestFailure> {
-    let toml = "\n[table.middle.inner]\n[table.middle.inner.inner]\n";
-    let expected = "\n[table_new.middle_new.inner_new]\n[table_new.middle_new.inner_new.inner2_new]\n";
-    let rendered = render_nested_renames(toml, "table.middle.inner.inner")?;
-    ensure_eq(
-      &rendered.as_str(),
-      &expected,
-      "different-length replacements must retain source order",
-    )
+  fn rename_keys() -> Result<(), impl Debug> {
+    let observed = nested_renames("\n[table.middle.inner]\n[table.middle.inner.inner]\n", "table.middle.inner.inner");
+    ensure_that(observed, "different-length replacements must retain source order", |result| {
+      let &Ok((_, ref edits, ref rendered)) = result else {
+        return false;
+      };
+
+      edits.iter().all(Result::is_ok)
+        && rendered
+          .as_ref()
+          .is_ok_and(|text| text == "\n[table_new.middle_new.inner_new]\n[table_new.middle_new.inner_new.inner2_new]\n")
+    })
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Rename every matching segment across repeated and nested array-of-tables headers.
   #[test]
-  fn rename_keys_array_of_tables() -> Result<(), TestFailure> {
-    let toml = "\n[[table.middle.inner]]\n[[table.middle.inner]]\n[table.middle.inner.inner]\n";
-    let expected =
-      "\n[[table_new.middle_new.inner_new]]\n[[table_new.middle_new.inner_new]]\n[table_new.middle_new.inner_new.inner2_new]\n";
-    let rendered = render_nested_renames(toml, "table.middle.inner.*.inner")?;
-    ensure_eq(&rendered.as_str(), &expected, "all matching array-table ranges must be rewritten")
+  fn rename_keys_array_of_tables() -> Result<(), impl Debug> {
+    let observed = nested_renames(
+      "\n[[table.middle.inner]]\n[[table.middle.inner]]\n[table.middle.inner.inner]\n",
+      "table.middle.inner.*.inner",
+    );
+    ensure_that(observed, "all matching array-table ranges must be rewritten", |result| {
+      let &Ok((_, ref edits, ref rendered)) = result else {
+        return false;
+      };
+
+      edits.iter().all(Result::is_ok)
+        && rendered.as_ref().is_ok_and(|text| {
+          text == "\n[[table_new.middle_new.inner_new]]\n[[table_new.middle_new.inner_new]]\n[table_new.middle_new.inner_new.inner2_new]\n"
+        })
+    })
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Keep exact paths literal while reserving an empty path for the document root.
   #[test]
-  fn exact_paths_are_literal_and_root_is_empty() -> Result<(), TestFailure> {
-    let root = ensure_ok(ExactPath::parse(""), "an empty path must parse as the document root")?;
-    ensure(
-      [root.is_root(), root.is_empty(), root.key().is_none(), root.parent().is_none()] == [true, true, true, true],
-      "the document root must have no segments, key, or parent",
-    )?;
-    ensure_eq(
-      &root,
-      &ExactPath::from_segments(empty::<&str>()),
-      "both root constructors must agree",
-    )?;
-    ensure_eq(&root.to_string().as_str(), &"", "the document root must render as an empty path")?;
-
-    let quoted = ensure_ok(
-      ExactPath::try_from("patch.\"https://example.com/repo\""),
-      "TryFrom must accept an exact quoted path",
-    )?;
-    ensure(
-      quoted.segments().collect::<Vec<_>>() == ["patch", "https://example.com/repo"],
-      "quoted punctuation must remain one literal segment",
-    )?;
-    let child = quoted.child("feature flags");
-    let parent = ensure_some(child.parent(), "a child path must expose its parent")?;
-    ensure(parent == quoted, "removing the final child must restore the original path")?;
-    let suffix = ExactPath::from_segments(["*", "line\nbreak"]);
-    let extended = child.extend(&suffix);
-    ensure(
-      extended.segments().collect::<Vec<_>>() == ["patch", "https://example.com/repo", "feature flags", "*", "line\nbreak"],
-      "path extension must preserve every literal suffix segment in order",
-    )?;
-    ensure(
-      matches!(ExactPath::parse("items.*"), Err(RewriteError::InvalidPath { .. })),
-      "unquoted wildcard syntax must be rejected",
-    )?;
-    let literal_wildcard = path("items.\"*\"")?;
-    ensure_eq(
-      &literal_wildcard.key().unwrap_or(""),
-      &"*",
-      "a quoted wildcard character must remain an exact literal key",
-    )?;
-    ensure(
-      matches!(ExactPath::parse("items[0]"), Err(RewriteError::InvalidPath { .. })),
-      "array-index syntax must be rejected",
+  fn exact_paths_are_literal_and_root_is_empty() -> Result<(), impl Debug> {
+    let fixture_quoted = ExactPath::try_from("patch.\"https://example.com/repo\"").map(|original| {
+      let child = original.child("feature flags");
+      let extended = child.extend(&ExactPath::from_segments(["*", "line\nbreak"]));
+      (original, child, extended)
+    });
+    ensure_that(
+      (
+        ExactPath::parse(""),
+        fixture_quoted,
+        ExactPath::parse("items.*"),
+        ExactPath::parse("items.\"*\""),
+        ExactPath::parse("items[0]"),
+      ),
+      "exact paths must preserve literal segments and reject query syntax",
+      |root_fields| {
+        let (ref root, ref quoted, ref glob, ref literal, ref index) = *root_fields;
+        root.as_ref().is_ok_and(|path| {
+          path.is_root()
+            && path.is_empty()
+            && path.key().is_none()
+            && path.parent().is_none()
+            && path == &ExactPath::from_segments(empty::<&str>())
+            && path.to_string().is_empty()
+        }) && quoted.as_ref().is_ok_and(|original_fields| {
+          let (ref original, ref child, ref extended) = *original_fields;
+          original.segments().eq(["patch", "https://example.com/repo"])
+            && child.parent().as_ref() == Some(original)
+            && extended
+              .segments()
+              .eq(["patch", "https://example.com/repo", "feature flags", "*", "line\nbreak"])
+        }) && matches!(glob, Err(RewriteError::InvalidPath { .. }))
+          && literal.as_ref().is_ok_and(|path| path.key() == Some("*"))
+          && matches!(index, Err(RewriteError::InvalidPath { .. }))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Render every literal key class without changing its decoded value.
   #[test]
-  fn exact_paths_render_literal_keys_canonically() -> Result<(), TestFailure> {
-    for (key, expected) in [
+  fn exact_paths_render_literal_keys_canonically() -> Result<(), impl Debug> {
+    let observed = [
       ("bare_1-key", "bare_1-key"),
       ("", "\"\""),
       ("with space", "\"with space\""),
@@ -2762,26 +2728,27 @@ mod tests {
       ("\u{000c}", "\"\\f\""),
       ("\u{0001}", "\"\\u0001\""),
       ("caf\u{e9}", "\"caf\u{e9}\""),
-    ] {
-      let rendered = ExactPath::from_segments([key]).to_string();
-      ensure_eq(
-        &rendered.as_str(),
-        &expected,
-        "literal key rendering must use the canonical lossless TOML spelling",
-      )?;
-      let reparsed = ensure_ok(ExactPath::parse(&rendered), "a rendered literal key must parse again")?;
-      ensure(
-        reparsed.segments().eq([key]),
-        "a rendered literal key must decode to the original segment",
-      )?;
-    }
-    Ok(())
+    ]
+    .map(|(key, expected)| {
+      let path = ExactPath::from_segments([key]);
+      let rendered = path.to_string();
+      let reparsed = ExactPath::parse(&rendered);
+      (key, expected, path, rendered, reparsed)
+    });
+    ensure_that(observed, "canonical path spellings must round-trip every literal key", |cases| {
+      cases.iter().all(|key_fields| {
+        let (key, ref expected, _, ref rendered, ref reparsed) = *key_fields;
+        rendered == expected && reparsed.as_ref().is_ok_and(|path| path.segments().eq([key]))
+      })
+    })
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Keep public fieldless-enum rendering stable for diagnostics and command output.
   #[test]
-  fn public_enum_display_is_stable() -> Result<(), TestFailure> {
-    for (kind, expected) in [
+  fn public_enum_display_is_stable() -> Result<(), impl Debug> {
+    let fixture_kinds = [
       (TomlKind::Table, "Table"),
       (TomlKind::InlineTable, "InlineTable"),
       (TomlKind::Array, "Array"),
@@ -2792,69 +2759,48 @@ mod tests {
       (TomlKind::Boolean, "Boolean"),
       (TomlKind::DateTime, "DateTime"),
       (TomlKind::Invalid, "Invalid"),
-    ] {
-      ensure_eq(
-        &kind.to_string().as_str(),
-        &expected,
-        "TOML kinds must retain their stable variant-name rendering",
-      )?;
-    }
-    for (outcome, expected) in [
+    ];
+    let fixture_outcomes = [
       (EditOutcome::Unchanged, "Unchanged"),
       (EditOutcome::Inserted, "Inserted"),
       (EditOutcome::Replaced, "Replaced"),
       (EditOutcome::Removed, "Removed"),
-    ] {
-      ensure_eq(
-        &outcome.to_string().as_str(),
-        &expected,
-        "edit outcomes must retain their stable variant-name rendering",
-      )?;
-    }
-    Ok(())
+    ];
+    ensure_that(
+      (fixture_kinds, fixture_outcomes),
+      "public enums must retain their stable variant-name rendering",
+      |kinds_fields| {
+        let (ref kinds, ref outcomes) = *kinds_fields;
+        kinds.iter().all(|&(kind, expected)| kind.to_string() == expected)
+          && outcomes.iter().all(|&(outcome, expected)| outcome.to_string() == expected)
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Reject both parser and DOM diagnostics before a rewrite transaction is created.
   #[test]
-  fn parse_rejects_syntax_and_semantic_diagnostics() -> Result<(), TestFailure> {
-    ensure(
-      matches!(Rewrite::parse("value = [1 2]"), Err(RewriteError::SyntaxDiagnostics { .. })),
-      "syntax diagnostics must reject a rewrite",
-    )?;
-    let semantic = Rewrite::parse("value = 1\nvalue = 2\n");
-    ensure(
-      matches!(semantic, Err(RewriteError::SemanticDiagnostics { .. })),
-      "duplicate-key semantic diagnostics must reject a rewrite",
-    )?;
-    let diagnostics = match semantic {
-      Err(RewriteError::SemanticDiagnostics {
-        diagnostics,
-      }) => diagnostics,
-      _ => Vec::new(),
-    };
-    let diagnostic = ensure_some(diagnostics.first(), "duplicate keys must retain one owned semantic diagnostic")?;
-    ensure(
-      diagnostic.kind() == SemanticDiagnosticKind::ConflictingKeys,
-      "the projected diagnostic must retain its stable category",
-    )?;
-    ensure(
-      diagnostic.range().is_some(),
-      "the projected diagnostic must retain its primary source range",
-    )?;
-    ensure(
-      diagnostic.related_range().is_some(),
-      "the projected diagnostic must retain its conflicting source range",
-    )?;
-    ensure(
-      !diagnostic.message().is_empty(),
-      "the projected diagnostic must retain its rendered message",
+  fn parse_rejects_syntax_and_semantic_diagnostics() -> Result<(), impl Debug> {
+    ensure_that(
+      (Rewrite::parse("value = [1 2]"), Rewrite::parse("value = 1\nvalue = 2\n")),
+      "rewrites must reject syntax and semantic diagnostics with their native evidence",
+      |syntax_fields| {
+        let (ref syntax, ref semantic) = *syntax_fields;
+        matches!(syntax, Err(RewriteError::SyntaxDiagnostics { .. }))
+          && matches!(semantic, Err(RewriteError::SemanticDiagnostics { diagnostics }) if diagnostics.first().is_some_and(|diagnostic|
+            diagnostic.kind() == SemanticDiagnosticKind::ConflictingKeys && diagnostic.range().is_some()
+              && diagnostic.related_range().is_some() && !diagnostic.message().is_empty()))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Project every DOM diagnostic family into owned typed ranges and messages.
   #[test]
-  fn semantic_diagnostic_projection_preserves_all_families() -> Result<(), TestFailure> {
-    for (source, expected_kind, expected_nonempty, expected_related, expected_message) in [
+  fn semantic_diagnostic_projection_preserves_all_families() -> Result<(), impl Debug> {
+    let fixture_cases = [
       (
         "missing =\nnext = 1\n",
         SemanticDiagnosticKind::UnexpectedSyntax,
@@ -2897,42 +2843,39 @@ mod tests {
         true,
         "expected array of tables",
       ),
-    ] {
-      let diagnostics = semantic_diagnostics(source)?;
-      let diagnostic = ensure_some(
-        diagnostics.iter().find(|diagnostic| diagnostic.kind() == expected_kind),
-        "the fixture must produce its expected semantic diagnostic family",
-      )?;
-      ensure(
-        (
-          diagnostic.message().starts_with(expected_message),
-          diagnostic.to_string() == diagnostic.message(),
-        ) == (true, true),
-        "the owned diagnostic must preserve both its message and Display contract",
-      )?;
-      let primary = ensure_some(
-        diagnostic.range(),
-        "a source-backed semantic diagnostic must preserve its primary range",
-      )?;
-      ensure(
-        (
-          primary.start() <= primary.end(),
-          (primary.start() < primary.end()) == expected_nonempty,
-        ) == (true, true),
-        "a semantic diagnostic must retain an ordered range with the source family's exact width polarity",
-      )?;
-      ensure(
-        diagnostic.related_range().is_some() == expected_related,
-        "only paired semantic diagnostics must retain a related range",
-      )?;
-      if let Some(related) = diagnostic.related_range() {
-        ensure(
-          related.start() < related.end(),
-          "a paired semantic diagnostic must retain a nonempty related range",
-        )?;
-      }
-    }
-    Ok(())
+    ]
+    .map(|(source, kind, nonempty, related, message)| {
+      let observed = parse(source).map(|parsed| {
+        let root = parsed.clone().into_dom();
+        let diagnostics = root.validate();
+        let projected = diagnostics
+          .as_ref()
+          .err()
+          .map(|errors| errors.iter().cloned().map(SemanticDiagnostic::from_dom).collect::<Vec<_>>());
+        (parsed, root, diagnostics, projected)
+      });
+      (kind, nonempty, related, message, observed)
+    });
+    ensure_that(
+      fixture_cases,
+      "semantic projection must preserve each diagnostic's message and exact range polarity",
+      |cases| {
+        cases.iter().all(|kind_fields| {
+          let (ref kind, ref nonempty, ref related, ref message, ref observed) = *kind_fields;
+          matches!(observed, &Ok((_, _, ref diagnostics, Some(ref projected))) if diagnostics.is_err()
+            && projected.iter().find(|diagnostic| diagnostic.kind() == *kind).is_some_and(|diagnostic|
+              diagnostic.range().is_some_and(|range|
+                diagnostic.message().starts_with(message)
+                && diagnostic.to_string() == diagnostic.message()
+                && range.start() <= range.end()
+                && (range.start() < range.end()) == *nonempty
+                && diagnostic.related_range().is_some() == *related
+                && diagnostic.related_range().is_none_or(|related_range| related_range.start() < related_range.end()))))
+        })
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Require owned rewrite failures to cross concurrent execution boundaries safely.
@@ -2943,1309 +2886,1125 @@ mod tests {
 
   /// Render an untouched non-ASCII document without changing any UTF-8 byte.
   #[test]
-  fn untouched_and_non_ascii_documents_render_byte_for_byte() -> Result<(), TestFailure> {
+  fn untouched_and_non_ascii_documents_render_byte_for_byte() -> Result<(), impl Debug> {
     let source = "# caf\u{e9}\n\"\u{43a}\u{43b}\u{44e}\u{447}\" = \"\u{5024}\"\n";
-    let rewrite = ensure_ok(Rewrite::parse(source), "valid non-ASCII TOML must parse")?;
-    let rendered = ensure_ok(rewrite.render(), "an untouched document must render")?;
-    ensure_eq(&rendered.as_str(), &source, "untouched UTF-8 bytes must be identical")
+    let observed = Rewrite::parse(source).map(|document| {
+      let rendered = document.render();
+      (document, rendered)
+    });
+    ensure_that(observed, "untouched UTF-8 bytes must be identical", |result| {
+      result
+        .as_ref()
+        .is_ok_and(|rendered_document| rendered_document.1.as_ref().is_ok_and(|text| text == source))
+    })
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Forward `Display` through the same validated source transaction as `render`.
   #[test]
-  fn display_matches_render_for_pending_rewrites() -> Result<(), TestFailure> {
-    let mut rewrite = ensure_ok(Rewrite::parse("value = 1\n"), "the display fixture must parse")?;
-    let replacement = ensure_ok(ValueFragment::parse("2"), "the displayed replacement must validate")?;
-    ensure_edit_outcome(
-      rewrite.replace_value(&path("value")?, &replacement),
-      EditOutcome::Replaced,
-      "the displayed value must be replaceable",
-      "the displayed mutation must report replacement",
-    )?;
-    let rendered = ensure_ok(rewrite.render(), "the pending display transaction must render")?;
-    ensure_eq(
-      &rewrite.to_string(),
-      &rendered,
+  fn display_matches_render_for_pending_rewrites() -> Result<(), impl Debug> {
+    let observed = edit_document("value = 1\n", |document| {
+      ValueFragment::parse("2").map(|replacement| {
+        let edited = document.replace_value(&ExactPath::from_segments(["value"]), &replacement);
+        (replacement, edited)
+      })
+    });
+    ensure_that(
+      observed,
       "Display must publish the same complete source as the fallible renderer",
+      |result| {
+        let &Ok((ref document, ref edited, ref rendered)) = result else {
+          return false;
+        };
+
+        edited.as_ref().is_ok_and(|edit| matches!(edit.1, Ok(EditOutcome::Replaced)))
+          && rendered.as_ref().is_ok_and(|text| document.to_string() == *text)
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Return exact source slices and structural kinds for values and entries.
   #[test]
-  fn values_and_entries_are_exact_and_typed() -> Result<(), TestFailure> {
-    let source = "# attached\nvalue  =  [1, 2] # trailing\nother = true\n";
-    let rewrite = ensure_ok(Rewrite::parse(source), "the query fixture must parse")?;
-    let value_path = path("value")?;
-    let value = ensure_ok(rewrite.value(&value_path), "the array value must be queryable")?;
-    ensure_eq(&value.text(), &"[1, 2]", "value lookup must exclude key and trivia")?;
-    ensure_eq(&value.kind(), &TomlKind::Array, "value lookup must expose the TOML kind")?;
-    let entry = ensure_ok(rewrite.entry(&value_path), "the entry must be queryable")?;
-    ensure_eq(
-      &entry.text(),
-      &"value  =  [1, 2] # trailing",
-      "entry lookup must retain internal spacing and its inline comment",
-    )?;
-    ensure_eq(&entry.kind(), &TomlKind::Array, "entry lookup must expose its value kind")?;
-    ensure_eq(
-      &entry.value().text(),
-      &"[1, 2]",
-      "entry lookup must expose the same exact value view",
-    )?;
-    let value_fragment = ensure_ok(rewrite.value_fragment(&value_path), "the value must be extractable")?;
-    ensure_eq(
-      &value_fragment.as_str(),
-      &"[1, 2]",
-      "value extraction must retain the exact value spelling",
-    )?;
-    ensure_eq(
-      &value_fragment.kind(),
-      &TomlKind::Array,
-      "value extraction must retain the parsed structural kind",
-    )?;
-    let fragment = ensure_ok(rewrite.entry_fragment(&value_path), "the entry must be extractable")?;
-    ensure(
-      [
-        fragment.as_str().contains("# attached"),
-        fragment.as_str().contains("# trailing"),
-      ] == [true, true],
-      "the extracted entry must retain attached comments",
-    )?;
-    ensure(fragment.key() == &value_path, "entry extraction must retain its exact key")?;
-    ensure_eq(
-      &fragment.value().kind(),
-      &TomlKind::Array,
-      "entry extraction must retain its validated value fragment",
+  fn values_and_entries_are_exact_and_typed() -> Result<(), impl Debug> {
+    let observed = Rewrite::parse("# attached\nvalue  =  [1, 2] # trailing\nother = true\n").map(|document| {
+      let path = ExactPath::from_segments(["value"]);
+      let value = document.value_fragment(&path);
+      let entry = document.entry_fragment(&path);
+      (document, path, value, entry)
+    });
+    ensure_that(
+      observed,
+      "exact queries and fragments must preserve source spelling, trivia, and structural kinds",
+      |result| {
+        let &Ok((ref document, ref path, ref value, ref entry)) = result else {
+          return false;
+        };
+
+        document
+          .value(path)
+          .is_ok_and(|view| view.text() == "[1, 2]" && view.kind() == TomlKind::Array)
+          && document.entry(path).is_ok_and(|view| {
+            view.text() == "value  =  [1, 2] # trailing" && view.kind() == TomlKind::Array && view.value().text() == "[1, 2]"
+          })
+          && value
+            .as_ref()
+            .is_ok_and(|fragment| fragment.as_str() == "[1, 2]" && fragment.kind() == TomlKind::Array)
+          && entry.as_ref().is_ok_and(|fragment| {
+            fragment.as_str().contains("# attached")
+              && fragment.as_str().contains("# trailing")
+              && fragment.key() == path
+              && fragment.value().kind() == TomlKind::Array
+          })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Classify every source-backed value family through the public exact-value query.
   #[test]
-  fn value_queries_classify_scalar_and_composite_families() -> Result<(), TestFailure> {
-    let rewrite = ensure_ok(
-      Rewrite::parse(
-        "boolean = true\nstring = \"value\"\ninteger = 1\nfloat = 1.5\ndate = 1979-05-27T07:32:00Z\narray = [1]\ninline = \
-         {}\n[regular]\nchild = 1\n[[items]]\nchild = 2\n",
-      ),
-      "the value-kind fixture must parse",
-    )?;
-    for (query, expected) in [
-      ("boolean", TomlKind::Boolean),
-      ("string", TomlKind::String),
-      ("integer", TomlKind::Integer),
-      ("float", TomlKind::Float),
-      ("date", TomlKind::DateTime),
-      ("array", TomlKind::Array),
-      ("inline", TomlKind::InlineTable),
-      ("regular", TomlKind::Table),
-      ("items", TomlKind::ArrayOfTables),
-    ] {
-      let value = ensure_ok(
-        rewrite.value(&path(query)?),
-        "every source-backed TOML family must support an exact value query",
-      )?;
-      ensure_eq(
-        &value.kind(),
-        &expected,
-        "exact value queries must preserve the structural TOML family",
-      )?;
-    }
-    Ok(())
+  fn value_queries_classify_scalar_and_composite_families() -> Result<(), impl Debug> {
+    let observed = Rewrite::parse(
+      "boolean = true\nstring = \"value\"\ninteger = 1\nfloat = 1.5\ndate = 1979-05-27T07:32:00Z\narray = [1]\ninline = \
+       {}\n[regular]\nchild = 1\n[[items]]\nchild = 2\n",
+    );
+    ensure_that(
+      observed,
+      "exact value queries must preserve every structural TOML family",
+      |result| {
+        let Ok(ref document) = *result else {
+          return false;
+        };
+
+        [
+          ("boolean", TomlKind::Boolean),
+          ("string", TomlKind::String),
+          ("integer", TomlKind::Integer),
+          ("float", TomlKind::Float),
+          ("date", TomlKind::DateTime),
+          ("array", TomlKind::Array),
+          ("inline", TomlKind::InlineTable),
+          ("regular", TomlKind::Table),
+          ("items", TomlKind::ArrayOfTables),
+        ]
+        .iter()
+        .all(|query_fields| {
+          let (query, ref expected) = *query_fields;
+          document
+            .value(&ExactPath::from_segments([query]))
+            .is_ok_and(|view| view.kind() == *expected)
+        })
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Reject document roots and table headers where a key/value entry is required.
   #[test]
-  fn entry_operations_reject_non_entry_paths_without_mutation() -> Result<(), TestFailure> {
-    let mut rewrite = ensure_ok(Rewrite::parse("[table]\nvalue = 1\n"), "the non-entry path fixture must parse")?;
-    ensure(
-      matches!(rewrite.entry(&ExactPath::default()), Err(RewriteError::MissingPath { .. })),
-      "the document root must not be projected as a key/value entry",
-    )?;
-    let table = path("table")?;
-    ensure(
-      matches!(rewrite.entry(&table), Err(RewriteError::UnsupportedPlacement { .. })),
-      "a regular table header must not be projected as a key/value entry",
-    )?;
-    ensure(
-      matches!(
-        rewrite.remove_entry(&table, RemoveEmptyParents::Keep),
-        Err(RewriteError::UnsupportedPlacement { .. })
-      ),
-      "entry removal must reject a regular table header",
-    )?;
-    ensure(
-      rewrite.patches().is_empty(),
-      "rejected non-entry operations must not queue a source patch",
+  fn entry_operations_reject_non_entry_paths_without_mutation() -> Result<(), impl Debug> {
+    let table = ExactPath::from_segments(["table"]);
+    let observed = edit_document("[table]\nvalue = 1\n", |document| {
+      document.remove_entry(&table, RemoveEmptyParents::Keep)
+    });
+    ensure_that(
+      observed,
+      "non-entry queries and removals must retain their typed failures without patches",
+      |result| {
+        let &Ok((ref document, ref removed, _)) = result else {
+          return false;
+        };
+
+        matches!(document.entry(&ExactPath::default()), Err(RewriteError::MissingPath { .. }))
+          && matches!(document.entry(&table), Err(RewriteError::UnsupportedPlacement { .. }))
+          && matches!(removed, Err(RewriteError::UnsupportedPlacement { .. }))
+          && document.patches().is_empty()
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Expose validated array-element and table-block metadata without reparsing at call sites.
   #[test]
-  fn structural_fragments_expose_their_validated_metadata() -> Result<(), TestFailure> {
-    let element = ensure_ok(
-      ArrayElementFragment::parse("# leading\n\"value\" # trailing"),
-      "an array element with attached comments must validate",
-    )?;
-    ensure_eq(
-      &element.as_str(),
-      &"# leading\n\"value\" # trailing",
-      "array-element extraction must retain its attached source spelling",
-    )?;
-    ensure_eq(
-      &element.value().as_str(),
-      &"\"value\"",
-      "an array element must expose its exact validated value",
-    )?;
-    ensure_eq(
-      &element.kind(),
-      &TomlKind::String,
-      "an array element must expose its validated value kind",
-    )?;
-
+  fn structural_fragments_expose_their_validated_metadata() -> Result<(), impl Debug> {
     let block_source = "# block\n[[items]]\nname = \"value\"\n";
-    let block = ensure_ok(TableBlockFragment::parse(block_source), "an array-table block must validate")?;
-    ensure_eq(
-      &block.as_str(),
-      &block_source,
-      "table-block extraction must retain its complete source",
-    )?;
-    ensure_eq(
-      &block.kind(),
-      &TomlKind::ArrayOfTables,
-      "table-block extraction must expose its header kind",
-    )?;
-    ensure_eq(
-      block.path(),
-      &path("items")?,
-      "table-block extraction must expose its exact header path",
+    ensure_that(
+      (
+        ArrayElementFragment::parse("# leading\n\"value\" # trailing"),
+        TableBlockFragment::parse(block_source),
+      ),
+      "structural fragments must retain complete source spelling and validated metadata",
+      |element_fields| {
+        let (ref element, ref block) = *element_fields;
+        element.as_ref().is_ok_and(|fragment| {
+          fragment.as_str() == "# leading\n\"value\" # trailing"
+            && fragment.value().as_str() == "\"value\""
+            && fragment.kind() == TomlKind::String
+        }) && block.as_ref().is_ok_and(|fragment| {
+          fragment.as_str() == block_source
+            && fragment.kind() == TomlKind::ArrayOfTables
+            && fragment.path() == &ExactPath::from_segments(["items"])
+        })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Limit an extracted inline entry to its own key, value, and internal trivia.
   #[test]
-  fn inline_entry_fragments_stay_inside_the_inline_table() -> Result<(), TestFailure> {
-    let rewrite = ensure_ok(
-      Rewrite::parse("dependency = { version = \"2\", features = [\"std\"] }\n"),
-      "the inline dependency fixture must parse",
-    )?;
-    let fragment = ensure_ok(
-      rewrite.entry_fragment(&path("dependency.version")?),
-      "the nested inline entry must be extractable",
-    )?;
-    ensure_eq(
-      &fragment.as_str(),
-      &"version = \"2\"",
-      "inline extraction must not capture the outer entry or sibling fields",
+  fn inline_entry_fragments_stay_inside_the_inline_table() -> Result<(), impl Debug> {
+    let observed = Rewrite::parse("dependency = { version = \"2\", features = [\"std\"] }\n").map(|document| {
+      let fragment = document.entry_fragment(&ExactPath::from_segments(["dependency", "version"]));
+      (document, fragment)
+    });
+    ensure_that(
+      observed,
+      "inline extraction must exclude the outer entry and sibling fields",
+      |result| {
+        result.as_ref().is_ok_and(|entry_observation| {
+          entry_observation
+            .1
+            .as_ref()
+            .is_ok_and(|entry| entry.as_str() == "version = \"2\"")
+        })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Replace only a value range and publish source, DOM, and patches transactionally.
   #[test]
-  fn replace_value_preserves_neighboring_bytes_and_commits_transactionally() -> Result<(), TestFailure> {
+  fn replace_value_preserves_neighboring_bytes_and_commits_transactionally() -> Result<(), impl Debug> {
     let source = "# keep\nvalue  =  1 # keep too\nneighbor = 2\n";
-    let mut rewrite = ensure_ok(Rewrite::parse(source), "the replacement fixture must parse")?;
-    let unchanged = ensure_ok(ValueFragment::parse("1"), "the existing value must validate as a fragment")?;
-    ensure_eq(
-      &ensure_ok(
-        rewrite.replace_value(&path("value")?, &unchanged),
-        "an identical value must remain replaceable",
-      )?,
-      &EditOutcome::Unchanged,
-      "an identical value must report an unchanged transaction",
-    )?;
-    ensure(
-      rewrite.patches().is_empty(),
-      "an unchanged replacement must not queue a source patch",
-    )?;
-    let replacement = ensure_ok(ValueFragment::parse("\"caf\u{e9}\""), "the replacement must be a value")?;
-    ensure_eq(
-      &ensure_ok(
-        rewrite.replace_value(&path("value")?, &replacement),
-        "the value must be replaceable",
-      )?,
-      &EditOutcome::Replaced,
-      "a different value must report replacement",
-    )?;
+    let observed = edit_document(source, |document| {
+      let fragments = [ValueFragment::parse("1"), ValueFragment::parse("\"caf\u{e9}\"")];
+      let changes = match &fragments {
+        &[Ok(ref unchanged), Ok(ref replacement)] => {
+          let path = ExactPath::from_segments(["value"]);
+          let first = document.replace_value(&path, unchanged);
+          let initial_patches = document.patches().to_vec();
+          let second = document.replace_value(&path, replacement);
+          let rendered = document.render();
+          let committed = document.commit();
+          Some((first, initial_patches, second, rendered, committed))
+        }
+        _ => None,
+      };
+      (fragments, changes)
+    });
     let expected = "# keep\nvalue  =  \"caf\u{e9}\" # keep too\nneighbor = 2\n";
-    let rendered = ensure_ok(rewrite.render(), "the replacement must render")?;
-    ensure_eq(&rendered.as_str(), &expected, "only the value bytes may change")?;
-    ensure_ok(rewrite.commit(), "the valid rendered document must commit")?;
-    ensure(rewrite.patches().is_empty(), "a successful commit must clear pending patches")?;
-    let committed = ensure_ok(rewrite.render(), "the committed document must render")?;
-    ensure_eq(&committed.as_str(), &expected, "commit must replace the source and DOM together")
+    ensure_that(
+      observed,
+      "replacement and commit must publish source and DOM together while preserving neighboring bytes",
+      |result| {
+        let &Ok((ref document, (_, ref changes), ref rendered)) = result else {
+          return false;
+        };
+
+        changes.as_ref().is_some_and(|first_fields| {
+          let (ref first, ref initial_patches, ref second, ref before, ref committed) = *first_fields;
+          matches!(first, Ok(EditOutcome::Unchanged))
+            && initial_patches.is_empty()
+            && matches!(second, Ok(EditOutcome::Replaced))
+            && before.as_ref().is_ok_and(|text| text == expected)
+            && committed.is_ok()
+        }) && document.patches().is_empty()
+          && document.source() == expected
+          && rendered.as_ref().is_ok_and(|text| text == expected)
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Leave committed source and queued patches intact when validation rejects a commit.
   #[test]
-  fn failed_commit_retains_source_and_patches() -> Result<(), TestFailure> {
-    let mut rewrite = ensure_ok(Rewrite::parse("value = 1\n"), "the transaction fixture must parse")?;
-    let invalid_rename = ensure_ok(rewrite.rename_keys("value", "bad key"), "rename accepts source text")?;
-    ensure(
-      matches!(invalid_rename.commit(), Err(RewriteError::SyntaxDiagnostics { .. })),
-      "an invalid complete result must fail commit",
-    )?;
-    ensure_eq(
-      &invalid_rename.source(),
-      &"value = 1\n",
-      "failed commit must retain the committed source",
-    )?;
-    ensure_eq(&invalid_rename.patches().len(), &1, "failed commit must retain pending patches")
+  fn failed_commit_retains_source_and_patches() -> Result<(), impl Debug> {
+    let observed = edit_document("value = 1\n", |document| {
+      let renamed = document
+        .rename_keys("value", "bad key")
+        .map(|updated| updated.patches().to_vec());
+      let committed = document.commit();
+      (renamed, committed)
+    });
+    ensure_that(
+      observed,
+      "rejected commit must retain committed source and pending patches",
+      |result| {
+        let &Ok((ref document, (ref renamed, ref committed), _)) = result else {
+          return false;
+        };
+
+        renamed.is_ok()
+          && matches!(committed, Err(RewriteError::SyntaxDiagnostics { .. }))
+          && document.source() == "value = 1\n"
+          && document.patches().len() == 1
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Insert entries at root, regular-table, and inline-table ownership boundaries.
   #[test]
-  fn insert_and_upsert_cover_root_regular_and_inline_tables() -> Result<(), TestFailure> {
-    let root_rendered = render_entry_insertion("[table]\nold = 1\n", &ExactPath::default(), "# new\nroot = true\n")?;
-    ensure(
-      root_rendered.starts_with("# new\nroot = true\n\n[table]"),
-      "root insertion must precede table blocks",
-    )?;
-
-    let regular_rendered = render_entry_insertion("[table]\nold = 1\n\n[other]\nx = 2\n", &path("table")?, "new = 2")?;
-    ensure_eq(
-      &regular_rendered.as_str(),
-      &"[table]\nold = 1\nnew = 2\n\n[other]\nx = 2\n",
-      "regular insertion must stay in the selected table block",
-    )?;
-
-    let inline_rendered = render_entry_insertion("value = { old = 1 }\n", &path("value")?, "new = 2")?;
-    ensure_eq(
-      &inline_rendered.as_str(),
-      &"value = { old = 1, new = 2 }\n",
-      "inline insertion must preserve braces and spacing",
-    )?;
-
-    let empty_inline_rendered = render_entry_insertion("value = {}\n", &path("value")?, "new = 2")?;
-    ensure_eq(
-      &empty_inline_rendered.as_str(),
-      &"value = { new = 2 }\n",
-      "empty inline insertion must establish canonical interior spacing",
-    )?;
-
-    let multiline_rendered = render_entry_insertion("value = {\n  old = 1,\n  }\n", &path("value")?, "new = 2")?;
-    ensure_eq(
-      &multiline_rendered.as_str(),
-      &"value = {\n  old = 1,\n  new = 2\n  }\n",
-      "multiline insertion must reuse the existing comma and closing indentation",
-    )?;
-
-    let multiline_without_comma = render_entry_insertion("value = {\n  old = 1\n  }\n", &path("value")?, "new = 2")?;
-    ensure_eq(
-      &multiline_without_comma.as_str(),
-      &"value = {\n  old = 1,\n  new = 2\n  }\n",
-      "multiline insertion must add the required separator when the preceding entry has no comma",
+  fn insert_and_upsert_cover_root_regular_and_inline_tables() -> Result<(), impl Debug> {
+    let fixture_root = insert_document("[table]\nold = 1\n", &ExactPath::default(), "# new\nroot = true\n");
+    let fixture_cases = [
+      (
+        "[table]\nold = 1\n\n[other]\nx = 2\n",
+        "table",
+        "[table]\nold = 1\nnew = 2\n\n[other]\nx = 2\n",
+      ),
+      ("value = { old = 1 }\n", "value", "value = { old = 1, new = 2 }\n"),
+      ("value = {}\n", "value", "value = { new = 2 }\n"),
+      ("value = {\n  old = 1,\n  }\n", "value", "value = {\n  old = 1,\n  new = 2\n  }\n"),
+      ("value = {\n  old = 1\n  }\n", "value", "value = {\n  old = 1,\n  new = 2\n  }\n"),
+    ]
+    .map(|(source, parent, expected)| (expected, insert_document(source, &ExactPath::from_segments([parent]), "new = 2")));
+    ensure_that(
+      (fixture_root, fixture_cases),
+      "entry insertion must preserve root, table, and inline ownership boundaries",
+      |root_fields| {
+        let (ref root, ref cases) = *root_fields;
+        root.as_ref().is_ok_and(|inserted_fields| {
+          let (_, ref inserted, ref rendered) = *inserted_fields;
+          inserted.as_ref().is_ok_and(|edit| matches!(edit.1, Ok(EditOutcome::Inserted)))
+            && rendered
+              .as_ref()
+              .is_ok_and(|text| text.starts_with("# new\nroot = true\n\n[table]"))
+        }) && cases.iter().all(|expected_fields| {
+          let (ref expected, ref result) = *expected_fields;
+          matches!(result, &Ok((_, ref inserted, ref rendered)) if inserted
+            .as_ref()
+            .is_ok_and(|edit| matches!(edit.1, Ok(EditOutcome::Inserted)))
+            && rendered.as_ref().is_ok_and(|text| text == expected))
+        })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Distinguish duplicate, unchanged, replacement, and insertion outcomes at one table boundary.
   #[test]
-  fn entry_upserts_and_table_creation_report_exact_outcomes() -> Result<(), TestFailure> {
-    let source = "root = 1\n[table]\nold = 1\n";
-    let mut rewrite = ensure_ok(Rewrite::parse(source), "the upsert fixture must parse")?;
-    ensure_eq(
-      &ensure_ok(
-        rewrite.create_tables(&ExactPath::default()),
-        "creating the document root must remain valid",
-      )?,
-      &EditOutcome::Unchanged,
-      "the document root must already exist",
-    )?;
-    let table = path("table")?;
-    ensure_eq(
-      &ensure_ok(rewrite.create_tables(&table), "an existing regular table must remain valid")?,
-      &EditOutcome::Unchanged,
-      "an existing regular table must not queue another header",
-    )?;
+  fn entry_upserts_and_table_creation_report_exact_outcomes() -> Result<(), impl Debug> {
+    let observed = edit_document("root = 1\n[table]\nold = 1\n", |document| {
+      let table = ExactPath::from_segments(["table"]);
+      let creations = [document.create_tables(&ExactPath::default()), document.create_tables(&table)];
+      let fragments = [
+        EntryFragment::parse("old = 1"),
+        EntryFragment::parse("old = 2"),
+        EntryFragment::parse("new = true"),
+      ];
+      let edits = match &fragments {
+        &[Ok(ref existing), Ok(ref replacement), Ok(ref inserted)] => Some([
+          document.insert_entry(&table, existing),
+          document.upsert_entry(&table, existing),
+          document.upsert_entry(&table, replacement),
+          document.upsert_entry(&table, inserted),
+        ]),
+        _ => None,
+      };
+      (creations, fragments, edits)
+    });
+    ensure_that(
+      observed,
+      "creation and upsert must report duplicate, unchanged, replaced, and inserted outcomes exactly",
+      |result| {
+        let &Ok((_, (ref creations, _, ref edits), ref rendered)) = result else {
+          return false;
+        };
 
-    let existing = ensure_ok(EntryFragment::parse("old = 1"), "the existing entry must validate")?;
-    let replacement = ensure_ok(EntryFragment::parse("old = 2"), "the replacement entry must validate")?;
-    let inserted = ensure_ok(EntryFragment::parse("new = true"), "the new entry must validate")?;
-    ensure(
-      matches!(
-        rewrite.insert_entry(&table, &existing),
-        Err(RewriteError::AmbiguousMatches {
-          count: 1,
-          ..
-        })
-      ),
-      "direct insertion must reject an existing exact entry",
-    )?;
-    ensure_edit_outcome(
-      rewrite.upsert_entry(&table, &existing),
-      EditOutcome::Unchanged,
-      "an identical entry must be upsertable",
-      "an identical upsert must remain unchanged",
-    )?;
-
-    ensure_edit_outcome(
-      rewrite.upsert_entry(&table, &replacement),
-      EditOutcome::Replaced,
-      "an existing entry value must be replaceable",
-      "a changed upsert must report replacement",
-    )?;
-    ensure_edit_outcome(
-      rewrite.upsert_entry(&table, &inserted),
-      EditOutcome::Inserted,
-      "a missing entry must be insertable",
-      "a missing upsert must report insertion",
-    )?;
-    let rendered = ensure_ok(rewrite.render(), "the mixed upsert transaction must render")?;
-    ensure_eq(
-      &rendered.as_str(),
-      &"root = 1\n[table]\nold = 2\nnew = true\n",
-      "mixed upserts must change only the selected value and append the missing entry",
+        creations.iter().all(|outcome| matches!(outcome, Ok(EditOutcome::Unchanged)))
+          && matches!(
+            edits,
+            Some([
+              Err(RewriteError::AmbiguousMatches {
+                count: 1,
+                ..
+              }),
+              Ok(EditOutcome::Unchanged),
+              Ok(EditOutcome::Replaced),
+              Ok(EditOutcome::Inserted)
+            ])
+          )
+          && rendered
+            .as_ref()
+            .is_ok_and(|text| text == "root = 1\n[table]\nold = 2\nnew = true\n")
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Replace and insert exact values while rejecting root replacement before mutation.
   #[test]
-  fn value_upserts_replace_insert_and_reject_the_document_root() -> Result<(), TestFailure> {
-    let replacement = ensure_ok(ValueFragment::parse("2"), "the replacement value must validate")?;
-    let mut existing = ensure_ok(
-      Rewrite::parse("[table]\nvalue = 1\n"),
-      "the existing-value upsert fixture must parse",
-    )?;
-    ensure_edit_outcome(
-      existing.upsert_value(&path("table.value")?, &replacement),
-      EditOutcome::Replaced,
-      "an existing exact value must be upsertable",
-      "an existing exact value must report replacement",
-    )?;
-    ensure_eq(
-      &ensure_ok(existing.render(), "the replaced value upsert must render")?,
-      &"[table]\nvalue = 2\n".to_owned(),
-      "value upsert replacement must preserve the surrounding entry and table",
-    )?;
-
-    let mut missing = ensure_ok(
-      Rewrite::parse("[table]\nvalue = 1\n"),
-      "the missing-value upsert fixture must parse",
-    )?;
-    ensure_edit_outcome(
-      missing.upsert_value(&path("table.added")?, &replacement),
-      EditOutcome::Inserted,
-      "a missing exact value with an existing parent must be upsertable",
-      "a missing exact value must report insertion",
-    )?;
-    ensure_eq(
-      &ensure_ok(missing.render(), "the inserted value upsert must render")?,
-      &"[table]\nvalue = 1\nadded = 2\n".to_owned(),
-      "value upsert insertion must append only the rendered key/value entry",
-    )?;
-
-    let mut root = ensure_ok(Rewrite::parse("value = 1\n"), "the root-rejection upsert fixture must parse")?;
-    ensure(
-      matches!(
-        root.upsert_value(&ExactPath::default(), &replacement),
-        Err(RewriteError::UnsupportedPlacement { .. })
+  fn value_upserts_replace_insert_and_reject_the_document_root() -> Result<(), impl Debug> {
+    let fixture_cases = [
+      (
+        "[table]\nvalue = 1\n",
+        ExactPath::from_segments(["table", "value"]),
+        Some((EditOutcome::Replaced, "[table]\nvalue = 2\n")),
       ),
-      "the document root must reject value upsert with its typed placement failure",
-    )?;
-    ensure(
-      root.patches().is_empty(),
-      "a rejected root value upsert must not queue a partial patch",
+      (
+        "[table]\nvalue = 1\n",
+        ExactPath::from_segments(["table", "added"]),
+        Some((EditOutcome::Inserted, "[table]\nvalue = 1\nadded = 2\n")),
+      ),
+      ("value = 1\n", ExactPath::default(), None),
+    ]
+    .map(|(source, path, expected)| {
+      let fragment = ValueFragment::parse("2");
+      let observed = edit_document(source, |document| {
+        fragment.as_ref().ok().map(|value| document.upsert_value(&path, value))
+      });
+      (expected, fragment, observed)
+    });
+    ensure_that(
+      fixture_cases,
+      "value upserts must distinguish replacement, insertion, and atomic root rejection",
+      |cases| {
+        cases.iter().all(|expected_fields| {
+          let (ref expected, ref fragment, ref result) = *expected_fields;
+          fragment.is_ok()
+            && matches!(result, &Ok((ref document, Some(ref outcome), ref rendered)) if
+              expected.as_ref().is_some_and(|&(expected_outcome, text)|
+                outcome.as_ref().is_ok_and(|actual| *actual == expected_outcome) && rendered.as_ref().is_ok_and(|actual| actual == text))
+              || expected.is_none() && matches!(outcome, Err(RewriteError::UnsupportedPlacement { .. })) && document.patches().is_empty())
+        })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Require a commit between parent-table creation and a dependent child insertion.
   #[test]
-  fn explicit_parent_creation_requires_a_separate_committed_phase() -> Result<(), TestFailure> {
-    let mut rewrite = ensure_ok(Rewrite::parse("root = true\n"), "the creation fixture must parse")?;
-    ensure_eq(
-      &ensure_ok(
-        rewrite.create_tables(&path("outer.inner")?),
-        "missing parent tables must be creatable",
-      )?,
-      &EditOutcome::Inserted,
-      "missing tables must report insertion",
-    )?;
-    ensure_ok(rewrite.commit(), "the created table phase must commit")?;
-    let entry = ensure_ok(EntryFragment::parse("value = 1"), "the dependent entry must validate")?;
-    ensure_eq(
-      &ensure_ok(
-        rewrite.insert_entry(&path("outer.inner")?, &entry),
-        "a dependent edit must use the reparsed table",
-      )?,
-      &EditOutcome::Inserted,
-      "the dependent entry must report insertion into the committed table",
-    )?;
-    let rendered = ensure_ok(rewrite.render(), "the dependent edit must render")?;
-    ensure(
-      rendered.contains("[outer.inner]\nvalue = 1\n"),
-      "the committed parent must accept a child entry",
+  fn explicit_parent_creation_requires_a_separate_committed_phase() -> Result<(), impl Debug> {
+    let observed = edit_document("root = true\n", |document| {
+      let parent = ExactPath::from_segments(["outer", "inner"]);
+      let created = document.create_tables(&parent);
+      let committed = document.commit();
+      let inserted = EntryFragment::parse("value = 1").map(|fragment| {
+        let outcome = document.insert_entry(&parent, &fragment);
+        (fragment, outcome)
+      });
+      (created, committed, inserted)
+    });
+    ensure_that(
+      observed,
+      "a committed parent-table phase must support its dependent child insertion",
+      |result| {
+        let &Ok((_, (ref created, ref committed, ref inserted), ref rendered)) = result else {
+          return false;
+        };
+
+        matches!(created, Ok(EditOutcome::Inserted))
+          && committed.is_ok()
+          && inserted.as_ref().is_ok_and(|edit| matches!(edit.1, Ok(EditOutcome::Inserted)))
+          && rendered.as_ref().is_ok_and(|text| text.contains("[outer.inner]\nvalue = 1\n"))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Preserve the document boundary while rejecting non-table creation prefixes.
   #[test]
-  fn table_creation_preserves_boundaries_and_rejects_non_table_prefixes() -> Result<(), TestFailure> {
-    let mut empty = ensure_ok(Rewrite::parse(""), "the empty table-creation fixture must parse")?;
-    ensure_edit_outcome(
-      empty.create_tables(&path("outer.inner")?),
-      EditOutcome::Inserted,
-      "nested tables must be creatable in an empty document",
-      "empty-document table creation must report inserted source",
-    )?;
-    ensure_eq(
-      &ensure_ok(empty.render(), "empty-document table creation must render")?,
-      &"[outer]\n\n[outer.inner]\n".to_owned(),
-      "table creation in an empty document must not manufacture a leading boundary",
-    )?;
-
-    let mut no_trailing_newline = ensure_ok(Rewrite::parse("root = true"), "the no-trailing-newline creation fixture must parse")?;
-    ensure_edit_outcome(
-      no_trailing_newline.create_tables(&path("outer.inner")?),
-      EditOutcome::Inserted,
-      "nested tables must be creatable after a terminal root entry",
-      "nested table creation must report inserted source",
-    )?;
-    ensure_eq(
-      &ensure_ok(no_trailing_newline.render(), "the no-trailing-newline table creation must render")?,
-      &"root = true\n\n[outer]\n\n[outer.inner]\n".to_owned(),
-      "table creation must establish exactly one source and table-block boundary",
-    )?;
-
-    for (source, expected_kind) in [
+  fn table_creation_preserves_boundaries_and_rejects_non_table_prefixes() -> Result<(), impl Debug> {
+    let parent = ExactPath::from_segments(["outer", "inner"]);
+    let fixture_valid = [
+      ("", "[outer]\n\n[outer.inner]\n"),
+      ("root = true", "root = true\n\n[outer]\n\n[outer.inner]\n"),
+    ]
+    .map(|(source, expected)| (expected, edit_document(source, |document| document.create_tables(&parent))));
+    let fixture_invalid = [
       ("outer = 1\n", TomlKind::Integer),
       ("outer = { value = 1 }\n", TomlKind::InlineTable),
-    ] {
-      let mut incompatible = ensure_ok(Rewrite::parse(source), "the incompatible-prefix fixture must parse")?;
-      ensure(
-        matches!(
-          incompatible.create_tables(&path("outer.inner")?),
-          Err(RewriteError::TypeMismatch {
-            expected: "regular table",
-            found,
-            ..
-          }) if found == expected_kind
-        ),
-        "table creation must reject an existing scalar or inline-table prefix with its exact kind",
-      )?;
-      ensure(
-        incompatible.patches().is_empty(),
-        "a rejected table creation must not queue a partial source mutation",
-      )?;
-      ensure_eq(
-        &ensure_ok(incompatible.render(), "the rejected table creation must remain renderable")?,
-        &source.to_owned(),
-        "a rejected table creation must leave the committed source byte-identical",
-      )?;
-    }
-    Ok(())
+    ]
+    .map(|(source, kind)| (source, kind, edit_document(source, |document| document.create_tables(&parent))));
+    ensure_that(
+      (fixture_valid, fixture_invalid),
+      "table creation must preserve boundaries and reject incompatible prefixes atomically",
+      |valid_fields| {
+        let (ref valid, ref invalid) = *valid_fields;
+        valid.iter().all(|expected_fields| {
+          let (ref expected, ref result) = *expected_fields;
+          matches!(result, &Ok((_, Ok(EditOutcome::Inserted), ref rendered)) if rendered.as_ref().is_ok_and(|text| text == expected))
+        }) && invalid.iter().all(|source_fields| {
+          let (ref source, ref kind, ref result) = *source_fields;
+          matches!(result, &Ok((ref document, ref created, ref rendered)) if
+            matches!(created, Err(RewriteError::TypeMismatch { expected: "regular table", found, .. }) if found == kind)
+            && document.patches().is_empty()
+            && rendered.as_ref().is_ok_and(|text| text == source))
+        })
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Remove one entry with its attached comments while preserving blank-separated trivia.
   #[test]
-  fn exact_removal_preserves_siblings_and_comment_boundaries() -> Result<(), TestFailure> {
-    let source = "# detached\n\n# attached\nremove = 1 # inline\nkeep = 2\n";
-    let mut rewrite = ensure_ok(Rewrite::parse(source), "the removal fixture must parse")?;
-    ensure_eq(
-      &ensure_ok(
-        rewrite.remove_entry(&path("remove")?, RemoveEmptyParents::Keep),
-        "the exact root entry must be removable",
-      )?,
-      &EditOutcome::Removed,
-      "exact entry removal must report removed source",
-    )?;
-    let rendered = ensure_ok(rewrite.render(), "the removal must render")?;
-    ensure_eq(
-      &rendered.as_str(),
-      &"# detached\n\nkeep = 2\n",
-      "attached comments must be removed while blank-separated comments remain",
+  fn exact_removal_preserves_siblings_and_comment_boundaries() -> Result<(), impl Debug> {
+    let observed = edit_document("# detached\n\n# attached\nremove = 1 # inline\nkeep = 2\n", |document| {
+      document.remove_entry(&ExactPath::from_segments(["remove"]), RemoveEmptyParents::Keep)
+    });
+    ensure_that(
+      observed,
+      "removal must discard attached comments and retain blank-separated trivia and siblings",
+      |result| {
+        let &Ok((_, ref removed, ref rendered)) = result else {
+          return false;
+        };
+
+        matches!(removed, Ok(EditOutcome::Removed)) && rendered.as_ref().is_ok_and(|text| text == "# detached\n\nkeep = 2\n")
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Remove every positional inline-table entry with a valid comma boundary.
   #[test]
-  fn inline_table_removal_is_comma_aware_at_every_position() -> Result<(), TestFailure> {
-    for (selected, expected) in [
+  fn inline_table_removal_is_comma_aware_at_every_position() -> Result<(), impl Debug> {
+    let fixture_cases = [
       ("first", "value = {middle=2,last=3}\n"),
       ("middle", "value = {first=1,last=3}\n"),
       ("last", "value = {first=1,middle=2}\n"),
-    ] {
-      let mut document = ensure_ok(
-        Rewrite::parse("value = {first=1,middle=2,last=3}\n"),
-        "the positional inline-removal fixture must parse",
-      )?;
-      ensure_edit_outcome(
-        document.remove_entry(&ExactPath::from_segments(["value", selected]), RemoveEmptyParents::Keep),
-        EditOutcome::Removed,
-        "the selected inline-table entry must be removable",
-        "inline-table removal must report removed source",
-      )?;
-      ensure_eq(
-        &ensure_ok(document.render(), "the positional inline removal must render")?,
-        &expected.to_owned(),
-        "inline removal must retain every unselected entry and exactly one valid comma boundary",
-      )?;
-    }
-
-    let mut only = ensure_ok(
-      Rewrite::parse("value = {only=1}\n"),
-      "the single-entry inline-removal fixture must parse",
-    )?;
-    ensure_edit_outcome(
-      only.remove_entry(&path("value.only")?, RemoveEmptyParents::Prune),
-      EditOutcome::Removed,
-      "the only inline-table entry must be removable",
-      "single-entry inline removal must report removed source",
-    )?;
-    ensure_eq(
-      &ensure_ok(only.render(), "the emptied inline table must render")?,
-      &"value = {}\n".to_owned(),
-      "removing the only inline entry must preserve the owning value as an empty inline table",
+    ]
+    .map(|(selected, expected)| {
+      (
+        expected,
+        edit_document("value = {first=1,middle=2,last=3}\n", |document| {
+          document.remove_entry(&ExactPath::from_segments(["value", selected]), RemoveEmptyParents::Keep)
+        }),
+      )
+    });
+    let fixture_only = edit_document("value = {only=1}\n", |document| {
+      document.remove_entry(&ExactPath::from_segments(["value", "only"]), RemoveEmptyParents::Prune)
+    });
+    ensure_that(
+      (fixture_cases, fixture_only),
+      "inline removal must preserve valid separators and retain an empty owning inline table",
+      |cases_fields| {
+        let (ref cases, ref only) = *cases_fields;
+        cases.iter().all(|expected_fields| {
+          let (ref expected, ref result) = *expected_fields;
+          matches!(result, &Ok((_, Ok(EditOutcome::Removed), ref rendered)) if rendered.as_ref().is_ok_and(|text| text == expected))
+        }) && only.as_ref().is_ok_and(|removed_fields| {
+          let (_, ref removed, ref rendered) = *removed_fields;
+          matches!(removed, Ok(EditOutcome::Removed)) && rendered.as_ref().is_ok_and(|text| text == "value = {}\n")
+        })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Prune only concrete empty ancestors that have no retained comment ownership.
   #[test]
-  fn removal_prunes_only_proven_empty_comment_free_parent_tables() -> Result<(), TestFailure> {
-    let mut nested = ensure_ok(
-      Rewrite::parse("[outer]\n[outer.inner]\nremove = 1\n"),
-      "the nested prune fixture must parse",
-    )?;
-    ensure_eq(
-      &ensure_ok(
-        nested.remove_entry(&path("outer.inner.remove")?, RemoveEmptyParents::Prune),
-        "the only nested entry must be removable with pruning",
-      )?,
-      &EditOutcome::Removed,
-      "nested pruning must report removal of the selected entry",
-    )?;
-    let nested_rendered = ensure_ok(nested.render(), "the nested prune must render")?;
-    ensure_eq(
-      &nested_rendered.as_str(),
-      &"",
-      "every concrete ancestor proven empty after the removal must be pruned",
-    )?;
-
-    let mut commented = ensure_ok(
-      Rewrite::parse("# retained table context\n[table]\nremove = 1\n"),
-      "the commented prune fixture must parse",
-    )?;
-    ensure_eq(
-      &ensure_ok(
-        commented.remove_entry(&path("table.remove")?, RemoveEmptyParents::Prune),
-        "the entry beneath a commented table must be removable",
-      )?,
-      &EditOutcome::Removed,
-      "comment-preserving pruning must still report removal of the selected entry",
-    )?;
-    let commented_rendered = ensure_ok(commented.render(), "the commented removal must render")?;
-    ensure_eq(
-      &commented_rendered.as_str(),
-      &"# retained table context\n[table]\n",
-      "a retained parent comment must prevent table pruning",
+  fn removal_prunes_only_proven_empty_comment_free_parent_tables() -> Result<(), impl Debug> {
+    let fixture_cases = [
+      (
+        "[outer]\n[outer.inner]\nremove = 1\n",
+        ExactPath::from_segments(["outer", "inner", "remove"]),
+        "",
+      ),
+      (
+        "# retained table context\n[table]\nremove = 1\n",
+        ExactPath::from_segments(["table", "remove"]),
+        "# retained table context\n[table]\n",
+      ),
+    ]
+    .map(|(source, path, expected)| {
+      (
+        expected,
+        edit_document(source, |document| document.remove_entry(&path, RemoveEmptyParents::Prune)),
+      )
+    });
+    ensure_that(
+      fixture_cases,
+      "pruning must remove empty ancestors while retaining parents that own comments",
+      |cases| {
+        cases.iter().all(|expected_fields| {
+          let (ref expected, ref result) = *expected_fields;
+          matches!(result, &Ok((_, Ok(EditOutcome::Removed), ref rendered)) if rendered.as_ref().is_ok_and(|text| text == expected))
+        })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Reconcile array order, attached comments, detached slots, commas, and empty state.
   #[test]
-  fn arrays_reconcile_elements_comments_order_and_empty_state() -> Result<(), TestFailure> {
-    let source = "values = [\n  # detached\n\n  # first\n  \"a\", # inline\n  \"b\",\n]\n";
-    let mut rewrite = ensure_ok(Rewrite::parse(source), "the multiline array must parse")?;
-    let values = path("values")?;
-    let mut elements = ensure_ok(rewrite.array_elements(&values), "array elements must be extractable")?;
-    ensure_eq(&elements.len(), &2, "the array must expose exactly two fragments")?;
-    let first = ensure_some(elements.first(), "the first array fragment must exist")?;
-    let second = ensure_some(elements.get(1), "the second array fragment must exist")?;
-    ensure(
-      [
-        first.as_str().contains("# first"),
-        first.as_str().contains("# inline"),
-        first.as_str().contains("\"b\""),
-      ] == [true, true, false],
-      "the first fragment must retain only its own value and attached comments",
-    )?;
-    ensure(
-      !first.as_str().contains("# detached"),
-      "blank-separated comments must not attach to an element fragment",
-    )?;
-    ensure_eq(
-      &second.as_str(),
-      &"\"b\"",
-      "the second fragment must not capture its preceding sibling",
-    )?;
-    elements.reverse();
-    ensure_eq(
-      &ensure_ok(rewrite.reconcile_array(&values, &elements), "array elements must be reorderable")?,
-      &EditOutcome::Replaced,
-      "reordering array elements must report replacement of the array interior",
-    )?;
-    let rendered = ensure_ok(rewrite.render(), "the reordered array must render")?;
-    ensure(rendered.contains("\"b\","), "the second element must move first")?;
-    ensure(
-      [rendered.contains("# first"), rendered.contains("# inline")] == [true, true],
-      "attached comments must survive reconciliation",
-    )?;
-    ensure_ordered_positions(
-      rendered.find("# detached"),
-      rendered.find("\"b\""),
-      rendered.find("# first"),
-      "blank-separated comments must remain at their structural slot instead of moving with an element",
-    )?;
-
-    let empty_rendered = render_reconciliation("values = [1, 2]\n", EditOutcome::Replaced, |document| {
-      document.reconcile_array(&values, &[])
-    })?;
-    ensure_eq(
-      &empty_rendered.as_str(),
-      &"values = []\n",
-      "empty reconciliation must retain the brackets",
-    )?;
-
-    let detached_only_source = "values = [\n  # retained\n\n  1,\n]\n";
-    let detached_only = render_reconciliation(detached_only_source, EditOutcome::Replaced, |document| {
-      document.reconcile_array(&values, &[])
-    })?;
-    ensure_eq(
-      &detached_only.as_str(),
-      &"values = [\n  # retained\n\n]\n",
-      "empty reconciliation must retain blank-separated comments at their array slot",
-    )?;
-
+  fn arrays_reconcile_elements_comments_order_and_empty_state() -> Result<(), impl Debug> {
+    let values = ExactPath::from_segments(["values"]);
+    let original_source = "values = [\n  # detached\n\n  # first\n  \"a\", # inline\n  \"b\",\n]\n";
+    let fixture_reordered = edit_document(original_source, |document| reorder_array(document, &values));
+    let fixture_empty = [
+      ("values = [1, 2]\n", "values = []\n"),
+      ("values = [\n  # retained\n\n  1,\n]\n", "values = [\n  # retained\n\n]\n"),
+    ]
+    .map(|(source, expected)| (expected, edit_document(source, |document| document.reconcile_array(&values, &[]))));
     let no_trailing_source = "values = [\n  1 # last\n]\n";
-    let mut no_trailing = ensure_ok(Rewrite::parse(no_trailing_source), "the comment-without-comma fixture must parse")?;
-    let no_trailing_elements = ensure_ok(
-      no_trailing.array_elements(&values),
-      "the final commented element must be extractable",
-    )?;
-    ensure_eq(
-      &ensure_ok(
-        no_trailing.reconcile_array(&values, &no_trailing_elements),
-        "the unchanged final comment must reconcile",
-      )?,
-      &EditOutcome::Unchanged,
-      "an inline comment must not manufacture a trailing comma",
-    )?;
-    let no_trailing_rendered = ensure_ok(no_trailing.render(), "the unchanged commented array must render")?;
-    ensure_eq(
-      &no_trailing_rendered.as_str(),
-      &no_trailing_source,
-      "a final inline comment without a comma must remain byte-identical",
-    )
+    let fixture_no_trailing = edit_document(no_trailing_source, |document| {
+      document.array_elements(&values).map(|fragments| {
+        let outcome = document.reconcile_array(&values, &fragments);
+        (fragments, outcome)
+      })
+    });
+    ensure_that((fixture_reordered, fixture_empty, fixture_no_trailing), "array reconciliation must preserve attachment, detached slots, commas, order, and empty-state trivia", |reordered_fields| { let (ref reordered, ref empty, ref no_trailing) = *reordered_fields;
+      let &Ok((_, Ok((ref original, _, ref outcome)), Ok(ref text))) = reordered else { return false; };
+      let [ref first, ref second] = *original.as_slice() else { return false; };
+      let &Ok((_, Ok((_, ref trailing_outcome)), Ok(ref trailing_text))) = no_trailing else { return false; };
+      first.as_str().contains("# first") && first.as_str().contains("# inline") && !first.as_str().contains("\"b\"")
+        && !first.as_str().contains("# detached") && second.as_str() == "\"b\"" && matches!(outcome, Ok(EditOutcome::Replaced))
+        && text.contains("\"b\",") && text.contains("# first") && text.contains("# inline")
+        && matches!((text.find("# detached"), text.find("\"b\""), text.find("# first")), (Some(first_position), Some(second_position), Some(third_position)) if first_position < second_position && second_position < third_position)
+        && empty.iter().all(|&(expected, ref result)| matches!(result, Ok((_, Ok(EditOutcome::Replaced), Ok(actual))) if actual == expected))
+        && matches!(trailing_outcome, Ok(EditOutcome::Unchanged)) && trailing_text == no_trailing_source
+    }).map(drop).map_err(Box::new)
   }
 
   /// Preserve one-line terminal-comma policy and untouched empty-array interior trivia.
   #[test]
-  fn one_line_arrays_preserve_terminal_comma_style_and_empty_trivia() -> Result<(), TestFailure> {
-    let values = path("values")?;
-    let trailing_comma_source = "values = [1, 2,   ] # array\n";
-    let mut trailing_comma = ensure_ok(
-      Rewrite::parse(trailing_comma_source),
-      "the one-line trailing-comma array must parse",
-    )?;
-    let mut trailing_comma_elements = ensure_ok(
-      trailing_comma.array_elements(&values),
-      "the trailing-comma elements must be extractable",
-    )?;
-    trailing_comma_elements.reverse();
-    ensure_eq(
-      &ensure_ok(
-        trailing_comma.reconcile_array(&values, &trailing_comma_elements),
-        "the trailing-comma elements must reconcile",
-      )?,
-      &EditOutcome::Replaced,
-      "a reordered trailing-comma array must report replacement",
-    )?;
-    let trailing_comma_rendered = ensure_ok(trailing_comma.render(), "the trailing-comma array must render")?;
-    ensure_eq(
-      &trailing_comma_rendered.as_str(),
-      &"values = [2, 1,   ] # array\n",
-      "a one-line terminal comma, its following spaces, and the entry comment must survive reconciliation",
-    )?;
-
-    let mut no_comma = ensure_ok(Rewrite::parse("values = [1, 2   ]\n"), "the one-line no-comma array must parse")?;
-    let mut no_comma_elements = ensure_ok(no_comma.array_elements(&values), "the no-comma elements must be extractable")?;
-    no_comma_elements.reverse();
-    ensure_eq(
-      &ensure_ok(
-        no_comma.reconcile_array(&values, &no_comma_elements),
-        "the no-comma elements must reconcile",
-      )?,
-      &EditOutcome::Replaced,
-      "reordering a no-comma array must report replacement",
-    )?;
-    let no_comma_rendered = ensure_ok(no_comma.render(), "the no-comma array must render")?;
-    ensure_eq(
-      &no_comma_rendered.as_str(),
-      &"values = [2, 1   ]\n",
-      "a one-line array without a terminal comma must not gain one",
-    )?;
-
-    let empty_source = "values = [   ]\n";
-    let mut empty = ensure_ok(Rewrite::parse(empty_source), "the spaced empty array must parse")?;
-    let empty_elements = ensure_ok(empty.array_elements(&values), "the empty array must expose no elements")?;
-    ensure_eq(&empty_elements.len(), &0, "the empty array must expose zero fragments")?;
-    ensure_eq(
-      &ensure_ok(empty.reconcile_array(&values, &empty_elements), "the empty array must reconcile")?,
-      &EditOutcome::Unchanged,
-      "an already-empty array must remain unchanged",
-    )?;
-    let empty_rendered = ensure_ok(empty.render(), "the empty array must render")?;
-    ensure_eq(
-      &empty_rendered.as_str(),
-      &empty_source,
-      "an empty array's existing interior trivia must remain byte-identical",
+  fn one_line_arrays_preserve_terminal_comma_style_and_empty_trivia() -> Result<(), impl Debug> {
+    let values = ExactPath::from_segments(["values"]);
+    let fixture_cases = [
+      (
+        "values = [1, 2,   ] # array\n",
+        "values = [2, 1,   ] # array\n",
+        EditOutcome::Replaced,
+        2,
+      ),
+      ("values = [1, 2   ]\n", "values = [2, 1   ]\n", EditOutcome::Replaced, 2),
+      ("values = [   ]\n", "values = [   ]\n", EditOutcome::Unchanged, 0),
+    ]
+    .map(|(source, expected, effect, count)| {
+      let observed = edit_document(source, |document| reorder_array(document, &values));
+      (expected, effect, count, observed)
+    });
+    ensure_that(
+      fixture_cases,
+      "array reconciliation must retain terminal comma style and empty-array interior trivia",
+      |cases| {
+        cases.iter().all(|expected_fields| {
+          let (ref expected, ref effect, ref count, ref result) = *expected_fields;
+          matches!(result, &Ok((_, Ok((ref original, _, Ok(ref outcome))), Ok(ref rendered))) if
+            original.len() == *count && outcome == effect && rendered == expected)
+        })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Reject incompatible reconciliation targets and fragments before queuing patches.
   #[test]
-  fn reconciliation_rejects_wrong_types_and_paths_without_partial_mutation() -> Result<(), TestFailure> {
-    let values = path("values")?;
-    for (source, expected_kind) in [
+  fn reconciliation_rejects_wrong_types_and_paths_without_partial_mutation() -> Result<(), impl Debug> {
+    let values = ExactPath::from_segments(["values"]);
+    let fixture_arrays = [
       ("values = 1\n", TomlKind::Integer),
       ("[[values]]\nname = \"one\"\n", TomlKind::ArrayOfTables),
-    ] {
-      let mut incompatible = ensure_ok(Rewrite::parse(source), "the incompatible-array fixture must parse")?;
-      ensure(
-        matches!(
-          incompatible.reconcile_array(&values, &[]),
-          Err(RewriteError::TypeMismatch {
-            expected: "inline array",
-            found,
-            ..
-          }) if found == expected_kind
-        ),
-        "array reconciliation must reject scalar and array-of-tables targets with their exact kinds",
-      )?;
-      ensure(
-        incompatible.patches().is_empty(),
-        "a rejected array reconciliation must not queue a partial source mutation",
-      )?;
-    }
-
-    let mut blocks = ensure_ok(
-      Rewrite::parse("[[items]]\nname = \"one\"\n"),
-      "the mismatched-block target fixture must parse",
-    )?;
-    let wrong_path = ensure_ok(
-      TableBlockFragment::parse("[[other]]\nname = \"two\"\n"),
-      "the mismatched table block must be independently valid",
-    )?;
-    ensure(
-      matches!(
-        blocks.reconcile_table_blocks(&path("items")?, &[wrong_path]),
-        Err(RewriteError::InvalidFragment {
-          kind: FragmentKind::TableBlock,
-          ..
-        })
-      ),
-      "table-block reconciliation must reject a valid fragment owned by another exact path",
-    )?;
-    ensure(
-      blocks.patches().is_empty(),
-      "a rejected table-block reconciliation must not queue a partial source mutation",
+    ]
+    .map(|(source, kind)| (kind, edit_document(source, |document| document.reconcile_array(&values, &[]))));
+    let fixture_blocks = edit_document("[[items]]\nname = \"one\"\n", |document| {
+      TableBlockFragment::parse("[[other]]\nname = \"two\"\n").map(|fragment| {
+        let outcome = document.reconcile_table_blocks(&ExactPath::from_segments(["items"]), from_ref(&fragment));
+        (fragment, outcome)
+      })
+    });
+    ensure_that(
+      (fixture_arrays, fixture_blocks),
+      "wrong array kinds and table-block paths must fail without partial mutation",
+      |arrays_fields| {
+        let (ref arrays, ref blocks) = *arrays_fields;
+        let &Ok((ref block_document, Ok((_, ref block_outcome)), _)) = blocks else {
+          return false;
+        };
+        arrays.iter().all(|kind_fields| {
+          let (ref kind, ref result) = *kind_fields;
+          matches!(result, &Ok((ref document, ref outcome, _)) if document.patches().is_empty()
+            && matches!(outcome, Err(RewriteError::TypeMismatch { expected: "inline array", found, .. }) if found == kind))
+        }) && block_document.patches().is_empty()
+          && matches!(
+            block_outcome,
+            Err(RewriteError::InvalidFragment {
+              kind: FragmentKind::TableBlock,
+              ..
+            })
+          )
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Extract and reorder complete table blocks without disturbing unrelated blocks.
   #[test]
-  fn table_blocks_copy_reorder_and_remove_as_complete_units() -> Result<(), TestFailure> {
+  fn table_blocks_copy_reorder_and_remove_as_complete_units() -> Result<(), impl Debug> {
     let source = "# one\n[[items]]\nname = \"a\"\n\n# two\n[[items]]\nname = \"b\"\n\n[other]\nkeep = true\n";
-    let mut rewrite = ensure_ok(Rewrite::parse(source), "the table-block fixture must parse")?;
-    let items = path("items")?;
-    let mut blocks = ensure_ok(rewrite.table_blocks(&items), "array-table blocks must be extractable")?;
-    ensure_eq(&blocks.len(), &2, "both array-table blocks must be enumerated")?;
-    ensure_eq(
-      &ensure_ok(
-        rewrite.reconcile_table_blocks(&items, &blocks),
-        "unchanged array-table blocks must remain reconcilable",
-      )?,
-      &EditOutcome::Unchanged,
-      "the original block sequence must not queue a replacement",
-    )?;
-    ensure(
-      rewrite.patches().is_empty(),
-      "unchanged table-block reconciliation must not queue a source patch",
-    )?;
-    blocks.reverse();
-    ensure_eq(
-      &ensure_ok(
-        rewrite.reconcile_table_blocks(&items, &blocks),
-        "array-table blocks must be reorderable",
-      )?,
-      &EditOutcome::Replaced,
-      "reordering array-table blocks must report replacement",
-    )?;
-    let rendered = ensure_ok(rewrite.render(), "reordered blocks must render")?;
-    let first_b = rendered.find("name = \"b\"");
-    let first_a = rendered.find("name = \"a\"");
-    ensure(
-      matches!((first_b, first_a), (Some(left), Some(right)) if left < right),
-      "the supplied block order must control the rendered order",
-    )?;
-    ensure(
-      rendered.contains("[other]\nkeep = true"),
-      "consumer-owned unrelated blocks must remain",
-    )?;
-
-    let parsed = ensure_ok(
-      TableBlockFragment::parse("# block\n[[items]]\nname = \"x\"\n"),
-      "a complete block must validate",
-    )?;
-    ensure_eq(parsed.path(), &items, "block parsing must retain the exact header path")
+    let items = ExactPath::from_segments(["items"]);
+    let fixture_observed = edit_document(source, |document| {
+      document.table_blocks(&items).map(|mut blocks| {
+        let original = blocks.clone();
+        let unchanged = document.reconcile_table_blocks(&items, &blocks);
+        let unchanged_patches = document.patches().to_vec();
+        blocks.reverse();
+        let replaced = document.reconcile_table_blocks(&items, &blocks);
+        (original, blocks, unchanged, unchanged_patches, replaced)
+      })
+    });
+    let fixture_parsed = TableBlockFragment::parse("# block\n[[items]]\nname = \"x\"\n");
+    ensure_that(
+      (fixture_observed, fixture_parsed),
+      "table blocks must retain exact paths, unchanged transactions, and independent reorder boundaries",
+      |observed_fields| {
+        let (ref observed, ref parsed) = *observed_fields;
+        let &Ok((_, Ok((ref original, _, ref unchanged, ref patches, ref replaced)), Ok(ref text))) = observed else {
+          return false;
+        };
+        let Ok(ref fragment) = *parsed else {
+          return false;
+        };
+        original.len() == 2
+          && matches!(unchanged, Ok(EditOutcome::Unchanged))
+          && patches.is_empty()
+          && matches!(replaced, Ok(EditOutcome::Replaced))
+          && text.contains("[other]\nkeep = true")
+          && matches!((text.find("name = \"b\""), text.find("name = \"a\"")), (Some(first), Some(second)) if first < second)
+          && fragment.path() == &items
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Insert missing table blocks and leave an absent empty sequence unchanged.
   #[test]
-  fn missing_table_block_reconciliation_distinguishes_empty_and_inserted() -> Result<(), TestFailure> {
-    let items = path("items")?;
-    let empty_block = ensure_ok(
-      TableBlockFragment::parse("[[items]]\nname = \"only\"\n"),
-      "the empty-document table block must validate",
-    )?;
-    let mut empty_document = ensure_ok(Rewrite::parse(""), "the empty block target must parse")?;
-    ensure_edit_outcome(
-      empty_document.reconcile_table_blocks(&items, &[empty_block]),
-      EditOutcome::Inserted,
-      "a table-block sequence must be insertable into an empty document",
-      "empty-document table-block reconciliation must report inserted source",
-    )?;
-    ensure_eq(
-      &ensure_ok(empty_document.render(), "the empty-document table block must render")?,
-      &"[[items]]\nname = \"only\"\n".to_owned(),
-      "table-block insertion into an empty document must not prepend blank lines",
-    )?;
-
-    let mut rewrite = ensure_ok(Rewrite::parse("root = true\n"), "the missing-block fixture must parse")?;
-    ensure_eq(
-      &ensure_ok(
-        rewrite.reconcile_table_blocks(&items, &[]),
-        "an absent empty block sequence must remain reconcilable",
-      )?,
-      &EditOutcome::Unchanged,
-      "an absent empty block sequence must remain unchanged",
-    )?;
-    let block = ensure_ok(
-      TableBlockFragment::parse("[[items]]\nname = \"new\"\n"),
-      "the inserted table block must validate",
-    )?;
-    ensure_eq(
-      &ensure_ok(
-        rewrite.reconcile_table_blocks(&items, &[block]),
-        "a missing table-block sequence must be insertable",
-      )?,
-      &EditOutcome::Inserted,
-      "a missing nonempty block sequence must report insertion",
-    )?;
-    let rendered = ensure_ok(rewrite.render(), "the inserted table block must render")?;
-    ensure_eq(
-      &rendered.as_str(),
-      &"root = true\n\n[[items]]\nname = \"new\"\n",
-      "table-block insertion must preserve the existing root entry and establish one block boundary",
-    )?;
-
-    let mut unterminated = ensure_ok(Rewrite::parse("root = true"), "the unterminated missing-block fixture must parse")?;
-    let first = ensure_ok(
-      TableBlockFragment::parse("[[items]]\nname = \"first\""),
-      "the first unterminated table block must validate",
-    )?;
-    let second = ensure_ok(
-      TableBlockFragment::parse("[[items]]\nname = \"second\""),
-      "the second unterminated table block must validate",
-    )?;
-    ensure_edit_outcome(
-      unterminated.reconcile_table_blocks(&items, &[first, second]),
-      EditOutcome::Inserted,
-      "unterminated table blocks must be insertable after an unterminated document",
-      "unterminated table-block insertion must report inserted source",
-    )?;
-    ensure_eq(
-      &ensure_ok(unterminated.render(), "the unterminated table-block insertion must render")?,
-      &"root = true\n\n[[items]]\nname = \"first\"\n[[items]]\nname = \"second\"".to_owned(),
-      "table-block rendering must establish boundaries without manufacturing a terminal newline",
+  fn missing_table_block_reconciliation_distinguishes_empty_and_inserted() -> Result<(), impl Debug> {
+    let items = ExactPath::from_segments(["items"]);
+    let fixture_empty = edit_document("", |document| {
+      TableBlockFragment::parse("[[items]]\nname = \"only\"\n").map(|fragment| {
+        let outcome = document.reconcile_table_blocks(&items, from_ref(&fragment));
+        (fragment, outcome)
+      })
+    });
+    let fixture_missing = edit_document("root = true\n", |document| {
+      let unchanged = document.reconcile_table_blocks(&items, &[]);
+      let inserted = TableBlockFragment::parse("[[items]]\nname = \"new\"\n").map(|fragment| {
+        let outcome = document.reconcile_table_blocks(&items, from_ref(&fragment));
+        (fragment, outcome)
+      });
+      (unchanged, inserted)
+    });
+    let fixture_unterminated = edit_document("root = true", |document| {
+      let fragments = [
+        TableBlockFragment::parse("[[items]]\nname = \"first\""),
+        TableBlockFragment::parse("[[items]]\nname = \"second\""),
+      ];
+      let outcome = match &fragments {
+        &[Ok(ref first), Ok(ref second)] => Some(document.reconcile_table_blocks(&items, &[first.clone(), second.clone()])),
+        _ => None,
+      };
+      (fragments, outcome)
+    });
+    ensure_that(
+      (fixture_empty, fixture_missing, fixture_unterminated),
+      "missing table blocks must preserve root and terminal-newline boundaries",
+      |empty_fields| {
+        let (ref empty, ref missing, ref unterminated) = *empty_fields;
+        let &Ok((_, Ok((_, ref empty_outcome)), Ok(ref empty_text))) = empty else {
+          return false;
+        };
+        let &Ok((_, (ref unchanged, Ok((_, ref inserted))), Ok(ref missing_text))) = missing else {
+          return false;
+        };
+        let &Ok((_, (_, ref unterminated_outcome), Ok(ref unterminated_text))) = unterminated else {
+          return false;
+        };
+        matches!(empty_outcome, Ok(EditOutcome::Inserted))
+          && empty_text == "[[items]]\nname = \"only\"\n"
+          && matches!(unchanged, Ok(EditOutcome::Unchanged))
+          && matches!(inserted, Ok(EditOutcome::Inserted))
+          && missing_text == "root = true\n\n[[items]]\nname = \"new\"\n"
+          && matches!(unterminated_outcome, Some(Ok(EditOutcome::Inserted)))
+          && unterminated_text == "root = true\n\n[[items]]\nname = \"first\"\n[[items]]\nname = \"second\""
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Keep detached inter-block and tail comments at their structural slots during reconciliation.
   #[test]
-  fn table_blocks_keep_detached_comments_at_structural_slots() -> Result<(), TestFailure> {
+  fn table_blocks_keep_detached_comments_at_structural_slots() -> Result<(), impl Debug> {
     let source =
       "# attached one\n[[items]]\nname = \"a\"\n\n# detached between\n\n# attached two\n[[items]]\nname = \"b\"\n\n# detached tail\n";
-    let items = path("items")?;
-    let mut reorder = ensure_ok(Rewrite::parse(source), "the detached-comment block fixture must parse")?;
-    let mut blocks = ensure_ok(reorder.table_blocks(&items), "the table blocks must be extractable")?;
-    ensure_eq(&blocks.len(), &2, "both table blocks must be enumerated")?;
-    let first = ensure_some(blocks.first(), "the first table block must exist")?;
-    let second = ensure_some(blocks.get(1), "the second table block must exist")?;
-    ensure_eq(
-      &first.as_str(),
-      &"# attached one\n[[items]]\nname = \"a\"\n",
-      "the first fragment must include its attached comment but exclude detached inter-block trivia",
-    )?;
-    ensure_eq(
-      &second.as_str(),
-      &"# attached two\n[[items]]\nname = \"b\"\n",
-      "the second fragment must include its attached comment but exclude detached tail trivia",
-    )?;
-    blocks.reverse();
-    ensure_eq(
-      &ensure_ok(
-        reorder.reconcile_table_blocks(&items, &blocks),
-        "the detached-comment table blocks must reorder",
-      )?,
-      &EditOutcome::Replaced,
-      "reordering blocks around detached comments must report replacement",
-    )?;
-    let reordered = ensure_ok(reorder.render(), "the reordered detached-comment blocks must render")?;
-    ensure_eq(
-      &reordered.as_str(),
-      &"# attached two\n[[items]]\nname = \"b\"\n\n# detached between\n\n# attached one\n[[items]]\nname = \"a\"\n\n# detached tail\n",
-      "attached comments must follow their blocks while detached inter-block and tail comments retain their slots",
-    )?;
-
-    let removed = render_reconciliation(source, EditOutcome::Removed, |document| {
-      document.reconcile_table_blocks(&items, &[])
-    })?;
-    ensure_eq(
-      &removed.as_str(),
-      &"\n# detached between\n\n\n# detached tail\n",
-      "block removal must remove attached comments while preserving detached comment bytes",
+    let items = ExactPath::from_segments(["items"]);
+    let fixture_reordered = edit_document(source, |document| {
+      document.table_blocks(&items).map(|mut blocks| {
+        let original = blocks.clone();
+        blocks.reverse();
+        let outcome = document.reconcile_table_blocks(&items, &blocks);
+        (original, blocks, outcome)
+      })
+    });
+    let fixture_removed = edit_document(source, |document| document.reconcile_table_blocks(&items, &[]));
+    ensure_that(
+      (fixture_reordered, fixture_removed),
+      "attached block comments must move with their blocks while detached comments retain their slots",
+      |reordered_fields| {
+        let (ref reordered, ref removed) = *reordered_fields;
+        let &Ok((_, Ok((ref original, _, ref replaced)), Ok(ref reordered_text))) = reordered else {
+          return false;
+        };
+        let [ref first, ref second] = *original.as_slice() else {
+          return false;
+        };
+        let &Ok((_, ref removed_outcome, Ok(ref removed_text))) = removed else {
+          return false;
+        };
+        first.as_str() == "# attached one\n[[items]]\nname = \"a\"\n"
+          && second.as_str() == "# attached two\n[[items]]\nname = \"b\"\n"
+          && matches!(replaced, Ok(EditOutcome::Replaced))
+          && reordered_text
+            == "# attached two\n[[items]]\nname = \"b\"\n\n# detached between\n\n# attached one\n[[items]]\nname = \"a\"\n\n# detached \
+                tail\n"
+          && matches!(removed_outcome, Ok(EditOutcome::Removed))
+          && removed_text == "\n# detached between\n\n\n# detached tail\n"
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Treat an array-table parent and all strict descendants as one movable semantic element.
   #[test]
-  fn array_table_elements_include_all_descendant_blocks() -> Result<(), TestFailure> {
+  fn array_table_elements_include_all_descendant_blocks() -> Result<(), impl Debug> {
     let source = "[[contracts.toml]]\nname = \"first\"\n[[contracts.toml.keys]]\nname = \"a\"\n\n[[contracts.toml]]\nname = \
                   \"second\"\n[[contracts.toml.keys]]\nname = \"b\"\n\n[other]\nkeep = true\n";
-    let mut rewrite = ensure_ok(Rewrite::parse(source), "the nested array-table fixture must parse")?;
-    let contracts = path("contracts.toml")?;
-    let mut blocks = ensure_ok(rewrite.table_blocks(&contracts), "complete parent elements must be extractable")?;
-    ensure_eq(&blocks.len(), &2, "each matching parent header must produce one semantic element")?;
-    let first = ensure_some(blocks.first(), "the first semantic parent element must exist")?;
-    let second = ensure_some(blocks.get(1), "the second semantic parent element must exist")?;
-    ensure(
-      [
-        first.as_str().contains("name = \"first\""),
-        first.as_str().contains("[[contracts.toml.keys]]"),
-        first.as_str().contains("name = \"a\""),
-        first.as_str().contains("name = \"second\""),
-      ] == [true, true, true, false],
-      "the first fragment must include its descendants and stop at its sibling",
-    )?;
-    ensure(
-      [
-        second.as_str().contains("name = \"second\""),
-        second.as_str().contains("name = \"b\""),
-        second.as_str().contains("[other]"),
-      ] == [true, true, false],
-      "the second fragment must include descendants and stop at the first non-descendant",
-    )?;
-
-    let parsed = ensure_ok(
-      TableBlockFragment::parse(first.as_str()),
-      "a parent plus descendants must validate as one block",
-    )?;
-    ensure_eq(parsed.path(), &contracts, "nested block parsing must retain the root header path")?;
-
-    blocks.reverse();
-    ensure_eq(
-      &ensure_ok(
-        rewrite.reconcile_table_blocks(&contracts, &blocks),
-        "complete parent elements must reconcile as ordered units",
-      )?,
-      &EditOutcome::Replaced,
-      "reordering complete parent elements must report replacement",
-    )?;
-    let rendered = ensure_ok(rewrite.render(), "nested parent reordering must render")?;
-    ensure_ordered_positions(
-      rendered.find("name = \"second\""),
-      rendered.find("name = \"b\""),
-      rendered.find("name = \"first\""),
-      "reordering must keep each descendant block with its owning parent",
-    )?;
-    ensure(
-      rendered.contains("[other]\nkeep = true"),
-      "non-descendant consumer blocks must remain in place",
-    )
+    let contracts = ExactPath::from_segments(["contracts", "toml"]);
+    let observed = edit_document(source, |document| {
+      document.table_blocks(&contracts).map(|mut blocks| {
+        let original = blocks.clone();
+        let reparsed = original.first().map(|first| TableBlockFragment::parse(first.as_str()));
+        blocks.reverse();
+        let outcome = document.reconcile_table_blocks(&contracts, &blocks);
+        (original, reparsed, blocks, outcome)
+      })
+    });
+    ensure_that(observed, "parent fragments must carry every descendant block through extraction, parsing, and reordering", |result| {
+      let &Ok((_, Ok((ref original, Some(Ok(ref reparsed)), _, ref outcome)), Ok(ref text))) = result else { return false; };
+      let [ref first, ref second] = *original.as_slice() else { return false; };
+      first.as_str().contains("name = \"first\"") && first.as_str().contains("[[contracts.toml.keys]]")
+        && first.as_str().contains("name = \"a\"") && !first.as_str().contains("name = \"second\"")
+        && second.as_str().contains("name = \"second\"") && second.as_str().contains("name = \"b\"") && !second.as_str().contains("[other]")
+        && reparsed.path() == &contracts && matches!(outcome, Ok(EditOutcome::Replaced)) && text.contains("[other]\nkeep = true")
+        && matches!((text.find("name = \"second\""), text.find("name = \"b\""), text.find("name = \"first\"")), (Some(first_position), Some(second_position), Some(third_position)) if first_position < second_position && second_position < third_position)
+    }).map(drop).map_err(Box::new)
   }
 
   /// Rebase only the root and descendant headers of a validated table block.
   #[test]
-  fn table_blocks_rebase_root_and_descendant_headers_only() -> Result<(), TestFailure> {
+  fn table_blocks_rebase_root_and_descendant_headers_only() -> Result<(), impl Debug> {
     let source = "# contract\n[workspace.metadata.config.contract]\nkind = \"toml\"\n\n# \
                   key\n[[workspace.metadata.config.contract.keys]]\nname = \"version\"\n";
-    let expected = "# contract\n[contracts]\nkind = \"toml\"\n\n# key\n[[contracts.keys]]\nname = \"version\"\n";
-    let block = ensure_ok(TableBlockFragment::parse(source), "the migration block must parse")?;
-    let unchanged = ensure_ok(block.rebase(block.path()), "rebasing to the existing root path must remain valid")?;
-    ensure(
-      unchanged == block,
-      "rebasing to the existing root path must preserve the validated block exactly",
-    )?;
-    let contracts = path("contracts")?;
-    let rebased = ensure_ok(block.rebase(&contracts), "the complete hierarchy must be rebaseable")?;
-    ensure_eq(rebased.path(), &contracts, "rebasing must expose the new root path")?;
-    ensure_eq(
-      &rebased.as_str(),
-      &expected,
-      "rebasing must change only root and descendant header paths",
-    )?;
-    ensure(
-      matches!(block.rebase(&ExactPath::default()), Err(RewriteError::InvalidFragment { .. })),
-      "a block cannot be rebased to the document root",
+    let contracts = ExactPath::from_segments(["contracts"]);
+    let observed = TableBlockFragment::parse(source).map(|block| {
+      let unchanged = block.rebase(block.path());
+      let rebased = block.rebase(&contracts);
+      let rejected = block.rebase(&ExactPath::default());
+      (block, unchanged, rebased, rejected)
+    });
+    ensure_that(
+      observed,
+      "rebasing must change only hierarchy headers and reject the document root",
+      |result| {
+        let &Ok((ref block, ref unchanged, ref rebased, ref rejected)) = result else {
+          return false;
+        };
+
+        unchanged.as_ref().is_ok_and(|actual| actual == block)
+          && rebased.as_ref().is_ok_and(|actual| {
+            actual.path() == &contracts
+              && actual.as_str() == "# contract\n[contracts]\nkind = \"toml\"\n\n# key\n[[contracts.keys]]\nname = \"version\"\n"
+          })
+          && matches!(rejected, Err(RewriteError::InvalidFragment { .. }))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Permit exact traversal through one array-table element and reject multiple matches.
   #[test]
-  fn exact_operations_traverse_only_one_array_table_element() -> Result<(), TestFailure> {
-    let parent = path("managed-children.repositories")?;
-    let branch = path("managed-children.repositories.branch")?;
-    let name = path("managed-children.repositories.name")?;
+  fn exact_operations_traverse_only_one_array_table_element() -> Result<(), impl Debug> {
+    let parent = ExactPath::from_segments(["managed-children", "repositories"]);
+    let branch = parent.child("branch");
+    let name = parent.child("name");
     let source = "[[managed-children.repositories]]\nname = \"legacy\"\nbranch = \"old\"\n";
-    let mut rewrite = ensure_ok(Rewrite::parse(source), "the standalone array-table block must parse")?;
-    let branch_value = ensure_ok(rewrite.value(&branch), "a child beneath one array-table element must resolve")?;
-    ensure_eq(
-      &branch_value.text(),
-      &"\"old\"",
-      "unique array-table traversal must reach the exact child",
-    )?;
-
-    let replacement = ensure_ok(ValueFragment::parse("\"strict\""), "the replacement branch must validate")?;
-    ensure_edit_outcome(
-      rewrite.replace_value(&branch, &replacement),
-      EditOutcome::Replaced,
-      "a child beneath one array-table element must be replaceable",
-      "replacing the array-table child must report replacement",
-    )?;
-    ensure_edit_outcome(
-      rewrite.remove_entry(&name, RemoveEmptyParents::Keep),
-      EditOutcome::Removed,
-      "a child beneath one array-table element must be removable",
-      "removing the array-table child must report removal",
-    )?;
-    let rendered = ensure_ok(rewrite.render(), "the unique array-table edits must render")?;
-    ensure_eq(
-      &rendered.as_str(),
-      &"[[managed-children.repositories]]\nbranch = \"strict\"\n",
-      "exact edits must retain the array-table header while changing only selected children",
-    )?;
-
-    ensure_ok(rewrite.commit(), "the unique array-table edits must commit before insertion")?;
-    let enabled = ensure_ok(EntryFragment::parse("enabled = true"), "the inserted child must validate")?;
-    ensure_eq(
-      &ensure_ok(
-        rewrite.insert_entry(&parent, &enabled),
-        "one array-table element must be a valid exact insertion parent",
-      )?,
-      &EditOutcome::Inserted,
-      "inserting beneath one array-table element must report insertion",
-    )?;
-    let inserted = ensure_ok(rewrite.render(), "the array-table insertion must render")?;
-    ensure(
-      inserted.contains("branch = \"strict\"\nenabled = true\n"),
-      "the inserted child must remain inside the unique array-table block",
-    )?;
-
-    let multiple_source = "[[managed-children.repositories]]\nbranch = \"one\"\n\n[[managed-children.repositories]]\nbranch = \"two\"\n";
-    let mut multiple = ensure_ok(Rewrite::parse(multiple_source), "the multiple-element array table must parse")?;
-    ensure(
-      matches!(
-        multiple.value(&branch),
-        Err(RewriteError::AmbiguousMatches {
-          count: 2,
-          ..
-        })
-      ),
-      "exact lookup through multiple array-table elements must be ambiguous",
-    )?;
-    ensure(
-      matches!(
-        multiple.replace_value(&branch, &replacement),
-        Err(RewriteError::AmbiguousMatches {
-          count: 2,
-          ..
-        })
-      ),
-      "exact mutation through multiple array-table elements must be ambiguous",
-    )?;
-    ensure(
-      multiple.patches().is_empty(),
-      "an ambiguous array-table mutation must leave no pending edit",
+    let fixture_observed = edit_document(source, |document| {
+      let initial = document.value(&branch).map(|view| (view.text().to_owned(), view.kind()));
+      let replacement = ValueFragment::parse("\"strict\"");
+      let replaced = replacement
+        .as_ref()
+        .ok()
+        .map(|fragment| document.replace_value(&branch, fragment));
+      let removed = document.remove_entry(&name, RemoveEmptyParents::Keep);
+      let rendered = document.render();
+      let committed = document.commit();
+      let inserted = EntryFragment::parse("enabled = true").map(|fragment| {
+        let outcome = document.insert_entry(&parent, &fragment);
+        (fragment, outcome)
+      });
+      (initial, replacement, replaced, removed, rendered, committed, inserted)
+    });
+    let fixture_multiple = edit_document(
+      "[[managed-children.repositories]]\nbranch = \"one\"\n\n[[managed-children.repositories]]\nbranch = \"two\"\n",
+      |document| {
+        let queried = document.value(&branch).map(|view| (view.text().to_owned(), view.kind()));
+        let edited = ValueFragment::parse("\"strict\"").map(|fragment| {
+          let outcome = document.replace_value(&branch, &fragment);
+          (fragment, outcome)
+        });
+        (queried, edited)
+      },
+    );
+    ensure_that(
+      (fixture_observed, fixture_multiple),
+      "exact array-table operations must retain unique traversal and reject ambiguity atomically",
+      |observed_fields| {
+        let (ref observed, ref multiple) = *observed_fields;
+        let &Ok((
+          _,
+          (Ok((ref initial, _)), _, ref replaced, ref removed, Ok(ref rendered), ref committed, Ok((_, ref inserted))),
+          Ok(ref final_render),
+        )) = observed
+        else {
+          return false;
+        };
+        let &Ok((ref document, (ref queried, Ok((_, ref multiple_edit))), _)) = multiple else {
+          return false;
+        };
+        initial == "\"old\""
+          && matches!(replaced, Some(Ok(EditOutcome::Replaced)))
+          && matches!(removed, Ok(EditOutcome::Removed))
+          && rendered == "[[managed-children.repositories]]\nbranch = \"strict\"\n"
+          && committed.is_ok()
+          && matches!(inserted, Ok(EditOutcome::Inserted))
+          && final_render.contains("branch = \"strict\"\nenabled = true\n")
+          && matches!(
+            queried,
+            Err(RewriteError::AmbiguousMatches {
+              count: 2,
+              ..
+            })
+          )
+          && document.patches().is_empty()
+          && matches!(
+            multiple_edit,
+            Err(RewriteError::AmbiguousMatches {
+              count: 2,
+              ..
+            })
+          )
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Reject fragments containing extra values, entries, headers, or detached trivia.
   #[test]
-  fn fragment_validation_rejects_wrong_shapes() -> Result<(), TestFailure> {
-    ensure(
-      matches!(ValueFragment::parse("1\nother = 2"), Err(RewriteError::InvalidFragment { .. })),
-      "a value fragment must reject a second entry",
-    )?;
-    ensure(
-      matches!(EntryFragment::parse("a = 1\nb = 2\n"), Err(RewriteError::InvalidFragment { .. })),
-      "an entry fragment must reject multiple entries",
-    )?;
-    ensure(
-      matches!(EntryFragment::parse("a = 1\n[table]\n"), Err(RewriteError::InvalidFragment { .. })),
-      "an entry fragment must reject a table header after its sole root entry",
-    )?;
-    ensure(
-      matches!(
-        EntryFragment::parse("# detached\n\na = 1\n"),
-        Err(RewriteError::InvalidFragment { .. })
-      ),
-      "an entry fragment must reject blank-separated trivia outside its attachment range",
-    )?;
-    ensure(
-      matches!(ArrayElementFragment::parse("1, 2"), Err(RewriteError::InvalidFragment { .. })),
-      "an array-element fragment must reject multiple elements",
-    )?;
-    ensure(
-      matches!(ArrayElementFragment::parse(""), Err(RewriteError::InvalidFragment { .. })),
-      "an array-element fragment must reject a missing element",
-    )?;
-    ensure(
-      matches!(
-        ArrayElementFragment::parse("# detached\n\n1"),
-        Err(RewriteError::InvalidFragment { .. })
-      ),
-      "an array-element fragment must reject blank-separated comments that are not attached trivia",
-    )?;
-    ensure(
-      matches!(
-        TableBlockFragment::parse("[a]\nx = 1\n[b]\ny = 2\n"),
-        Err(RewriteError::InvalidFragment { .. })
-      ),
-      "a table-block fragment must reject multiple headers",
-    )?;
-    ensure(
-      matches!(TableBlockFragment::parse("root = 1\n"), Err(RewriteError::InvalidFragment { .. })),
-      "a table-block fragment must reject source without a table header",
-    )?;
-    ensure(
-      matches!(
-        TableBlockFragment::parse("root = 1\n[a]\nx = 1\n"),
-        Err(RewriteError::InvalidFragment { .. })
-      ),
-      "a table-block fragment must reject root entries before its table header",
-    )?;
-    ensure(
-      matches!(
-        TableBlockFragment::parse("# detached\n\n[a]\nx = 1\n"),
-        Err(RewriteError::InvalidFragment { .. })
-      ),
-      "a table-block fragment must reject blank-separated source before its owned block",
-    )?;
-    ensure(
-      matches!(
-        TableBlockFragment::parse("[[items]]\nname = \"one\"\n\n# detached tail\n"),
-        Err(RewriteError::InvalidFragment { .. })
-      ),
-      "a table-block fragment must reject blank-separated tail comments that are not attached trivia",
+  fn fragment_validation_rejects_wrong_shapes() -> Result<(), impl Debug> {
+    let fixture_values = [ValueFragment::parse("1\nother = 2")];
+    let fixture_entries = ["a = 1\nb = 2\n", "a = 1\n[table]\n", "# detached\n\na = 1\n"].map(EntryFragment::parse);
+    let fixture_elements = ["1, 2", "", "# detached\n\n1"].map(ArrayElementFragment::parse);
+    let fixture_blocks = [
+      "[a]\nx = 1\n[b]\ny = 2\n",
+      "root = 1\n",
+      "root = 1\n[a]\nx = 1\n",
+      "# detached\n\n[a]\nx = 1\n",
+      "[[items]]\nname = \"one\"\n\n# detached tail\n",
+    ]
+    .map(TableBlockFragment::parse);
+    ensure_that(
+      (fixture_values, fixture_entries, fixture_elements, fixture_blocks),
+      "fragment boundaries must reject extra structures and detached trivia",
+      |values_fields| {
+        let (ref values, ref entries, ref elements, ref blocks) = *values_fields;
+        values
+          .iter()
+          .all(|result| matches!(result, Err(RewriteError::InvalidFragment { .. })))
+          && entries
+            .iter()
+            .all(|result| matches!(result, Err(RewriteError::InvalidFragment { .. })))
+          && elements
+            .iter()
+            .all(|result| matches!(result, Err(RewriteError::InvalidFragment { .. })))
+          && blocks
+            .iter()
+            .all(|result| matches!(result, Err(RewriteError::InvalidFragment { .. })))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Preserve distinct typed errors for missing paths, type mismatches, queries, ambiguity, and
   /// ranges.
   #[test]
-  fn query_and_mutation_failures_retain_typed_boundaries() -> Result<(), TestFailure> {
-    let rewrite = ensure_ok(Rewrite::parse("scalar = 1\n"), "the typed-error fixture must parse")?;
-    ensure(
-      matches!(rewrite.value(&path("missing")?), Err(RewriteError::MissingPath { .. })),
-      "an absent exact value must return a missing-path error",
-    )?;
-
-    let entry = ensure_ok(EntryFragment::parse("child = true"), "the child entry must validate")?;
-    let mut wrong_parent = ensure_ok(Rewrite::parse("scalar = 1\n"), "the wrong-parent fixture must parse")?;
-    ensure(
-      matches!(
-        wrong_parent.insert_entry(&path("scalar")?, &entry),
-        Err(RewriteError::TypeMismatch { .. })
+  fn query_and_mutation_failures_retain_typed_boundaries() -> Result<(), impl Debug> {
+    let fixture_missing = Rewrite::parse("scalar = 1\n");
+    let fixture_wrong_parent = edit_document("scalar = 1\n", |document| {
+      EntryFragment::parse("child = true").map(|fragment| {
+        let outcome = document.insert_entry(&ExactPath::from_segments(["scalar"]), &fragment);
+        (fragment, outcome)
+      })
+    });
+    let fixture_query = edit_document("value = 1\n", |document| {
+      let renamed = document
+        .rename_keys("[", "replacement")
+        .map(|updated| updated.patches().to_vec());
+      let invalid_glob = Keys::from(Key::new("["));
+      let glob = document
+        .root
+        .find_all_matches(&invalid_glob, false)
+        .map(Iterator::collect::<Vec<_>>);
+      (renamed, invalid_glob, glob)
+    });
+    let fixture_ambiguous = edit_document(
+      "[[items]]\nname = \"one\"\n\n[other]\nkeep = true\n\n[[items]]\nname = \"two\"\n",
+      |document| {
+        let items = ExactPath::from_segments(["items"]);
+        document.table_blocks(&items).map(|blocks| {
+          let outcome = document.reconcile_table_blocks(&items, &blocks);
+          (blocks, outcome)
+        })
+      },
+    );
+    let fixture_invalid_range = raw_patch_document("value = 1\n", 0..100, "replacement");
+    ensure_that(
+      (
+        fixture_missing, fixture_wrong_parent, fixture_query, fixture_ambiguous, fixture_invalid_range,
       ),
-      "insertion beneath a scalar must return a type mismatch",
-    )?;
-    ensure(
-      wrong_parent.patches().is_empty(),
-      "a type mismatch must not leave a pending source mutation",
-    )?;
-
-    let mut query = ensure_ok(Rewrite::parse("value = 1\n"), "the query-error fixture must parse")?;
-    ensure(
-      matches!(
-        query.rename_keys("[", "replacement"),
-        Err(RewriteError::Query(QueryError::InvalidKey(_)))
-      ),
-      "a malformed textual query must retain its typed parse-diagnostic failure",
-    )?;
-    let invalid_glob = Keys::from(Key::new("["));
-    ensure(
-      matches!(query.root.find_all_matches(&invalid_glob, false), Err(QueryError::InvalidGlob(_))),
-      "a decoded key containing invalid glob syntax must retain its typed glob failure",
-    )?;
-
-    let mut ambiguous = ensure_ok(
-      Rewrite::parse("[[items]]\nname = \"one\"\n\n[other]\nkeep = true\n\n[[items]]\nname = \"two\"\n"),
-      "the non-contiguous array-table fixture must parse",
-    )?;
-    let items = path("items")?;
-    let blocks = ensure_ok(ambiguous.table_blocks(&items), "both non-contiguous blocks must be queryable")?;
-    ensure(
-      matches!(
-        ambiguous.reconcile_table_blocks(&items, &blocks),
-        Err(RewriteError::AmbiguousMatches { .. })
-      ),
-      "non-contiguous exact table matches must return an ambiguity error",
-    )?;
-
-    let (_invalid_range, invalid_range_error) = failed_patch_render("value = 1\n", 0..100, "replacement")?;
-    ensure(
-      matches!(invalid_range_error, RewriteError::InvalidSourceRange { .. }),
-      "an out-of-bounds pending range must return an invalid-source-range error",
+      "query and mutation failures must retain their distinct typed boundaries",
+      |missing_fields| {
+        let (ref missing, ref wrong_parent, ref query, ref ambiguous, ref invalid_range) = *missing_fields;
+        missing.as_ref().is_ok_and(|document| {
+          matches!(
+            document.value(&ExactPath::from_segments(["missing"])),
+            Err(RewriteError::MissingPath { .. })
+          )
+        }) && wrong_parent.as_ref().is_ok_and(|document_fields| {
+          let (ref document, ref edited, _) = *document_fields;
+          document.patches().is_empty()
+            && edited
+              .as_ref()
+              .is_ok_and(|edit| matches!(edit.1, Err(RewriteError::TypeMismatch { .. })))
+        }) && query.as_ref().is_ok_and(|&(_, (ref renamed, _, ref glob), _)| {
+          matches!(renamed, Err(RewriteError::Query(QueryError::InvalidKey(_)))) && matches!(glob, Err(QueryError::InvalidGlob(_)))
+        }) && ambiguous.as_ref().is_ok_and(|edited_fields| {
+          let (_, ref edited, _) = *edited_fields;
+          edited
+            .as_ref()
+            .is_ok_and(|edit| matches!(edit.1, Err(RewriteError::AmbiguousMatches { .. })))
+        }) && invalid_range.as_ref().is_ok_and(|admitted_fields| {
+          let (_, ref admitted, ref rendered) = *admitted_fields;
+          admitted.is_ok() && matches!(rendered, Err(RewriteError::InvalidSourceRange { .. }))
+        })
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Reject overlapping key patches without appending any part of the failed request.
   #[test]
-  fn overlapping_and_touching_patches_are_rejected_without_partial_addition() -> Result<(), TestFailure> {
-    let mut patches = rewrite("[table]\nvalue = 1\n")?;
-    let first_rename = ensure_ok(patches.rename_keys("table", "first"), "the first replacement must be accepted")?;
-    ensure(
-      matches!(first_rename.rename_keys("table", "second"), Err(RewriteError::Overlap)),
-      "a second replacement over the same source range must be rejected",
-    )?;
-    ensure_eq(&first_rename.patches().len(), &1, "failed addition must not leave a partial patch")
+  fn overlapping_and_touching_patches_are_rejected_without_partial_addition() -> Result<(), impl Debug> {
+    let observed = edit_document("[table]\nvalue = 1\n", |document| {
+      let first = document.rename_keys("table", "first").map(|updated| updated.patches().to_vec());
+      let second = document
+        .rename_keys("table", "second")
+        .map(|updated| updated.patches().to_vec());
+      (first, second)
+    });
+    ensure_that(
+      observed,
+      "overlapping replacement must retain the accepted patch without partial addition",
+      |result| {
+        let &Ok((ref document, (ref first, ref second), _)) = result else {
+          return false;
+        };
+
+        first.is_ok() && matches!(second, Err(RewriteError::Overlap)) && document.patches().len() == 1
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Reject adjacent and non-UTF-8 ranges without mutating committed render state.
   #[test]
-  fn touching_and_non_utf8_ranges_fail_without_mutating_render_state() -> Result<(), TestFailure> {
-    let mut touching = ensure_ok(Rewrite::parse("ab = 1\n"), "the touching-range fixture must parse")?;
-    ensure_ok(
-      touching.push_std_patch(0..1, "x".into()),
-      "the first internal patch must be accepted",
-    )?;
-    ensure(
-      matches!(touching.push_std_patch(1..2, "y".into()), Err(RewriteError::Overlap)),
-      "adjacent source ranges must be rejected as touching",
-    )?;
-    ensure_eq(&touching.patches().len(), &1, "a rejected touching range must not add a patch")?;
-
-    let (utf8, utf8_error) = failed_patch_render("\"\u{e9}\" = 1\n", 2..2, "")?;
-    ensure(
-      matches!(utf8_error, RewriteError::InvalidUtf8Range { .. }),
-      "render must reject a byte offset inside a UTF-8 code point",
-    )?;
-    ensure_eq(&utf8.source(), &"\"\u{e9}\" = 1\n", "failed render must retain the original source")?;
-    ensure_eq(&utf8.patches().len(), &1, "failed render must retain the pending transaction")
+  fn touching_and_non_utf8_ranges_fail_without_mutating_render_state() -> Result<(), impl Debug> {
+    let fixture_touching = edit_document("ab = 1\n", |document| {
+      let first = document.push_std_patch(0..1, "x".into());
+      let second = document.push_std_patch(1..2, "y".into());
+      (first, second)
+    });
+    let fixture_utf8 = raw_patch_document("\"\u{e9}\" = 1\n", 2..2, "");
+    ensure_that(
+      (fixture_touching, fixture_utf8),
+      "touching and non-UTF-8 patches must retain committed source and accepted transaction state",
+      |touching_fields| {
+        let (ref touching, ref utf8) = *touching_fields;
+        touching.as_ref().is_ok_and(|&(ref document, (ref first, ref second), _)| {
+          first.is_ok() && matches!(second, Err(RewriteError::Overlap)) && document.patches().len() == 1
+        }) && utf8.as_ref().is_ok_and(|document_fields| {
+          let (ref document, ref admitted, ref rendered) = *document_fields;
+          admitted.is_ok()
+            && matches!(rendered, Err(RewriteError::InvalidUtf8Range { .. }))
+            && document.source() == "\"\u{e9}\" = 1\n"
+            && document.patches().len() == 1
+        })
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Require the rewrite constructor to own a document-root syntax node.
   #[test]
-  fn non_root_nodes_are_rejected() -> Result<(), TestFailure> {
-    let parsed = ensure_ok(parse("value = 1\n[table]\nchild = 2\n"), "the non-root fixture tree must construct")?;
-    ensure(parsed.diagnostics().is_empty(), "the non-root fixture must parse cleanly")?;
-    let root = parsed.into_dom();
-    let value = ensure_some(root.get_key("value"), "the fixture value must exist")?;
-    let table = ensure_some(root.get_key("table"), "the fixture table must exist")?;
-    ensure(
-      matches!(Rewrite::new(value), Err(RewriteError::RootNodeExpected)),
-      "a scalar token must not own a rewrite",
-    )?;
-    ensure(
-      matches!(Rewrite::new(table), Err(RewriteError::RootNodeExpected)),
-      "a source-backed non-root syntax node must not own a rewrite",
+  fn non_root_nodes_are_rejected() -> Result<(), impl Debug> {
+    let observed = parse("value = 1\n[table]\nchild = 2\n").map(|parsed| {
+      let root = parsed.clone().into_dom();
+      let value = root.get_key("value").map(Rewrite::new);
+      let table = root.get_key("table").map(Rewrite::new);
+      (parsed, root, value, table)
+    });
+    ensure_that(
+      observed,
+      "scalar and source-backed non-root nodes must reject rewrite ownership",
+      |result| {
+        let &Ok((ref parsed, _, ref value, ref table)) = result else {
+          return false;
+        };
+
+        parsed.diagnostics().is_empty()
+          && matches!(value, Some(Err(RewriteError::RootNodeExpected)))
+          && matches!(table, Some(Err(RewriteError::RootNodeExpected)))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

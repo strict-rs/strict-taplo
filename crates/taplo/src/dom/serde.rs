@@ -82,6 +82,7 @@ impl Serialize for Node {
 }
 
 /// Detached TOML-compatible value collected before one iterative arena publication.
+#[derive(Debug)]
 enum DetachedNode {
   /// Boolean value.
   Bool(bool),
@@ -390,15 +391,13 @@ impl<'de> Deserialize<'de> for Node {
 #[cfg(test)]
 /// Serde boundary tests for supported detached values and rejected non-TOML shapes.
 mod tests {
+  use core::fmt::Debug;
+
   use serde::de::Visitor as _;
   use serde::de::value::Error as ValueError;
   use serde::de::value::StrDeserializer;
   use serde_json::json;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_eq;
-  use strict_test_support::ensure_ok;
-  use strict_test_support::ensure_some;
+  use strict_test_support::ensure_that;
 
   use super::Node;
   use super::TomlVisitor;
@@ -406,71 +405,77 @@ mod tests {
 
   /// Round-trip supported JSON shapes and render detached values as valid TOML.
   #[test]
-  fn detached_json_values_round_trip_and_render_valid_toml() -> Result<(), TestFailure> {
-    let expected = json!({
-      "can't\n": true,
-      "count": 3,
-      "nested": {
-        "items": ["one", "two"],
-      },
+  fn detached_json_values_round_trip_and_render_valid_toml() -> Result<(), impl Debug> {
+    let expected = json!({ "can't\n": true, "count": 3, "nested": { "items": ["one", "two"] } });
+    let observed = serde_json::from_value::<Node>(expected.clone()).map(|node| {
+      let serialized = serde_json::to_value(&node);
+      let rendered = node.to_toml(false, false);
+      (node, serialized, rendered)
     });
-    let node = ensure_ok(
-      serde_json::from_value::<Node>(expected.clone()),
-      "supported JSON values must construct a detached DOM",
-    )?;
-    let observed = ensure_ok(serde_json::to_value(&node), "a valid detached DOM must serialize back to JSON")?;
-    ensure_eq(
-      &observed,
-      &expected,
-      "detached JSON conversion must preserve every supported value and key",
-    )?;
-    let rendered = ensure_ok(node.to_toml(false, false), "a detached DOM with a non-bare key must render")?;
-    ensure(
-      rendered.contains("\"can't\\n\" = true"),
-      "a detached key containing a newline must use valid escaped basic-key syntax",
+    ensure_that(
+      (expected, observed),
+      "detached JSON must retain all supported values and render newline keys with basic-string escaping",
+      |subject| {
+        let Ok(ref value) = subject.1 else {
+          return false;
+        };
+
+        value.1.as_ref().is_ok_and(|json| json == &subject.0)
+          && value.2.as_ref().is_ok_and(|rendered| rendered.contains("\"can't\\n\" = true"))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Reject serialization whenever malformed source or conflicts make semantics ambiguous.
   #[test]
-  fn invalid_and_conflicting_source_cannot_serialize() -> Result<(), TestFailure> {
-    let malformed = ensure_ok(
-      parse("value = 999999999999999999999999999999\n"),
-      "the malformed scalar fixture tree must construct",
-    )?
-    .into_dom();
-    ensure(
-      serde_json::to_value(malformed).is_err(),
-      "a malformed semantic scalar must not serialize with a fabricated value",
-    )?;
-
-    let conflicting = ensure_ok(parse("value = 1\nvalue = 2\n"), "the conflicting-key fixture tree must construct")?.into_dom();
-    ensure(
-      serde_json::to_value(conflicting).is_err(),
-      "conflicting semantic keys must not serialize as an ambiguous object",
+  fn invalid_and_conflicting_source_cannot_serialize() -> Result<(), impl Debug> {
+    let observed = ["value = 999999999999999999999999999999\n", "value = 1\nvalue = 2\n"].map(|source| {
+      parse(source).map(|parsed| {
+        let node = parsed.clone().into_dom();
+        let serialized = serde_json::to_value(&node);
+        (parsed, node, serialized)
+      })
+    });
+    ensure_that(
+      observed,
+      "malformed scalar and conflicting-key DOMs must reject serialization",
+      |subjects| {
+        subjects
+          .iter()
+          .all(|subject| subject.as_ref().is_ok_and(|value| value.2.is_err()))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Reject JSON null because TOML has no equivalent semantic value.
   #[test]
-  fn unsupported_json_null_is_rejected() -> Result<(), TestFailure> {
-    ensure(
-      serde_json::from_value::<Node>(serde_json::Value::Null).is_err(),
-      "JSON null has no TOML semantic value and must be rejected",
+  fn unsupported_json_null_is_rejected() -> Result<(), impl Debug> {
+    ensure_that(
+      serde_json::from_value::<Node>(serde_json::Value::Null),
+      "JSON null must be rejected because TOML has no null value",
+      Result::is_err,
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   /// Report enum input through Serde's default typed visitor rejection.
   #[test]
-  fn enum_input_reports_its_type_and_the_toml_expectation() -> Result<(), TestFailure> {
-    let error = ensure_some(
-      TomlVisitor.visit_enum(StrDeserializer::<ValueError>::new("Variant")).err(),
-      "Serde enum access must be rejected by the TOML visitor",
-    )?;
-    ensure_eq(
-      &error.to_string(),
-      &"invalid type: enum, expected a TOML value".to_owned(),
-      "the default visitor contract must identify both the unsupported input and expected TOML domain",
+  fn enum_input_reports_its_type_and_the_toml_expectation() -> Result<(), impl Debug> {
+    ensure_that(
+      TomlVisitor.visit_enum(StrDeserializer::<ValueError>::new("Variant")),
+      "enum rejection must identify the unsupported input and expected TOML domain",
+      |result| {
+        result
+          .as_ref()
+          .is_err_and(|error| error.to_string() == "invalid type: enum, expected a TOML value")
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

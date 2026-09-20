@@ -655,6 +655,7 @@ impl<E: LocalEnvironment> LocalTransportState for OfflineSchemaTransport<E> {
 
 #[cfg(test)]
 mod tests {
+  use std::fmt::Debug;
   #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
   use std::io::Error as IoError;
   #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
@@ -673,315 +674,252 @@ mod tests {
   #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
   use std::time::Duration;
 
-  use futures::FutureExt as _;
   use futures::executor::block_on;
-  use futures::future::LocalBoxFuture;
+  use serde_json::Value;
   use serde_json::json;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_eq;
-  use strict_test_support::ensure_ok;
-  use strict_test_support::ensure_some;
-  use taplo_test_support::ensure_result;
+  use strict_test_support::PredicateFailure;
+  use strict_test_support::ensure_that;
+  #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
+  use thiserror::Error;
   #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
   use tokio::runtime::Builder;
   #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
   use tokio::runtime::Runtime;
+  use url::ParseError;
   use url::Url;
 
   #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
   use super::ConcurrentSchemaTransport;
-  #[cfg(feature = "reqwest")]
+  #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
   use super::LocalSchemaTransport;
   use super::OfflineSchemaTransport;
   use super::SchemaTransport;
   use super::TransportError;
   #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
   use crate::environment::Environment as _;
+  use crate::environment::LocalEnvironmentFuture;
   use crate::test_support::TestEnvironment;
-  /// Parse one transport fixture URL.
-  fn url(input: &str) -> Result<Url, TestFailure> {
-    ensure_ok(Url::parse(input), "the transport fixture URL must parse")
+
+  /// URL construction and the complete transport read attempted from it.
+  type SchemaRead = (Result<Url, ParseError>, Option<Result<Value, TransportError>>);
+
+  /// Read a fixture URL while retaining its parse result and native transport outcome.
+  fn read_schema<'operation, T: SchemaTransport>(
+    transport: &'operation T,
+    input: &'operation str,
+  ) -> LocalEnvironmentFuture<'operation, SchemaRead> {
+    Box::pin(async move {
+      let url = Url::parse(input);
+      let read = if let Ok(ref address) = url {
+        Some(transport.read_json(address.clone()).await)
+      } else {
+        None
+      };
+      (url, read)
+    })
   }
 
-  /// Exercise the file, decoder, and scheme contracts shared by every transport.
-  fn file_transport_contract<T: SchemaTransport>(transport: &T) -> LocalBoxFuture<'_, Result<(), TestFailure>> {
-    async move {
-      let schema = ensure_result(
-        transport.read_json(url("file:///workspace/schema.json")?).await,
-        "file-schema loading must succeed",
-      )?;
-      let title = ensure_some(schema.get("title"), "the file schema must retain its title")?;
-      ensure_eq(title, &json!("local"), "file transport must preserve the decoded JSON value")?;
+  /// Complete typed checks of file URL, JSON, and unsupported scheme reads.
+  type FileContract = Result<[SchemaRead; 4], Box<PredicateFailure<[SchemaRead; 4]>>>;
 
-      let invalid = ensure_some(
-        transport.read_json(url("file:///workspace/invalid.json")?).await.err(),
-        "invalid file JSON must fail",
-      )?;
-      ensure(
-        matches!(invalid, TransportError::Json { .. }),
-        "invalid file JSON must retain its transport URL and decoder error",
-      )?;
-
-      let invalid_url = ensure_some(
-        transport.read_json(url("file://remote-host/schema.json")?).await.err(),
-        "a nonlocal file URL must fail",
-      )?;
-      ensure(
-        matches!(invalid_url, TransportError::InvalidFileUrl { .. }),
-        "a nonlocal file URL must retain the typed file-path boundary",
-      )?;
-
-      let unsupported = ensure_some(
-        transport.read_json(url("ftp://example.com/schema.json")?).await.err(),
-        "an unsupported transport scheme must fail",
-      )?;
-      ensure(
-        matches!(
-          unsupported,
-          TransportError::UnsupportedScheme {
-            ref scheme,
-            ..
-          } if scheme == "ftp"
-        ),
-        "the unsupported-scheme error must retain the rejected scheme",
+  /// Exercise shared file, JSON decoder, and scheme contracts without dropping any result.
+  fn file_transport_contract<T: SchemaTransport>(transport: &T) -> LocalEnvironmentFuture<'_, FileContract> {
+    Box::pin(async move {
+      let reads = [
+        read_schema(transport, "file:///workspace/schema.json").await,
+        read_schema(transport, "file:///workspace/invalid.json").await,
+        read_schema(transport, "file://remote-host/schema.json").await,
+        read_schema(transport, "ftp://example.com/schema.json").await,
+      ];
+      ensure_that(
+        reads,
+        "file transport must preserve decoded JSON and typed decoder, file-path, and scheme failures",
+        |actual| {
+          let [ref valid, ref invalid_json, ref nonlocal, ref unsupported] = *actual;
+          valid
+            .1
+            .as_ref()
+            .is_some_and(|read| read.as_ref().is_ok_and(|schema| schema.get("title") == Some(&json!("local"))))
+            && matches!(&invalid_json.1, Some(Err(TransportError::Json { .. })))
+            && matches!(&nonlocal.1, Some(Err(TransportError::InvalidFileUrl { .. })))
+            && matches!(&unsupported.1, Some(Err(TransportError::UnsupportedScheme { scheme, .. })) if scheme == "ftp")
+        },
       )
-    }
-    .boxed_local()
+      .map_err(Box::new)
+    })
   }
 
   #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
-  /// Loopback server thread used by one HTTP transport fixture.
-  type LoopbackServer = thread::JoinHandle<Result<(), IoError>>;
+  /// Native failures during loopback fixture construction.
+  #[derive(Debug, Error)]
+  enum LoopbackSetupError {
+    /// Socket or server-thread construction failed.
+    #[error(transparent)]
+    Io(#[from] IoError),
+    /// The bound endpoint could not be represented as a URL.
+    #[error(transparent)]
+    Url(#[from] Box<ParseError>),
+  }
 
   #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
-  /// Endpoint and server thread for one loopback HTTP response.
-  type LoopbackFixture = (Url, LoopbackServer);
+  /// Completed request and server finalization, including a native panic payload if joining fails.
+  #[derive(Debug)]
+  struct HttpRead {
+    /// Requested loopback endpoint.
+    endpoint: Url,
+    /// Native transport response.
+    response: Result<Value, TransportError>,
+    /// Native join and server I/O results.
+    joined:   thread::Result<Result<(), IoError>>,
+  }
 
   #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
-  /// Start one loopback server that writes the supplied complete HTTP response.
-  #[allow(
-    clippy::single_call_fn,
-    reason = "the loopback fixture owns port binding, request draining, and endpoint construction so transport assertions stay free of \
-              server setup"
-  )]
-  fn serve_once(response: &'static [u8]) -> Result<LoopbackFixture, TestFailure> {
-    let listener = ensure_ok(TcpListener::bind(("127.0.0.1", 0)), "the loopback schema listener must bind")?;
-    let address = ensure_ok(listener.local_addr(), "the loopback schema listener must expose its address")?;
-    let server = thread::spawn(move || {
+  /// Read a complete loopback response and finalize its server even when transport reading fails.
+  fn read_http_once<T: SchemaTransport>(runtime: &Runtime, transport: &T, response: &'static [u8]) -> Result<HttpRead, LoopbackSetupError> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    let endpoint = Url::parse(&format!("http://{}/schema.json", listener.local_addr()?)).map_err(Box::new)?;
+    let server = thread::Builder::new().spawn(move || {
       let (mut stream, _) = listener.accept()?;
       let mut request = [0_u8; 1024];
       if stream.read(&mut request)? == 0 {
         return Err(IoError::from(ErrorKind::UnexpectedEof));
       }
       stream.write_all(response)
-    });
-    let endpoint = ensure_ok(
-      Url::parse(&format!("http://{address}/schema.json")),
-      "the loopback schema URL must parse",
-    )?;
-    Ok((endpoint, server))
-  }
-
-  #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
-  /// Join one loopback server and preserve its typed I/O result.
-  #[allow(
-    clippy::single_call_fn,
-    reason = "server teardown names the panic-free join and typed I/O adjudication that must outlive every read outcome, including a \
-              failing one"
-  )]
-  fn finish_server(server: LoopbackServer) -> Result<(), TestFailure> {
+    })?;
+    let result = runtime.block_on(transport.read_json(endpoint.clone()));
     let joined = server.join();
-    ensure(joined.is_ok(), "the panic-free loopback schema server must terminate normally")?;
-    ensure_result(
-      ensure_some(joined.ok(), "the completed loopback server must retain its I/O result")?,
-      "the loopback schema server must write its response",
-    )
-  }
-
-  #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
-  /// Read one loopback response through a real schema transport.
-  fn read_http_once<T: SchemaTransport>(
-    runtime: &Runtime,
-    transport: &T,
-    response: &'static [u8],
-  ) -> Result<Result<serde_json::Value, TransportError>, TestFailure> {
-    let (endpoint, server) = serve_once(response)?;
-    let result = runtime.block_on(transport.read_json(endpoint));
-    finish_server(server)?;
-    Ok(result)
-  }
-
-  #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
-  /// Read one failing response through both online transport capabilities.
-  fn http_error_pair<L: SchemaTransport, C: SchemaTransport>(
-    runtime: &Runtime,
-    local: &L,
-    concurrent: &C,
-    response: &'static [u8],
-  ) -> Result<(TransportError, TransportError), TestFailure> {
-    let local_error = ensure_some(
-      read_http_once(runtime, local, response)?.err(),
-      "the local transport must reject the failing HTTP response",
-    )?;
-    let concurrent_error = ensure_some(
-      read_http_once(runtime, concurrent, response)?.err(),
-      "the concurrent transport must reject the failing HTTP response",
-    )?;
-    Ok((local_error, concurrent_error))
-  }
-
-  #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
-  /// Require both online transport families to preserve the typed HTTP failure boundary.
-  fn ensure_http_failure_pair(errors: &(TransportError, TransportError), context: &'static str) -> Result<(), TestFailure> {
-    ensure(
-      [
-        matches!(errors.0, TransportError::Http { .. }),
-        matches!(errors.1, TransportError::Http { .. }),
-      ] == [true, true],
-      context,
-    )
+    Ok(HttpRead {
+      endpoint,
+      response: result,
+      joined,
+    })
   }
 
   #[test]
-  fn offline_transport_preserves_local_io_and_typed_scheme_boundaries() -> Result<(), TestFailure> {
+  fn offline_transport_preserves_local_io_and_typed_scheme_boundaries() -> Result<(), impl Debug> {
     block_on(async {
       let environment = TestEnvironment::default();
-      let local_schema = ensure_ok(
-        serde_json::to_vec(&json!({ "title": "local" })),
-        "the local schema fixture must serialize",
-      )?;
-      environment.insert_file("/workspace/schema.json", local_schema);
+      let local_schema = serde_json::to_vec(&json!({ "title": "local" }));
+      if let Ok(ref bytes) = local_schema {
+        environment.insert_file("/workspace/schema.json", bytes.clone());
+      }
       environment.insert_file("/workspace/invalid.json", b"not-json".to_vec());
       let transport = OfflineSchemaTransport::new(environment.clone());
-
-      file_transport_contract(&transport).await?;
-
-      let remote = ensure_some(
-        transport.read_json(url("https://example.com/schema.json")?).await.err(),
-        "offline HTTP loading must fail",
-      )?;
-      ensure(
-        matches!(remote, TransportError::RemoteUnavailable { .. }),
-        "offline HTTP failure must be distinguishable from an unsupported scheme",
-      )?;
-
+      let files = file_transport_contract(&transport).await;
+      let remote = read_schema(&transport, "https://example.com/schema.json").await;
       let output = PathBuf::from("/workspace/cache/schema");
-      ensure_result(
-        transport.write_bytes(output.clone(), b"cached".to_vec()).await,
-        "offline cache writes must retain local host capability",
-      )?;
-      let written = ensure_result(
-        transport.read_bytes(output).await,
-        "offline cache writes must be readable through the same capability",
-      )?;
-      ensure(
-        written.as_slice() == b"cached",
-        "offline byte transport must preserve exact contents",
+      let write = transport.write_bytes(output.clone(), b"cached".to_vec()).await;
+      let read = transport.read_bytes(output).await;
+      ensure_that(
+        (environment, transport, local_schema, files, remote, write, read),
+        "offline transport must preserve file and cache I/O while rejecting remote access with its own error",
+        |actual| {
+          actual.2.is_ok()
+            && actual.3.is_ok()
+            && matches!(&actual.4.1, Some(Err(TransportError::RemoteUnavailable { .. })))
+            && actual.5.is_ok()
+            && actual.6.as_ref().is_ok_and(|bytes| bytes == b"cached")
+        },
       )
+      .map(drop)
+      .map_err(Box::new)
     })
   }
 
   #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
   #[test]
-  fn online_transports_share_file_and_http_success_error_contracts() -> Result<(), TestFailure> {
+  fn online_transports_share_file_and_http_success_error_contracts() -> Result<(), impl Debug> {
     let environment = TestEnvironment::default();
-    environment.insert_file(
-      "/workspace/schema.json",
-      ensure_ok(
-        serde_json::to_vec(&json!({ "title": "local" })),
-        "the online file-schema fixture must serialize",
-      )?,
-    );
+    let schema = serde_json::to_vec(&json!({ "title": "local" }));
+    if let Ok(ref bytes) = schema {
+      environment.insert_file("/workspace/schema.json", bytes.clone());
+    }
     environment.insert_file("/workspace/invalid.json", b"not-json".to_vec());
-    let local = LocalSchemaTransport::new(
-      environment.clone(),
-      ensure_result(super::local_http_client(), "the local HTTP schema client must construct")?,
-    );
-    let concurrent = ConcurrentSchemaTransport::new(
-      environment.clone(),
-      ensure_result(
-        super::concurrent_http_client(&environment, Duration::from_secs(2)),
-        "the concurrent HTTP schema client must construct",
-      )?,
-    );
-    block_on(file_transport_contract(&local))?;
-    block_on(file_transport_contract(&concurrent))?;
-
-    let runtime = ensure_ok(
-      Builder::new_current_thread().enable_all().build(),
-      "the loopback schema runtime must construct",
-    )?;
-    let success = b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\n{\"title\":\"loop\"}";
-    let local_schema = ensure_result(
-      read_http_once(&runtime, &local, success)?,
-      "the local transport must decode a successful loopback response",
-    )?;
-    let concurrent_schema = ensure_result(
-      read_http_once(&runtime, &concurrent, success)?,
-      "the concurrent transport must decode a successful loopback response",
-    )?;
-    ensure_eq(
-      &local_schema,
-      &json!({ "title": "loop" }),
-      "the local HTTP transport must preserve the response JSON",
-    )?;
-    ensure_eq(
-      &concurrent_schema,
-      &local_schema,
-      "local and concurrent HTTP transports must decode the same successful response",
-    )?;
-
-    let status = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-    ensure_http_failure_pair(
-      &http_error_pair(&runtime, &local, &concurrent, status)?,
-      "local and concurrent status failures must retain the same typed HTTP family",
-    )?;
-
-    let truncated = b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\nConnection: close\r\n\r\n{\"title\":";
-    ensure_http_failure_pair(
-      &http_error_pair(&runtime, &local, &concurrent, truncated)?,
-      "local and concurrent body-read failures must retain the same typed HTTP family",
+    let local = super::local_http_client().map(|client| LocalSchemaTransport::new(environment.clone(), client));
+    let concurrent = super::concurrent_http_client(&environment, Duration::from_secs(2))
+      .map(|client| ConcurrentSchemaTransport::new(environment.clone(), client));
+    let runtime = Builder::new_current_thread().enable_all().build();
+    let observed = local
+      .as_ref()
+      .ok()
+      .zip(concurrent.as_ref().ok())
+      .zip(runtime.as_ref().ok())
+      .map(|((local_transport, concurrent_transport), executor)| {
+        let files = [
+          block_on(file_transport_contract(local_transport)),
+          block_on(file_transport_contract(concurrent_transport)),
+        ];
+        let success = b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\n{\"title\":\"loop\"}";
+        let successes = [
+          read_http_once(executor, local_transport, success),
+          read_http_once(executor, concurrent_transport, success),
+        ];
+        let status = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let statuses = [
+          read_http_once(executor, local_transport, status),
+          read_http_once(executor, concurrent_transport, status),
+        ];
+        let truncated = b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\nConnection: close\r\n\r\n{\"title\":";
+        let truncations = [
+          read_http_once(executor, local_transport, truncated),
+          read_http_once(executor, concurrent_transport, truncated),
+        ];
+        (files, successes, statuses, truncations)
+      });
+    let completed_json_response = |read: &Result<HttpRead, LoopbackSetupError>| {
+      let Ok(ref result) = *read else {
+        return false;
+      };
+      matches!(&result.joined, Ok(Ok(()))) && result.response.as_ref().is_ok_and(|value| value == &json!({"title": "loop"}))
+    };
+    let completed_http_failure = |read: &Result<HttpRead, LoopbackSetupError>| {
+      let Ok(ref result) = *read else {
+        return false;
+      };
+      matches!(&result.joined, Ok(Ok(()))) && matches!(&result.response, Err(TransportError::Http { url, .. }) if url == &result.endpoint)
+    };
+    ensure_that(
+      (environment, schema, local, concurrent, runtime, observed),
+      "both online transports must preserve file contracts, HTTP JSON, status failures, body failures, and server finalization",
+      |actual| {
+        let Some(ref io) = actual.5 else {
+          return false;
+        };
+        actual.1.is_ok()
+          && io.0.iter().all(Result::is_ok)
+          && io.1.iter().all(completed_json_response)
+          && io.2.iter().chain(io.3.iter()).all(completed_http_failure)
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[cfg(all(feature = "reqwest", not(target_arch = "wasm32")))]
   #[test]
-  fn concurrent_client_reads_custom_certificate_from_its_environment() -> Result<(), TestFailure> {
+  fn concurrent_client_reads_custom_certificate_from_its_environment() -> Result<(), impl Debug> {
     let environment = TestEnvironment::default();
     environment.set_env_var("TAPLO_EXTRA_CA_CERTS", "/missing/taplo-ca.pem");
-    let error = ensure_some(
-      super::concurrent_http_client(&environment, Duration::from_secs(1)).err(),
-      "a configured missing certificate must prevent client construction",
-    )?;
-    #[cfg(any(feature = "native-tls", feature = "rustls-tls"))]
-    ensure(
-      matches!(
-        error,
-        TransportError::CertificateRead {
-          ref path,
-          ..
-        } if path.as_path() == Path::new("/missing/taplo-ca.pem")
-      ),
-      "a TLS-enabled client must retain the environment-provided certificate path",
-    )?;
-    #[cfg(not(any(feature = "native-tls", feature = "rustls-tls")))]
-    ensure(
-      matches!(
-        error,
-        TransportError::TlsUnavailable {
-          ref path
-        } if path.as_path() == Path::new("/missing/taplo-ca.pem")
-      ),
-      "a client without TLS must reject the environment-provided certificate path",
-    )?;
-    let configured = ensure_result(
-      environment.env_var("TAPLO_EXTRA_CA_CERTS"),
-      "the certificate variable must remain readable",
-    )?;
-    ensure(
-      configured.as_deref() == Some("/missing/taplo-ca.pem"),
-      "client construction must not mutate the owning host environment",
+    let client = super::concurrent_http_client(&environment, Duration::from_secs(1));
+    let configured = environment.env_var("TAPLO_EXTRA_CA_CERTS");
+    ensure_that(
+      (environment, client, configured),
+      "client construction must retain the rejected certificate path without mutating its environment",
+      |actual| {
+        #[cfg(any(feature = "native-tls", feature = "rustls-tls"))]
+        let rejected =
+          matches!(&actual.1, Err(TransportError::CertificateRead { path, .. }) if path.as_path() == Path::new("/missing/taplo-ca.pem"));
+        #[cfg(not(any(feature = "native-tls", feature = "rustls-tls")))]
+        let rejected =
+          matches!(&actual.1, Err(TransportError::TlsUnavailable { path }) if path.as_path() == Path::new("/missing/taplo-ca.pem"));
+        rejected
+          && actual
+            .2
+            .as_ref()
+            .is_ok_and(|value| value.as_deref() == Some("/missing/taplo-ca.pem"))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

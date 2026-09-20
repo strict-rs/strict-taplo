@@ -29,6 +29,7 @@ pub(super) enum WorkspaceChangeError {
 }
 
 /// Client-visible output after one committed workspace-folder transition.
+#[derive(Debug)]
 pub(super) struct WorkspaceChangeEffects {
   /// Current schema associations after redistribution.
   pub(super) associations: Vec<DidChangeSchemaAssociationParams>,
@@ -117,6 +118,7 @@ define_lsp_execution_families!(
 );
 
 /// Validated root URLs for one workspace-folder event.
+#[derive(Debug)]
 struct PreparedWorkspaceChange {
   /// Roots removed before additions are processed.
   removed: Vec<Url>,
@@ -146,21 +148,20 @@ fn workspace_urls(workspaces: Vec<lsp_types::WorkspaceFolder>) -> Result<Vec<Url
 
 #[cfg(test)]
 mod tests {
-  use std::str::FromStr as _;
+  use std::fmt::Debug;
 
   use futures::executor::block_on;
   use lsp_types::DidChangeWorkspaceFoldersParams;
-  use lsp_types::Uri;
   use lsp_types::WorkspaceFolder;
   use lsp_types::WorkspaceFoldersChangeEvent;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
+  use strict_test_support::ResultFailure;
   use strict_test_support::ensure_ok;
+  use strict_test_support::ensure_that;
   use url::Url;
 
+  use crate::handlers::test_support::FixtureFailure;
   #[cfg(not(target_arch = "wasm32"))]
   use crate::handlers::test_support::concurrent_world;
-  use crate::handlers::test_support::ensure_no_client_effects;
   use crate::handlers::test_support::local_world;
 
   /// Construct one workspace-folder change event.
@@ -174,66 +175,89 @@ mod tests {
   }
 
   /// Construct one workspace folder with checked wire URI syntax.
-  fn folder(uri: &str, name: &str) -> Result<WorkspaceFolder, TestFailure> {
+  fn folder(uri: &str, name: &str) -> Result<WorkspaceFolder, ResultFailure<serde_json::Error>> {
     Ok(WorkspaceFolder {
-      uri:  ensure_ok(Uri::from_str(uri), "the workspace-folder URI fixture must parse")?,
+      uri:  ensure_ok(
+        serde_json::from_value(serde_json::json!(uri)),
+        "the workspace-folder URI fixture must parse",
+      )?,
       name: name.to_owned(),
     })
   }
 
   #[test]
-  fn workspace_change_preparation_preserves_order_and_rejects_relative_references() -> Result<(), TestFailure> {
-    let removed = folder("file:///workspace/old", "old")?;
-    let added = folder("file:///workspace/new", "new")?;
-    let prepared = ensure_ok(
-      super::prepare_change(change(vec![removed], vec![added])),
-      "absolute workspace-folder changes must prepare",
-    )?;
-    let expected_removed = ensure_ok(Url::parse("file:///workspace/old"), "the removed workspace URL fixture must parse")?;
-    let expected_added = ensure_ok(Url::parse("file:///workspace/new"), "the added workspace URL fixture must parse")?;
-    ensure(
-      (prepared.removed, prepared.added) == (vec![expected_removed], vec![expected_added]),
-      "workspace preparation must retain removed-then-added URL identity and order",
-    )?;
-
-    let relative = folder("workspace/relative", "relative")?;
-    ensure(
-      matches!(
-        super::prepare_change(change(Vec::new(), vec![relative])),
-        Err(super::WorkspaceChangeError::UnsupportedWorkspaceUri { .. })
-      ),
-      "a relative workspace URI reference must be rejected before topology mutation",
+  fn workspace_change_preparation_preserves_order_and_rejects_relative_references() -> Result<(), impl Debug> {
+    let observed = (|| {
+      let removed = folder("file:///workspace/old", "old")?;
+      let added = folder("file:///workspace/new", "new")?;
+      let relative = folder("workspace/relative", "relative")?;
+      let expected_removed = ensure_ok(Url::parse("file:///workspace/old"), "the removed workspace URL fixture must parse")?;
+      let expected_added = ensure_ok(Url::parse("file:///workspace/new"), "the added workspace URL fixture must parse")?;
+      let prepared = super::prepare_change(change(vec![removed], vec![added]));
+      let rejected = super::prepare_change(change(Vec::new(), vec![relative]));
+      Ok::<_, FixtureFailure>((prepared, rejected, expected_removed, expected_added))
+    })();
+    ensure_that(
+      observed,
+      "workspace preparation must retain removed-then-added identity and reject relative references before mutation",
+      |result| {
+        let Ok(ref scenario) = *result else {
+          return false;
+        };
+        scenario
+          .0
+          .as_ref()
+          .is_ok_and(|prepared| prepared.removed == [scenario.2.clone()] && prepared.added == [scenario.3.clone()])
+          && matches!(scenario.1, Err(super::WorkspaceChangeError::UnsupportedWorkspaceUri { .. }))
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn empty_workspace_changes_are_no_ops_across_execution_families() -> Result<(), TestFailure> {
-    block_on(async {
-      let local_world = local_world()?;
-      let local_effects = ensure_ok(
-        super::workspace_change_local(&local_world, change(Vec::new(), Vec::new())).await,
-        "an empty local workspace change must succeed",
-      )?;
-      ensure_no_client_effects(
-        &local_effects.associations,
-        &local_effects.diagnostics,
-        "an empty local workspace change must publish no client effects",
-      )?;
-
+  fn empty_workspace_changes_are_no_ops_across_execution_families() -> Result<(), impl Debug> {
+    let observed = block_on(async {
+      let local = local_world()?;
       #[cfg(not(target_arch = "wasm32"))]
-      {
-        let concurrent_world = concurrent_world()?;
-        let concurrent_effects = ensure_ok(
-          super::workspace_change_concurrent(&concurrent_world, change(Vec::new(), Vec::new())).await,
-          "an empty concurrent workspace change must succeed",
-        )?;
-        ensure_no_client_effects(
-          &concurrent_effects.associations,
-          &concurrent_effects.diagnostics,
-          "an empty concurrent workspace change must publish no client effects",
-        )?;
-      };
-      Ok(())
-    })
+      let concurrent = concurrent_world()?;
+      let local_effects = super::workspace_change_local(&local, change(Vec::new(), Vec::new())).await;
+      #[cfg(not(target_arch = "wasm32"))]
+      let concurrent_effects = super::workspace_change_concurrent(&concurrent, change(Vec::new(), Vec::new())).await;
+      Ok::<_, FixtureFailure>((
+        local,
+        local_effects,
+        #[cfg(not(target_arch = "wasm32"))]
+        (concurrent, concurrent_effects),
+      ))
+    });
+    ensure_that(
+      observed,
+      "empty workspace transitions must succeed without schema or diagnostic effects in either execution family",
+      |result| {
+        let Ok(ref scenario) = *result else {
+          return false;
+        };
+        let local_empty = scenario
+          .1
+          .as_ref()
+          .is_ok_and(|effects| effects.associations.is_empty() && effects.diagnostics.is_empty());
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+          local_empty
+            && scenario
+              .2
+              .1
+              .as_ref()
+              .is_ok_and(|effects| effects.associations.is_empty() && effects.diagnostics.is_empty())
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+          local_empty
+        }
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

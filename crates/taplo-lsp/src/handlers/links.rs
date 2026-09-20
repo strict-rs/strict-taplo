@@ -145,29 +145,31 @@ fn key_document_links(schema: &Value, key: &Key, mapper: &Mapper) -> Result<Vec<
 
 #[cfg(test)]
 mod tests {
+  use std::fmt::Debug;
+
   use futures::executor::block_on;
   use lsp_types::DocumentLink;
   use lsp_types::DocumentLinkParams;
   use lsp_types::Position;
   use lsp_types::Range;
   use serde_json::json;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
+  use strict_test_support::ResultFailure;
   use strict_test_support::ensure_ok;
-  use strict_test_support::ensure_some;
+  use strict_test_support::ensure_that;
   use taplo::dom::KeyOrIndex;
   use taplo::dom::Keys;
-  use taplo::dom::error::QueryError;
-  use taplo::dom::node::Key;
   use taplo::parser;
+  use taplo_common::schema::transport::LocalSchemaTransport;
   use taplo_lsp_async::Params;
+  use taplo_lsp_async::rpc::RpcError;
   use taplo_lsp_async::util::Mapper;
   use url::Url;
 
   use super::key_document_links;
   use super::links_concurrent;
   use super::links_local;
-  use crate::LocalTestFuture;
+  use crate::LocalFuture;
+  use crate::handlers::test_support::FixtureFailure;
   use crate::handlers::test_support::SchemaFixture;
   use crate::handlers::test_support::concurrent_world;
   use crate::handlers::test_support::install_schema_document;
@@ -175,14 +177,18 @@ mod tests {
   use crate::handlers::test_support::replace_concurrent_document;
   use crate::handlers::test_support::replace_local_document;
   use crate::handlers::test_support::schema_fixture;
+  use crate::lsp_ext::notification::DidChangeSchemaAssociationParams;
+  use crate::world::DocumentSnapshot;
+  use crate::world::DocumentUpdate;
   use crate::world::LocalWorld;
   use crate::world::TestEnvironment;
+  use crate::world::WorldError;
 
   /// Source shared by each standalone document-link handler scenario.
   const LINK_SOURCE: &str = "setting = 1\nother = 2\n";
 
-  /// Construct one standalone document-link scenario without retaining transport state.
-  fn link_fixture() -> Result<SchemaFixture, TestFailure> {
+  /// Construct the complete URL identity of a standalone document-link scenario.
+  fn link_fixture() -> Result<SchemaFixture, ResultFailure<url::ParseError>> {
     schema_fixture(
       "file:///workspace/links.toml",
       "https://example.com/link-schema.json",
@@ -193,52 +199,46 @@ mod tests {
 
   /// Construct the client policy that enables standalone schema links.
   fn link_configuration() -> serde_json::Value {
-    json!({
-      "schema": {
-        "enabled": true,
-        "links": true,
-        "catalogs": []
-      }
-    })
+    json!({ "schema": { "enabled": true, "links": true, "catalogs": [] } })
   }
 
   /// Construct the schema that documents exactly one fixture property.
   fn link_schema() -> serde_json::Value {
-    json!({
-      "type": "object",
-      "properties": {
-        "setting": {
-          "type": "integer",
-          "x-taplo": {
-            "links": {
-              "key": "https://example.com/docs/setting"
-            }
-          }
-        },
-        "other": {
-          "type": "integer"
-        }
-      }
-    })
+    json!({ "type": "object", "properties": {
+      "setting": { "type": "integer", "x-taplo": { "links": { "key": "https://example.com/docs/setting" } } },
+      "other": { "type": "integer" }
+    } })
   }
 
-  /// Enable standalone schema links in one local handler world.
-  fn enable_local_links(world: &LocalWorld<TestEnvironment>) -> LocalTestFuture<'_, ()> {
-    Box::pin(async move {
-      drop(ensure_ok(
-        world.apply_configuration_values_local(Some(&link_configuration()), &[]).await,
-        "the local document-link policy must commit",
-      )?);
-      Ok(())
-    })
+  /// Decode one document-link request through its public wire shape.
+  fn link_params(document: &Url) -> Result<DocumentLinkParams, ResultFailure<serde_json::Error>> {
+    ensure_ok(
+      serde_json::from_value(json!({ "textDocument": { "uri": document.as_str() } })),
+      "the document-link request fixture must decode",
+    )
   }
 
-  /// Execute one fully configured local link projection.
-  fn configured_local_links(fixture: &SchemaFixture) -> LocalTestFuture<'_, Vec<DocumentLink>> {
+  /// Native world, configuration, schema installation, and response of one link projection.
+  type LinkObservation<Owner, Transport> = (
+    Owner,
+    Result<Vec<DidChangeSchemaAssociationParams>, WorldError>,
+    (
+      Result<DocumentUpdate, Box<ResultFailure<WorldError>>>,
+      Option<DocumentSnapshot<Transport>>,
+    ),
+    Result<Option<Vec<DocumentLink>>, RpcError>,
+  );
+
+  /// Current-thread link projection retaining its concrete transport and world.
+  type LocalLinkObservation = LinkObservation<LocalWorld<TestEnvironment>, LocalSchemaTransport<TestEnvironment>>;
+
+  /// Execute a local link projection and return all setup, mutation and protocol evidence.
+  fn configured_local_links(fixture: &SchemaFixture) -> LocalFuture<'_, Result<LocalLinkObservation, FixtureFailure>> {
     Box::pin(async move {
       let world = local_world()?;
-      enable_local_links(&world).await?;
-      install_schema_document(
+      let parameters = link_params(&fixture.document)?;
+      let configured = world.apply_configuration_values_local(Some(&link_configuration()), &[]).await;
+      let installed = install_schema_document(
         replace_local_document(
           &world,
           &fixture.document,
@@ -249,185 +249,170 @@ mod tests {
         &fixture.document,
         &fixture.schema_url,
         link_schema(),
-        "the configured local document must expose a snapshot",
       )
-      .await?;
-      ensure_some(
-        ensure_ok(
-          links_local(&world, Params::from(Some(link_params(&fixture.document)?))).await,
-          "configured local standalone-link generation must execute",
-        )?,
-        "enabled local standalone links must return a concrete collection",
-      )
-    })
-  }
-
-  /// Decode one document-link request through its public wire shape.
-  fn link_params(document: &Url) -> Result<DocumentLinkParams, TestFailure> {
-    ensure_ok(
-      serde_json::from_value(json!({
-        "textDocument": {
-          "uri": document.as_str()
-        }
-      })),
-      "the document-link request fixture must decode",
-    )
-  }
-
-  /// Extract the first real key from one parsed document path.
-  #[allow(
-    clippy::single_call_fn,
-    reason = "the named fixture keeps the parse, path decode, and DOM existence check together, so link ranges are asserted against a key \
-              that provably exists in the fixture tree"
-  )]
-  fn key(source: &str, path: &str) -> Result<Key, TestFailure> {
-    let dom = ensure_ok(parser::parse(source), "the document-link fixture tree must build")?.into_dom();
-    let keys: Keys = path.parse().map_err(|error: QueryError| TestFailure::WasErr {
-      context: "the document-link fixture path must parse",
-      cause:   error.to_string(),
-    })?;
-    ensure_some(
-      keys.iter().find_map(KeyOrIndex::as_key).cloned(),
-      "the document-link fixture must contain a key",
-    )
-    .and_then(|parsed_key| {
-      ensure(dom.path(&keys).is_some(), "the document-link fixture path must exist")?;
-      Ok(parsed_key)
+      .await;
+      let response = links_local(&world, Params::from(Some(parameters))).await;
+      Ok((world, configured, installed, response))
     })
   }
 
   #[test]
-  fn standalone_links_require_valid_targets_and_mappable_ranges() -> Result<(), TestFailure> {
+  fn standalone_links_require_valid_targets_and_mappable_ranges() -> Result<(), impl Debug> {
     let source = "setting = 1\n";
-    let key = key(source, "setting")?;
-    let schema = json!({
-        "x-taplo": { "links": { "key": "https://example.com/docs" } }
+    let parsed = parser::parse(source);
+    let keys = "setting".parse::<Keys>();
+    let located = parsed.as_ref().ok().zip(keys.as_ref().ok()).map(|(document, path)| {
+      let dom = document.clone().into_dom();
+      let key = path.iter().find_map(KeyOrIndex::as_key).cloned();
+      let selected = dom.path(path);
+      (dom, key, selected)
     });
-    let mapper = ensure_ok(Mapper::new_utf16(source), "the document-link fixture mapper must build")?;
-    let links = ensure_ok(
-      key_document_links(&schema, &key, &mapper),
-      "a valid schema documentation link must be projected",
-    )?;
-    let link = ensure_some(links.first(), "a valid standalone link must be emitted")?;
-    ensure(
-      link.range == Range::new(Position::new(0, 0), Position::new(0, 7)),
-      "standalone link range must cover the exact key source",
-    )?;
-    ensure(
-      link
-        .target
-        .as_ref()
-        .is_some_and(|target| target.as_str() == "https://example.com/docs"),
-      "standalone link target must retain the schema URL",
-    )?;
-
-    let invalid_target = key_document_links(
-      &json!({
-          "x-taplo": { "links": { "key": "not a URL" } }
-      }),
-      &key,
-      &mapper,
-    );
-    ensure(invalid_target.is_err(), "an invalid target URL must not be silently skipped")?;
-    let empty_mapper = ensure_ok(Mapper::new_utf16(""), "the empty document-link fixture mapper must build")?;
-    let unmappable = key_document_links(&schema, &key, &empty_mapper);
-    ensure(
-      unmappable.is_err(),
-      "an unmappable key range must return its typed projection error",
-    )?;
-    let absent = ensure_ok(
-      key_document_links(&json!({ "description": "no standalone link" }), &key, &mapper),
-      "a schema without link metadata must remain a successful empty projection",
-    )?;
-    ensure(absent.is_empty(), "a schema without an external key link must emit nothing")
+    let mapper = Mapper::new_utf16(source);
+    let empty_mapper = Mapper::new_utf16("");
+    let schema = json!({ "x-taplo": { "links": { "key": "https://example.com/docs" } } });
+    let projections = located
+      .as_ref()
+      .and_then(|location| location.1.as_ref())
+      .zip(mapper.as_ref().ok())
+      .zip(empty_mapper.as_ref().ok())
+      .map(|((key, coordinates), empty)| {
+        (
+          key_document_links(&schema, key, coordinates),
+          key_document_links(&json!({ "x-taplo": { "links": { "key": "not a URL" } } }), key, coordinates),
+          key_document_links(&schema, key, empty),
+          key_document_links(&json!({ "description": "no standalone link" }), key, coordinates),
+        )
+      });
+    ensure_that(
+      (parsed, keys, located, mapper, empty_mapper, schema, projections),
+      "standalone links must retain exact source and target, reject invalid targets or ranges, and omit schemas without link metadata",
+      |observed| {
+        let Some(ref links) = observed.6 else {
+          return false;
+        };
+        let Ok(ref projected) = links.0 else {
+          return false;
+        };
+        observed.2.as_ref().is_some_and(|location| location.2.is_some())
+          && projected.first().is_some_and(|link| {
+            link.range == Range::new(Position::new(0, 0), Position::new(0, 7))
+              && link
+                .target
+                .as_ref()
+                .is_some_and(|target| target.as_str() == "https://example.com/docs")
+          })
+          && links.1.is_err()
+          && links.2.is_err()
+          && links.3.as_ref().is_ok_and(Vec::is_empty)
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn document_links_remain_disabled_by_default_and_reject_missing_parameters() -> Result<(), TestFailure> {
-    block_on(async {
+  fn document_links_remain_disabled_by_default_and_reject_missing_parameters() -> Result<(), impl Debug> {
+    let observed = block_on(async {
       let fixture = link_fixture()?;
       let local = local_world()?;
-      replace_local_document(
+      let parameters = link_params(&fixture.document)?;
+      let installed = replace_local_document(
         &local,
         &fixture.document,
         LINK_SOURCE,
         "the local document-link source must install",
       )
-      .await?;
-      ensure(
-        ensure_ok(
-          links_local(&local, Params::from(Some(link_params(&fixture.document)?))).await,
-          "disabled standalone links must remain an absent success",
-        )?
-        .is_none(),
-        "the default link-disabled policy must not emit standalone schema links",
-      )?;
-      let missing_params = ensure_some(
-        links_local(&local, Params::<DocumentLinkParams>::from(None)).await.err(),
-        "document links without parameters must return a typed invalid-params error",
-      )?;
-      ensure(
-        (missing_params.code, missing_params.details.is_some()) == (-32602, true),
-        "document links without parameters must retain the standard typed invalid-params response",
-      )
-    })
+      .await;
+      let disabled = links_local(&local, Params::from(Some(parameters))).await;
+      let rejected = links_local(&local, Params::<DocumentLinkParams>::from(None)).await;
+      Ok::<_, FixtureFailure>((fixture, local, installed, disabled, rejected))
+    });
+    ensure_that(
+      observed,
+      "default-disabled links must return absence and missing parameters must retain the typed invalid-params response",
+      |result| {
+        let Ok(ref scenario) = *result else {
+          return false;
+        };
+        scenario.2.is_ok()
+          && matches!(scenario.3, Ok(None))
+          && scenario
+            .4
+            .as_ref()
+            .is_err_and(|error| error.code == -32602 && error.details.is_some())
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn document_links_require_an_association_and_preserve_exact_protocol_fields() -> Result<(), TestFailure> {
-    block_on(async {
+  fn document_links_require_an_association_and_preserve_exact_protocol_fields() -> Result<(), impl Debug> {
+    let observed = block_on(async {
       let fixture = link_fixture()?;
       let unassociated = local_world()?;
-      enable_local_links(&unassociated).await?;
-      replace_local_document(
+      let parameters = link_params(&fixture.document)?;
+      let configured = unassociated
+        .apply_configuration_values_local(Some(&link_configuration()), &[])
+        .await;
+      let installed = replace_local_document(
         &unassociated,
         &fixture.document,
         LINK_SOURCE,
         "the unassociated document-link source must install",
       )
-      .await?;
-      let unassociated_links = ensure_some(
-        ensure_ok(
-          links_local(&unassociated, Params::from(Some(link_params(&fixture.document)?))).await,
-          "unassociated document-link generation must execute",
-        )?,
-        "enabled links without an association must return an empty collection",
-      )?;
-      ensure(
-        unassociated_links.is_empty(),
-        "an unassociated document must not fabricate schema documentation links",
-      )?;
-
-      let local_links = configured_local_links(&fixture).await?;
-      let local_link = ensure_some(local_links.first(), "the linked schema property must emit one standalone link")?;
-      ensure(
-        (
-          local_links.len(),
-          local_link.range,
-          local_link.target.as_ref().map(|target| target.as_str()),
-        ) == (
-          1,
-          Range::new(Position::new(0, 0), Position::new(0, 7)),
-          Some("https://example.com/docs/setting"),
-        ),
-        "standalone-link generation must emit only documented keys with exact ranges and targets",
-      )
-    })
+      .await;
+      let absent = links_local(&unassociated, Params::from(Some(parameters))).await;
+      let associated = configured_local_links(&fixture).await;
+      Ok::<_, FixtureFailure>((fixture, unassociated, configured, installed, absent, associated))
+    });
+    ensure_that(
+      observed,
+      "links require an association and must preserve exactly one documented key range and target",
+      |result| {
+        let Ok(ref scenario) = *result else {
+          return false;
+        };
+        let Ok(ref associated) = scenario.5 else {
+          return false;
+        };
+        let Ok(Some(ref links)) = associated.3 else {
+          return false;
+        };
+        scenario.2.is_ok()
+          && scenario.3.is_ok()
+          && scenario
+            .4
+            .as_ref()
+            .is_ok_and(|response| response.as_ref().is_some_and(Vec::is_empty))
+          && associated.1.is_ok()
+          && associated.2.0.is_ok()
+          && associated.2.1.is_some()
+          && links.len() == 1
+          && links.first().is_some_and(|link| {
+            link.range == Range::new(Position::new(0, 0), Position::new(0, 7))
+              && link
+                .target
+                .as_ref()
+                .is_some_and(|target| target.as_str() == "https://example.com/docs/setting")
+          })
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn document_link_execution_families_preserve_identical_protocol_output() -> Result<(), TestFailure> {
-    block_on(async {
+  fn document_link_execution_families_preserve_identical_protocol_output() -> Result<(), impl Debug> {
+    let observed = block_on(async {
       let fixture = link_fixture()?;
-      let local_links = configured_local_links(&fixture).await?;
       let concurrent = concurrent_world()?;
-      drop(ensure_ok(
-        concurrent
-          .apply_configuration_values_concurrent(Some(&link_configuration()), &[])
-          .await,
-        "the concurrent document-link configuration must commit",
-      )?);
-      install_schema_document(
+      let parameters = link_params(&fixture.document)?;
+      let local = configured_local_links(&fixture).await;
+      let configured = concurrent
+        .apply_configuration_values_concurrent(Some(&link_configuration()), &[])
+        .await;
+      let installed = install_schema_document(
         replace_concurrent_document(
           &concurrent,
           &fixture.document,
@@ -438,20 +423,32 @@ mod tests {
         &fixture.document,
         &fixture.schema_url,
         link_schema(),
-        "the configured concurrent document must expose a snapshot",
       )
-      .await?;
-      let concurrent_links = ensure_some(
-        ensure_ok(
-          links_concurrent(&concurrent, Params::from(Some(link_params(&fixture.document)?))).await,
-          "concurrent standalone-link generation must execute",
-        )?,
-        "enabled concurrent standalone links must return a concrete collection",
-      )?;
-      ensure(
-        concurrent_links == local_links,
-        "local and concurrent standalone-link families must preserve identical protocol output",
-      )
-    })
+      .await;
+      let response = links_concurrent(&concurrent, Params::from(Some(parameters))).await;
+      Ok::<_, FixtureFailure>((fixture, local, (concurrent, configured, installed, response)))
+    });
+    ensure_that(
+      observed,
+      "local and concurrent standalone links must preserve identical complete protocol output",
+      |result| {
+        let Ok(ref scenario) = *result else {
+          return false;
+        };
+        let Ok(ref local) = scenario.1 else {
+          return false;
+        };
+        local.1.is_ok()
+          && local.2.0.is_ok()
+          && local.2.1.is_some()
+          && scenario.2.1.is_ok()
+          && scenario.2.2.0.is_ok()
+          && scenario.2.2.1.is_some()
+          && local.3.as_ref().is_ok_and(Option::is_some)
+          && local.3 == scenario.2.3
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 }
