@@ -5,6 +5,7 @@ use std::env::consts::OS;
 use std::path::Path;
 use std::path::PathBuf;
 
+use strict_standard::Workspace;
 use template_core::CoreError;
 use template_core::cli::context::CommandContext;
 use template_core::sys::process::ToolColor;
@@ -83,13 +84,11 @@ fn artifact_for_host(os: &'static str, architecture: &'static str) -> Result<Art
 ///
 /// # Errors
 ///
-/// Returns a workflow-wrapped [`StaskError::PathUnicode`] when `path` cannot be
+/// Returns [`StaskError::PathUnicode`] when `path` cannot be
 /// represented as UTF-8.
-fn path_argument(path: &Path) -> template_core::Result<String> {
-  path.to_str().map(str::to_owned).ok_or_else(|| {
-    CoreError::workflow(StaskError::PathUnicode {
-      path: path.to_owned()
-    })
+fn path_argument(path: &Path) -> Result<String, StaskError> {
+  path.to_str().map(str::to_owned).ok_or_else(|| StaskError::PathUnicode {
+    path: path.to_owned()
   })
 }
 
@@ -103,7 +102,7 @@ fn path_argument(path: &Path) -> template_core::Result<String> {
   clippy::single_call_fn,
   reason = "the named provisioning step separates verified runner acquisition from conformance execution"
 )]
-fn prepare_runner(context: &CommandContext, artifact: &Artifact) -> template_core::Result<PathBuf> {
+fn prepare_runner(context: &CommandContext<impl Workspace>, artifact: &Artifact) -> Result<PathBuf, StaskError> {
   let tool_directory = PathBuf::from(TOOL_DIRECTORY);
   context.file_system().create_dir_all(&tool_directory).map_err(CoreError::from)?;
 
@@ -177,8 +176,8 @@ fn prepare_runner(context: &CommandContext, artifact: &Artifact) -> template_cor
   clippy::single_call_fn,
   reason = "the named handler keeps checksum-pinned conformance orchestration behind its extension boundary"
 )]
-pub(super) fn run(context: &CommandContext) -> template_core::Result<()> {
-  let artifact = artifact_for_host(OS, ARCH).map_err(CoreError::workflow)?;
+pub(super) fn run(context: &CommandContext<impl Workspace>) -> Result<(), StaskError> {
+  let artifact = artifact_for_host(OS, ARCH)?;
   let runner_path = prepare_runner(context, &artifact)?;
   let runner_argument = path_argument(&runner_path)?;
   command::run(
@@ -203,6 +202,7 @@ pub(super) fn run(context: &CommandContext) -> template_core::Result<()> {
     ToolColor::EnvOnly,
     None,
   )
+  .map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -215,196 +215,196 @@ mod tests {
   use std::path::PathBuf;
 
   use strict_test_support::EffectEvent;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_contains;
-  use strict_test_support::ensure_eq;
+  use strict_test_support::PredicateFailure;
   use strict_test_support::ensure_ok;
-  use strict_test_support::ensure_some;
+  use strict_test_support::ensure_that;
 
+  use super::Artifact;
   use super::StaskError;
   use super::artifact_for_host;
   use super::path_argument;
   use super::prepare_runner;
   use super::run;
+  use crate::extensions::test_support::Execution;
+  use crate::extensions::test_support::ExtensionTestFailure;
   use crate::extensions::test_support::recording_context;
+
+  /// Complete host artifact selection, including native rejection details.
+  type ArtifactSelection = Result<Artifact, StaskError>;
+  /// Provisioned executable or native failure alongside every recorded effect.
+  type Provisioning = Execution<PathBuf, StaskError>;
+  /// Complete conformance result alongside every recorded effect.
+  type Conformance = Execution<(), StaskError>;
 
   /// Pin the CI runner artifact and its official checksum.
   #[test]
-  fn selects_checksum_pinned_linux_runner() -> Result<(), TestFailure> {
-    let artifact = ensure_ok(
+  fn selects_checksum_pinned_linux_runner() -> Result<(), PredicateFailure<ArtifactSelection>> {
+    ensure_that(
       artifact_for_host("linux", "x86_64"),
-      "the CI host must have a configured toml-test artifact",
-    )?;
-    ensure_eq(
-      &artifact.sha256,
-      &"08f9e0a97da1151c33debf01358a8f5ef45e2a56be201241ae5eb5c2e9323fef",
-      "the Linux runner checksum must remain release-pinned",
+      "the CI host must select the release-pinned Linux runner checksum",
+      |observed| {
+        observed
+          .as_ref()
+          .is_ok_and(|artifact| artifact.sha256 == "08f9e0a97da1151c33debf01358a8f5ef45e2a56be201241ae5eb5c2e9323fef")
+      },
     )
+    .map(drop)
   }
 
   /// Reject hosts that lack an explicitly checksum-pinned artifact.
   #[test]
-  fn rejects_unconfigured_toml_test_host() -> Result<(), TestFailure> {
-    ensure(
-      artifact_for_host("unknown", "unknown")
-        == Err(StaskError::UnsupportedTomlTestHost {
-          os:           "unknown",
-          architecture: "unknown",
-        }),
+  fn rejects_unconfigured_toml_test_host() -> Result<(), PredicateFailure<ArtifactSelection>> {
+    ensure_that(
+      artifact_for_host("unknown", "unknown"),
       "unknown hosts must fail instead of downloading an unverified artifact",
+      |observed| {
+        matches!(
+          observed,
+          &Err(StaskError::UnsupportedTomlTestHost {
+            os:           "unknown",
+            architecture: "unknown",
+          })
+        )
+      },
     )
+    .map(drop)
   }
 
   #[test]
-  fn provisions_the_pinned_runner_with_checksum_and_command_order() -> Result<(), TestFailure> {
+  fn provisions_the_pinned_runner_with_checksum_and_command_order() -> Result<(), ExtensionTestFailure<Provisioning>> {
     let artifact = ensure_ok(
       artifact_for_host("linux", "x86_64"),
       "the deterministic provisioning fixture must select the Linux artifact",
     )?;
     let (context, effects) = recording_context(&[0, 0, 0, 0])?;
-    let runner = ensure_ok(
-      prepare_runner(&context, &artifact),
-      "the checksum-pinned runner provisioning sequence must succeed",
-    )?;
-    ensure(
-      runner.as_path() == Path::new("target/stask-tools/toml-test-v2.2.0/toml-test-v2.2.0-linux-amd64"),
-      "runner provisioning must return the decompressed executable path",
-    )?;
-
-    let events = effects.events();
-    let checksum = ensure_some(
-      events.iter().find_map(|event| match *event {
-        EffectEvent::WriteBytes {
-          ref path,
-          ref contents,
-          atomic: false,
-        } if path.extension().is_some_and(|extension| extension == "sha256") => Some(contents),
-        EffectEvent::Process(_)
-        | EffectEvent::PathState(_)
-        | EffectEvent::CreateDirAll(_)
-        | EffectEvent::RemovePath(_)
-        | EffectEvent::Rename {
-          ..
-        }
-        | EffectEvent::CopyDirAll {
-          ..
-        }
-        | EffectEvent::WriteBytes {
-          ..
-        }
-        | EffectEvent::ReadBytes(_)
-        | EffectEvent::CreateDirectorySymlink {
-          ..
-        }
-        | EffectEvent::ReadDirectory(_)
-        | EffectEvent::EnvironmentVariable(_)
-        | EffectEvent::CurrentDirectory
-        | EffectEvent::ClockNow
-        | EffectEvent::CreateWorkspace {
-          ..
-        }
-        | EffectEvent::CloseWorkspace(_) => None,
-      }),
-      "runner provisioning must write one checksum manifest",
-    )?;
+    let result = prepare_runner(&context, &artifact);
     let compressed = PathBuf::from("target/stask-tools/toml-test-v2.2.0").join(artifact.file_name);
     let expected_checksum = format!("{}  {}\n", artifact.sha256, compressed.display());
-    ensure(
-      checksum == expected_checksum.as_bytes(),
-      "the checksum manifest must bind the official digest to the downloaded artifact path",
-    )?;
-    let requests = effects.process_requests();
-    let request_programs = requests.iter().map(|request| request.program.clone()).collect::<Vec<_>>();
-    ensure(
-      request_programs == ["curl", artifact.checksum_program, "gzip", "chmod"].map(OsString::from),
-      "runner provisioning must download, verify, decompress, and mark the executable in order",
+    ensure_that(
+      (result, effects),
+      "provisioning must return the executable, bind the official checksum to the artifact path, and download, verify, decompress, and \
+       mark it executable in order",
+      |observed| {
+        let events = observed.1.events();
+        let checksum = events.iter().find_map(|event| {
+          let &EffectEvent::WriteBytes {
+            ref path,
+            ref contents,
+            atomic: None,
+          } = event
+          else {
+            return None;
+          };
+          path
+            .extension()
+            .is_some_and(|extension| extension == "sha256")
+            .then_some(contents)
+        });
+        let requests = observed.1.process_requests();
+        observed
+          .0
+          .as_ref()
+          .is_ok_and(|runner| runner.as_path() == Path::new("target/stask-tools/toml-test-v2.2.0/toml-test-v2.2.0-linux-amd64"))
+          && checksum.is_some_and(|contents| contents == expected_checksum.as_bytes())
+          && requests.iter().map(|request| request.program.clone()).collect::<Vec<_>>()
+            == ["curl", artifact.checksum_program, "gzip", "chmod"].map(OsString::from)
+      },
     )
+    .map(drop)
+    .map_err(Into::into)
   }
 
   #[test]
-  fn provisioning_and_conformance_execution_stop_at_the_first_failed_process() -> Result<(), TestFailure> {
+  fn provisioning_stops_at_the_first_failed_process() -> Result<(), ExtensionTestFailure<Provisioning>> {
     let artifact = ensure_ok(
       artifact_for_host("linux", "x86_64"),
       "the deterministic failure fixture must select the Linux artifact",
     )?;
     let (provisioning_context, provisioning_effects) = recording_context(&[0, 7])?;
-    ensure(
-      prepare_runner(&provisioning_context, &artifact).is_err(),
-      "a checksum verification failure must reject runner provisioning",
-    )?;
-    let provisioning_requests = provisioning_effects.process_requests();
-    ensure(
-      (
-        provisioning_requests.len(),
-        provisioning_requests.get(1).map(|request| request.program.clone()),
-      ) == (2, Some(OsString::from(artifact.checksum_program))),
-      "checksum failure must stop before decompression and permission changes",
-    )?;
+    let result = prepare_runner(&provisioning_context, &artifact);
+    ensure_that(
+      (result, provisioning_effects),
+      "checksum failure must reject provisioning before decompression and permission changes",
+      |observed| {
+        let requests = observed.1.process_requests();
+        observed.0.is_err()
+          && requests.len() == 2
+          && requests
+            .get(1)
+            .is_some_and(|request| request.program == artifact.checksum_program)
+      },
+    )
+    .map(drop)
+    .map_err(Into::into)
+  }
 
+  #[test]
+  fn conformance_execution_stops_at_the_first_failed_process() -> Result<(), ExtensionTestFailure<Conformance>> {
     if artifact_for_host(OS, ARCH).is_err() {
       return Ok(());
     }
     let (run_context, run_effects) = recording_context(&[0, 0, 0, 0, 11])?;
-    ensure(
-      run(&run_context).is_err(),
-      "a decoder build failure must reject the conformance extension",
-    )?;
-    let run_requests = run_effects.process_requests();
-    ensure(
-      (run_requests.len(), run_requests.last().map(|request| request.program.clone())) == (5, Some(OsString::from("cargo"))),
-      "a decoder build failure must stop before invoking the conformance runner",
+    let result = run(&run_context);
+    ensure_that(
+      (result, run_effects),
+      "a decoder build failure must reject conformance before invoking the runner",
+      |observed| {
+        let requests = observed.1.process_requests();
+        observed.0.is_err() && requests.len() == 5 && requests.last().is_some_and(|request| request.program == "cargo")
+      },
     )
+    .map(drop)
+    .map_err(Into::into)
   }
 
   #[test]
-  fn complete_conformance_execution_builds_then_invokes_the_pinned_runner() -> Result<(), TestFailure> {
+  fn complete_conformance_execution_builds_then_invokes_the_pinned_runner() -> Result<(), ExtensionTestFailure<Conformance>> {
     let artifact = match artifact_for_host(OS, ARCH) {
       Ok(artifact) => artifact,
       Err(_unsupported) => return Ok(()),
     };
     let (context, effects) = recording_context(&[0, 0, 0, 0, 0, 0])?;
-    ensure_ok(
-      run(&context),
-      "the supported host must complete runner provisioning, decoder build, and conformance execution",
-    )?;
-    let requests = effects.process_requests();
-    let runner = ensure_some(requests.last(), "complete conformance execution must emit its runner request")?;
+    let result = run(&context);
     let expected_runner = PathBuf::from(super::TOOL_DIRECTORY).join(artifact.file_name).with_extension("");
     let expected_arguments = ["test", "-toml", "1.1", "-decoder", "./target/debug/taplo toml-test"].map(OsString::from);
-    ensure(
-      (runner.program.as_os_str(), runner.arguments.as_slice()) == (expected_runner.as_os_str(), expected_arguments.as_slice()),
-      "the pinned runner must execute the complete TOML 1.1 decoder contract",
+    ensure_that(
+      (result, effects),
+      "the supported host must provision, build, and execute the pinned runner with the complete TOML 1.1 decoder contract",
+      |observed| {
+        observed.0.is_ok()
+          && observed.1.process_requests().last().is_some_and(|runner| {
+            (runner.program.as_os_str(), runner.arguments.as_slice()) == (expected_runner.as_os_str(), expected_arguments.as_slice())
+          })
+      },
     )
+    .map(drop)
+    .map_err(Into::into)
   }
 
   #[test]
-  fn process_paths_accept_unicode_and_reject_unrepresentable_host_paths() -> Result<(), TestFailure> {
-    ensure_eq(
-      &ensure_ok(
-        path_argument(Path::new("target/tool")),
-        "a Unicode process path must convert to an owned argument",
-      )?
-      .as_str(),
-      &"target/tool",
+  fn process_paths_accept_unicode_and_reject_unrepresentable_host_paths() -> Result<(), PredicateFailure<Result<String, StaskError>>> {
+    drop(ensure_that(
+      path_argument(Path::new("target/tool")),
       "Unicode process paths must preserve exact text",
-    )?;
+      |observed| observed.as_ref().is_ok_and(|argument| argument == "target/tool"),
+    )?);
 
     #[cfg(unix)]
     {
       use std::os::unix::ffi::OsStringExt as _;
 
       let invalid = PathBuf::from(OsString::from_vec(vec![0xff]));
-      let message = ensure_some(
-        path_argument(&invalid).err().map(|error| error.to_string()),
-        "a non-Unicode process path must return a typed workflow error",
-      )?;
-      ensure_contains(
-        &message,
-        "not valid Unicode",
-        "the path failure must retain the rejected representation contract",
-      )
-    }?;
+      drop(ensure_that(
+        path_argument(&invalid),
+        "a non-Unicode process path must retain the rejected path in its native error",
+        |observed| {
+          matches!(observed, &Err(StaskError::PathUnicode { ref path }) if path == &invalid)
+            && observed
+              .as_ref()
+              .is_err_and(|error| error.to_string().contains("not valid Unicode"))
+        },
+      )?);
+    }
     Ok(())
   }
 }

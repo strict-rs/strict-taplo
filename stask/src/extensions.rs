@@ -18,8 +18,11 @@ mod wasm_matrix;
 
 use bpaf::Parser as _;
 use bpaf::pure;
-use template_core::cli::command::CommandSet;
+use strict_standard::Workspace;
 use template_core::cli::context::CommandContext;
+use template_stask::ExtensionCommandSet;
+
+pub use self::error::StaskError;
 
 /// Every repository-specific extension command.
 #[derive(Clone, Copy, Debug)]
@@ -39,12 +42,12 @@ enum ProjectCommand {
   clippy::single_call_fn,
   reason = "the registry callback keeps the ProjectCommand dispatch match explicit and exhaustive"
 )]
-fn execute(command: ProjectCommand, context: &CommandContext) -> template_core::Result<()> {
+fn execute(command: ProjectCommand, context: &CommandContext<impl Workspace>) -> Result<(), StaskError> {
   match command {
     ProjectCommand::TomlConformance => toml_conformance::run(context),
-    ProjectCommand::WasmMatrix => wasm_matrix::run(context),
-    ProjectCommand::JavaScriptBuild => javascript::run(context),
-    ProjectCommand::TaploSelfFormat => self_format::run(context),
+    ProjectCommand::WasmMatrix => wasm_matrix::run(context).map_err(Into::into),
+    ProjectCommand::JavaScriptBuild => javascript::run(context).map_err(Into::into),
+    ProjectCommand::TaploSelfFormat => self_format::run(context).map_err(Into::into),
   }
 }
 
@@ -58,7 +61,7 @@ fn execute(command: ProjectCommand, context: &CommandContext) -> template_core::
   clippy::single_call_fn,
   reason = "the public constructor is the crate facade and contract-test seam for extension composition"
 )]
-pub fn commands() -> template_stask::Result<CommandSet> {
+pub fn commands() -> template_stask::Result<ExtensionCommandSet<(), StaskError>> {
   let toml_conformance = template_stask::extension_command(
     "toml-conformance",
     "Run the pinned TOML 1.1 conformance suite without skips",
@@ -93,12 +96,13 @@ pub fn commands() -> template_stask::Result<CommandSet> {
 
 #[cfg(test)]
 mod tests {
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_ok;
+  use strict_test_support::ensure_that;
 
   use super::ProjectCommand;
+  use super::StaskError;
   use super::execute;
+  use super::test_support::Execution;
+  use super::test_support::ExtensionTestFailure;
   use super::test_support::recording_context;
 
   /// Successful extension-dispatch expectation.
@@ -112,7 +116,8 @@ mod tests {
   }
 
   #[test]
-  fn project_dispatcher_routes_every_extension_and_preserves_fail_fast_errors() -> Result<(), TestFailure> {
+  fn project_dispatcher_routes_every_extension_and_preserves_fail_fast_errors()
+  -> Result<(), ExtensionTestFailure<Execution<(), StaskError>>> {
     let successful_cases = [
       SuccessfulCase {
         command:            ProjectCommand::TomlConformance,
@@ -142,14 +147,12 @@ mod tests {
     } in successful_cases
     {
       let (context, effects) = recording_context(statuses)?;
-      ensure_ok(
-        execute(command, &context),
-        "each repository extension variant must route to its successful handler",
-      )?;
-      ensure(
-        effects.process_requests().len() == expected_processes,
-        "each repository extension variant must emit its complete child-command sequence",
-      )?;
+      let result = execute(command, &context);
+      drop(ensure_that(
+        (result, effects),
+        "each repository extension variant must succeed with its complete child-command sequence",
+        |observed| observed.0.is_ok() && observed.1.process_requests().len() == expected_processes,
+      )?);
     }
 
     for command in [
@@ -159,14 +162,12 @@ mod tests {
       ProjectCommand::TaploSelfFormat,
     ] {
       let (context, effects) = recording_context(&[13])?;
-      ensure(
-        execute(command, &context).is_err(),
-        "each repository extension variant must propagate its first child-process failure",
-      )?;
-      ensure(
-        effects.process_requests().len() == 1,
-        "each failed repository extension must stop after its first rejected child process",
-      )?;
+      let result = execute(command, &context);
+      drop(ensure_that(
+        (result, effects),
+        "each failed repository extension must propagate its first child-process failure and stop",
+        |observed| observed.0.is_err() && observed.1.process_requests().len() == 1,
+      )?);
     }
     Ok(())
   }

@@ -755,6 +755,16 @@ impl Rewrite {
     &self.source
   }
 
+  /// Borrow the immutable DOM corresponding to [`Self::source`].
+  ///
+  /// The node retains its semantic values, diagnostics, and source anchors.
+  /// Pending patches do not change this view. A successful [`Self::commit`]
+  /// replaces the committed root; a failed commit leaves it intact.
+  #[must_use]
+  pub const fn root(&self) -> &Node {
+    &self.root
+  }
+
   /// Add a low-level patch such as [`Patch::RenameKeys`].
   ///
   /// # Errors

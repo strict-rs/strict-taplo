@@ -5,8 +5,8 @@
 //! both local and concurrent environment contracts.
 
 use std::collections::HashMap;
+use std::error::Error;
 use std::fmt::Debug;
-use std::fmt::Display;
 use std::fmt::Formatter;
 use std::fmt::Result as FmtResult;
 use std::future::Future;
@@ -22,7 +22,8 @@ use std::task::Poll;
 use futures::executor::block_on;
 use futures::task::AtomicWaker;
 use parking_lot::RwLock;
-use strict_test_support::TestFailure;
+use strict_test_support::ResultFailure;
+use strict_test_support::ensure_ok;
 use time::OffsetDateTime;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
@@ -251,17 +252,14 @@ impl AsyncWrite for TestOutput {
   }
 }
 
-/// Adapt a displayable typed result into the panic-free test failure vocabulary.
+/// Extract a successful result while preserving its concrete error on failure.
 ///
 /// # Errors
 ///
-/// Returns [`TestFailure::WasErr`] with the supplied context when `result`
-/// contains an error.
-pub fn ensure_result<T, E: Display>(result: Result<T, E>, context: &'static str) -> Result<T, TestFailure> {
-  result.map_err(|error| TestFailure::WasErr {
-    context,
-    cause: error.to_string(),
-  })
+/// Returns [`ResultFailure`] with the supplied context and original error when
+/// `result` contains an error.
+pub fn ensure_result<T, E: Error>(result: Result<T, E>, context: &'static str) -> Result<T, ResultFailure<E>> {
+  ensure_ok(result, context)
 }
 
 /// Drive one fixture-owned future to completion.
@@ -678,11 +676,11 @@ mod tests {
   use std::path::PathBuf;
 
   use futures::future::join;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
+  use strict_test_support::ComparisonFailure;
+  use strict_test_support::PredicateFailure;
+  use strict_test_support::ResultFailure;
   use strict_test_support::ensure_eq;
-  use strict_test_support::ensure_ok;
-  use strict_test_support::ensure_some;
+  use strict_test_support::ensure_that;
   use time::Duration;
   use time::OffsetDateTime;
   use tokio::io::AsyncReadExt as _;
@@ -690,160 +688,277 @@ mod tests {
 
   use super::TestEnvironment;
   use super::drive;
+  use super::ensure_result;
+
+  /// Clock observations before absence, during absence, and after recovery.
+  type ClockObservations = [Option<OffsetDateTime>; 3];
+
+  /// Complete configuration lookup, recorded search bases, and executor output.
+  type DiscoveryObservations = (Option<PathBuf>, Vec<PathBuf>, u8);
+
+  /// Native byte extraction result, including its original I/O failure.
+  type ExtractedBytes = Result<Vec<u8>, ResultFailure<IoError>>;
+
+  /// Both native outcomes of the result extraction contract.
+  #[derive(Debug)]
+  struct ResultExtractions {
+    /// Bytes returned by a successful operation.
+    accepted: ExtractedBytes,
+    /// Original error returned by an unsuccessful operation.
+    rejected: ExtractedBytes,
+  }
+
+  /// Complete read result and its destination buffer, including partial bytes on failure.
+  #[derive(Debug)]
+  struct ReadObservation<Buffer> {
+    /// Native byte count or read error.
+    count: Result<usize, IoError>,
+    /// Original destination buffer after the read.
+    bytes: Buffer,
+  }
+
+  /// Memory-file observations across replacement and injected failures.
+  #[derive(Debug)]
+  struct MemoryIoObservations {
+    /// Original seeded bytes or their native read failure.
+    initial:        Result<Vec<u8>, IoError>,
+    /// Native result of replacing the seeded file.
+    replacement:    Result<(), IoError>,
+    /// Bytes observed after replacement.
+    replaced:       Result<Vec<u8>, IoError>,
+    /// Successful write targets before failure injection.
+    writes:         Vec<PathBuf>,
+    /// Native result of the deliberately rejected read.
+    rejected_read:  Result<Vec<u8>, IoError>,
+    /// Native result of the deliberately rejected write.
+    rejected_write: Result<(), IoError>,
+    /// File contents after the rejected write.
+    retained:       Result<Vec<u8>, IoError>,
+    /// Successful write targets after the rejected write.
+    final_writes:   Vec<PathBuf>,
+  }
+
+  /// Snapshot-channel observations, including every operation and byte buffer.
+  #[derive(Debug)]
+  struct StreamObservations {
+    /// Read results and complete input buffers before and after exhaustion.
+    reads:            [ReadObservation<String>; 2],
+    /// Native results of each initial output write, in order.
+    writes:           [Result<(), IoError>; 3],
+    /// Captured standard output and standard error after initial writes.
+    captured:         [Vec<u8>; 2],
+    /// Native result of the injected standard-output failure.
+    rejected_write:   Result<(), IoError>,
+    /// Native result of the recovery write.
+    recovered_write:  Result<(), IoError>,
+    /// Captured output after rejecting one write and accepting the recovery.
+    recovered_output: Vec<u8>,
+    /// Native result of independent standard-error failure injection.
+    rejected_flush:   Result<(), IoError>,
+    /// Both captured channels after clearing their contents.
+    cleared:          [Vec<u8>; 2],
+  }
+
+  /// Interactive-channel observations retaining both sides of every joined operation.
+  #[derive(Debug)]
+  struct InteractiveObservations {
+    /// Native input read result and complete received bytes.
+    input:           (Result<usize, IoError>, Vec<u8>),
+    /// Write, flush, shutdown, and post-shutdown write results in order.
+    input_writes:    [Result<(), IoError>; 4],
+    /// Complete captured standard-output bytes and native read result.
+    standard:        ([u8; 12], Result<usize, IoError>),
+    /// Complete captured standard-error bytes and native read result.
+    diagnostic:      ([u8; 10], Result<usize, IoError>),
+    /// Native results of the three connected output writes.
+    output_writes:   [Result<(), IoError>; 3],
+    /// Complete replayed standard-error bytes and native read result.
+    replayed:        ([u8; 10], Result<usize, IoError>),
+    /// Native result of the injected output failure.
+    rejected_write:  Result<(), IoError>,
+    /// Captured output after the rejected write.
+    retained_output: Vec<u8>,
+  }
 
   #[test]
-  fn clock_absence_preserves_time_for_recovery() -> Result<(), TestFailure> {
+  fn result_extraction_preserves_success_and_native_failure() -> Result<(), Box<PredicateFailure<ResultExtractions>>> {
+    let observations = ResultExtractions {
+      accepted: ensure_result(Ok::<_, IoError>(vec![0, 159, 255]), "extract the complete byte buffer"),
+      rejected: ensure_result(
+        Err::<Vec<u8>, _>(IoError::from_raw_os_error(5)),
+        "retain the original operating-system failure",
+      ),
+    };
+    ensure_that(
+      observations,
+      "result extraction must retain bytes, context, and the native error",
+      |observed| {
+        observed.accepted.as_ref().is_ok_and(|bytes| bytes == &[0, 159, 255])
+          && observed.rejected.as_ref().is_err_and(|failure| {
+            failure.context == "retain the original operating-system failure" && failure.source.raw_os_error() == Some(5)
+          })
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
+  }
+
+  #[test]
+  fn clock_absence_preserves_time_for_recovery() -> Result<(), Box<ComparisonFailure<ClockObservations, ClockObservations>>> {
     let environment = TestEnvironment::default();
     let replacement = OffsetDateTime::UNIX_EPOCH.saturating_add(Duration::hours(2));
     environment.set_now(replacement);
-    ensure_eq(
-      &ensure_some(environment.now(), "the available test clock must return its configured time")?,
-      &replacement,
-      "the configured test time must be observable",
-    )?;
-
+    let configured = environment.now();
     environment.set_clock_available(false);
-    ensure(
-      environment.now().is_none(),
-      "an unavailable clock must return the typed missing-callback failure",
-    )?;
-
+    let unavailable = environment.now();
     environment.set_clock_available(true);
     ensure_eq(
-      &ensure_some(environment.now(), "the re-enabled test clock must recover")?,
-      &replacement,
-      "clock recovery must preserve the prior deterministic value",
+      [configured, unavailable, environment.now()],
+      [Some(replacement), None, Some(replacement)],
+      "the clock must expose its configured time, report absence, and recover the same time",
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn memory_io_overwrites_and_injects_failures() -> Result<(), TestFailure> {
+  fn memory_io_overwrites_and_injects_failures() -> Result<(), Box<PredicateFailure<MemoryIoObservations>>> {
     let environment = TestEnvironment::default();
     let path = Path::new("/workspace/value.txt");
     environment.insert_file(path, b"first".to_vec());
-    ensure(
-      ensure_ok(environment.read_file(path), "seeded memory reads must succeed")? == b"first",
-      "memory reads must return seeded bytes",
-    )?;
-
-    ensure_ok(
-      environment.write_file(path.to_path_buf(), b"second".to_vec()),
-      "memory writes must replace existing bytes",
-    )?;
-    ensure(
-      ensure_ok(environment.read_file(path), "replaced memory reads must succeed")? == b"second",
-      "memory writes must expose replacement bytes",
-    )?;
-    ensure(
-      environment.writes() == [PathBuf::from("/workspace/value.txt")],
-      "successful writes must record their target exactly once",
-    )?;
-
+    let initial = environment.read_file(path);
+    let replacement = environment.write_file(path.to_path_buf(), b"second".to_vec());
+    let replaced = environment.read_file(path);
+    let writes = environment.writes();
     environment.set_read_failure(true);
-    ensure(
-      environment
-        .read_file(path)
-        .is_err_and(|error| error.kind() == ErrorKind::PermissionDenied),
-      "injected read failure must use the typed I/O boundary",
-    )?;
+    let rejected_read = environment.read_file(path);
     environment.set_read_failure(false);
     environment.set_write_failure(true);
-    ensure(
-      environment
-        .write_file(path.to_path_buf(), b"ignored".to_vec())
-        .is_err_and(|error| error.kind() == ErrorKind::PermissionDenied),
-      "injected write failure must use the typed I/O boundary",
+    let rejected_write = environment.write_file(path.to_path_buf(), b"ignored".to_vec());
+    ensure_that(
+      MemoryIoObservations {
+        initial,
+        replacement,
+        replaced,
+        writes,
+        rejected_read,
+        rejected_write,
+        retained: environment.read_file(path),
+        final_writes: environment.writes(),
+      },
+      "memory I/O must replace and record successful writes while preserving native failures and rejected-write state",
+      |observed| {
+        observed.initial.as_ref().is_ok_and(|bytes| bytes == b"first")
+          && observed.replacement.is_ok()
+          && observed.replaced.as_ref().is_ok_and(|bytes| bytes == b"second")
+          && observed.writes == [path.to_path_buf()]
+          && observed
+            .rejected_read
+            .as_ref()
+            .is_err_and(|error| error.kind() == ErrorKind::PermissionDenied)
+          && observed
+            .rejected_write
+            .as_ref()
+            .is_err_and(|error| error.kind() == ErrorKind::PermissionDenied)
+          && observed.retained.as_ref().is_ok_and(|bytes| bytes == b"second")
+          && observed.final_writes == observed.writes
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn standard_streams_capture_order_and_recover_from_failures() -> Result<(), TestFailure> {
+  fn standard_streams_capture_order_and_recover_from_failures() -> Result<(), Box<PredicateFailure<StreamObservations>>> {
     let environment = TestEnvironment::default();
     environment.set_stdin(b"input".to_vec());
 
     let mut input = environment.stdin_reader();
     let mut source = String::new();
-    let read = ensure_ok(
-      drive(input.read_to_string(&mut source)),
-      "the deterministic input stream must read its complete snapshot",
-    )?;
-    ensure_eq(&read, &5, "the input stream must report every consumed byte")?;
-    ensure_eq(&source.as_str(), &"input", "standard input must preserve exact bytes")?;
-    ensure_eq(
-      &ensure_ok(
-        drive(input.read_to_string(&mut source)),
-        "an exhausted deterministic input stream must remain readable",
-      )?,
-      &0,
-      "an exhausted input stream must return no additional bytes",
-    )?;
-
+    let first_read = ReadObservation {
+      count: drive(input.read_to_string(&mut source)),
+      bytes: source.clone(),
+    };
+    let exhausted_read = ReadObservation {
+      count: drive(input.read_to_string(&mut source)),
+      bytes: source,
+    };
     let mut stdout = environment.stdout_writer();
     let mut stderr = environment.stderr_writer();
-    ensure_ok(
-      drive(async {
-        stdout.write_all(b"first").await?;
-        stdout.write_all(b"-second").await?;
-        stderr.write_all(b"diagnostic").await
-      }),
-      "deterministic output streams must accept ordered writes",
-    )?;
-    ensure(environment.stdout() == b"first-second", "standard output must retain write order")?;
-    ensure(
-      environment.stderr() == b"diagnostic",
-      "standard error must remain independent from standard output",
-    )?;
-
+    let writes = drive(async {
+      [
+        stdout.write_all(b"first").await,
+        stdout.write_all(b"-second").await,
+        stderr.write_all(b"diagnostic").await,
+      ]
+    });
+    let captured = [environment.stdout(), environment.stderr()];
     environment.set_stdout_failure(true);
-    ensure(
-      drive(stdout.write_all(b"rejected")).is_err_and(|error| error.kind() == ErrorKind::PermissionDenied),
-      "injected standard-output failure must use the typed I/O boundary",
-    )?;
+    let rejected_write = drive(stdout.write_all(b"rejected"));
     environment.set_stdout_failure(false);
-    ensure_ok(
-      drive(stdout.write_all(b"-recovered")),
-      "standard output must recover when failure injection is disabled",
-    )?;
+    let recovered_write = drive(stdout.write_all(b"-recovered"));
+    let recovered_output = environment.stdout();
     environment.set_stderr_failure(true);
-    ensure(
-      drive(stderr.flush()).is_err_and(|error| error.kind() == ErrorKind::PermissionDenied),
-      "standard-error failure injection must be independent",
-    )?;
-
+    let rejected_flush = drive(stderr.flush());
     environment.clear_output();
-    ensure(environment.stdout().is_empty(), "clearing output must empty standard output")?;
-    ensure(environment.stderr().is_empty(), "clearing output must empty standard error")
+    ensure_that(
+      StreamObservations {
+        reads: [first_read, exhausted_read],
+        writes,
+        captured,
+        rejected_write,
+        recovered_write,
+        recovered_output,
+        rejected_flush,
+        cleared: [environment.stdout(), environment.stderr()],
+      },
+      "snapshot streams must preserve input exhaustion, write order, independent failures, recovery, and clearing",
+      |observed| {
+        let [ref first, ref exhausted] = observed.reads;
+        let [ref standard, ref diagnostic] = observed.captured;
+        first.count.as_ref().is_ok_and(|count| *count == 5)
+          && first.bytes == "input"
+          && exhausted.count.as_ref().is_ok_and(|count| *count == 0)
+          && exhausted.bytes == "input"
+          && observed.writes.iter().all(Result::is_ok)
+          && standard == b"first-second"
+          && diagnostic == b"diagnostic"
+          && observed
+            .rejected_write
+            .as_ref()
+            .is_err_and(|error| error.kind() == ErrorKind::PermissionDenied)
+          && observed.recovered_write.is_ok()
+          && observed.recovered_output == b"first-second-recovered"
+          && observed
+            .rejected_flush
+            .as_ref()
+            .is_err_and(|error| error.kind() == ErrorKind::PermissionDenied)
+          && observed.cleared.iter().all(Vec::is_empty)
+      },
+    )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn interactive_standard_streams_wait_and_preserve_channel_boundaries() -> Result<(), TestFailure> {
+  fn interactive_standard_streams_wait_and_preserve_channel_boundaries() -> Result<(), Box<PredicateFailure<InteractiveObservations>>> {
     let environment = TestEnvironment::default();
     let mut input_writer = environment.interactive_stdin();
     let mut input_reader = environment.stdin_reader();
     let (input_result, writer_result) = drive(join(
       async {
         let mut bytes = Vec::new();
-        input_reader.read_to_end(&mut bytes).await.map(|read| (read, bytes))
+        (input_reader.read_to_end(&mut bytes).await, bytes)
       },
       async {
-        input_writer.write_all(b"later").await?;
-        input_writer.flush().await?;
-        input_writer.shutdown().await?;
-        Ok::<_, IoError>(input_writer.write_all(b"rejected").await)
+        [
+          input_writer.write_all(b"later").await,
+          input_writer.flush().await,
+          input_writer.shutdown().await,
+          input_writer.write_all(b"rejected").await,
+        ]
       },
     ));
-    let (read, input_bytes) = ensure_ok(input_result, "interactive input must read through writer shutdown")?;
-    ensure_eq(&read, &5, "interactive input must report every later byte")?;
-    ensure(
-      input_bytes == b"later",
-      "interactive input must preserve bytes supplied after the reader begins waiting",
-    )?;
-    let post_shutdown = ensure_ok(writer_result, "interactive input setup operations must succeed")?;
-    ensure(
-      post_shutdown.is_err_and(|error| error.kind() == ErrorKind::BrokenPipe),
-      "interactive input writes after shutdown must return a broken-pipe failure",
-    )?;
-
     let mut stdout = environment.stdout_writer();
     let mut stderr = environment.stderr_writer();
     let mut stdout_reader = environment.stdout_reader();
@@ -854,79 +969,80 @@ mod tests {
         let mut diagnostic = [0_u8; 10];
         let (standard_result, diagnostic_result) =
           join(stdout_reader.read_exact(&mut standard), stderr_reader.read_exact(&mut diagnostic)).await;
-        let standard_read = standard_result?;
-        let diagnostic_read = diagnostic_result?;
-        Ok::<_, IoError>((standard, diagnostic, standard_read, diagnostic_read))
+        ((standard, standard_result), (diagnostic, diagnostic_result))
       },
       async {
-        stdout.write_all(b"first").await?;
-        stdout.write_all(b"-second").await?;
-        stderr.write_all(b"diagnostic").await
+        [
+          stdout.write_all(b"first").await,
+          stdout.write_all(b"-second").await,
+          stderr.write_all(b"diagnostic").await,
+        ]
       },
     ));
-    ensure_ok(capture_result, "connected output writers must accept exact channel bytes")?;
-    let (standard, diagnostic, standard_read, diagnostic_read) =
-      ensure_ok(output_result, "output readers must receive later captured bytes")?;
-    ensure(
-      (standard_read, diagnostic_read) == (standard.len(), diagnostic.len()),
-      "output readers must report every exact channel byte",
-    )?;
-    ensure(
-      standard == *b"first-second",
-      "the waiting standard-output reader must preserve ordered writes",
-    )?;
-    ensure(
-      diagnostic == *b"diagnostic",
-      "the waiting standard-error reader must remain channel-independent",
-    )?;
-
     let mut replay = environment.stderr_reader();
     let mut replayed = [0_u8; 10];
-    let replayed_count = ensure_ok(
-      drive(replay.read_exact(&mut replayed)),
-      "a newly requested output reader must begin at byte zero",
-    )?;
-    ensure_eq(
-      &replayed_count,
-      &replayed.len(),
-      "a fresh output reader must report the complete captured channel",
-    )?;
-    ensure(
-      replayed == diagnostic,
-      "a fresh output reader must replay the complete captured channel",
-    )?;
-
+    let replayed_count = drive(replay.read_exact(&mut replayed));
     environment.set_stdout_failure(true);
-    ensure(
-      drive(stdout.write_all(b"ignored")).is_err_and(|error| error.kind() == ErrorKind::PermissionDenied),
-      "failed output writes must retain their typed failure",
-    )?;
-    ensure(
-      environment.stdout() == standard,
-      "failed output writes must not fabricate captured bytes",
+    let rejected_write = drive(stdout.write_all(b"ignored"));
+    let (standard, diagnostic) = output_result;
+    ensure_that(
+      InteractiveObservations {
+        input: input_result,
+        input_writes: writer_result,
+        standard,
+        diagnostic,
+        output_writes: capture_result,
+        replayed: (replayed, replayed_count),
+        rejected_write,
+        retained_output: environment.stdout(),
+      },
+      "interactive streams must retain later input, shutdown failures, channel ordering, replay, and rejected-write state",
+      |observed| {
+        let (ref input_count, ref input_bytes) = observed.input;
+        let [ref written, ref flushed, ref closed, ref post_shutdown] = observed.input_writes;
+        let (ref standard_bytes, ref standard_count) = observed.standard;
+        let (ref diagnostic_bytes, ref diagnostic_count) = observed.diagnostic;
+        let (ref replayed_bytes, ref replay_count) = observed.replayed;
+        input_count.as_ref().is_ok_and(|count| *count == 5)
+          && input_bytes == b"later"
+          && written.is_ok()
+          && flushed.is_ok()
+          && closed.is_ok()
+          && post_shutdown.as_ref().is_err_and(|error| error.kind() == ErrorKind::BrokenPipe)
+          && observed.output_writes.iter().all(Result::is_ok)
+          && standard_count.as_ref().is_ok_and(|count| *count == standard_bytes.len())
+          && diagnostic_count.as_ref().is_ok_and(|count| *count == diagnostic_bytes.len())
+          && standard_bytes == b"first-second"
+          && diagnostic_bytes == b"diagnostic"
+          && replay_count.as_ref().is_ok_and(|count| *count == replayed_bytes.len())
+          && replayed_bytes == diagnostic_bytes
+          && observed
+            .rejected_write
+            .as_ref()
+            .is_err_and(|error| error.kind() == ErrorKind::PermissionDenied)
+          && observed.retained_output == *standard_bytes
+      },
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 
   #[test]
-  fn discovery_records_bases_and_selects_supported_names() -> Result<(), TestFailure> {
+  fn discovery_records_bases_and_selects_supported_names()
+  -> Result<(), Box<ComparisonFailure<DiscoveryObservations, DiscoveryObservations>>> {
     let environment = TestEnvironment::default();
     environment.insert_file("/workspace/taplo.toml", Vec::new());
-    let discovered = ensure_some(
-      environment.find_config_file(Path::new("/workspace"), &[".taplo.toml", "taplo.toml"]),
-      "a supported seeded configuration name must be discovered",
-    )?;
-    ensure(
-      discovered.as_path() == Path::new("/workspace/taplo.toml"),
-      "configuration discovery must return the supported seeded path",
-    )?;
-    ensure(
-      environment.discovery_bases() == [PathBuf::from("/workspace")],
-      "configuration discovery must record its exact search base",
-    )?;
+    let discovered = environment.find_config_file(Path::new("/workspace"), &[".taplo.toml", "taplo.toml"]);
     ensure_eq(
-      &drive(async { 7_u8 }),
-      &7_u8,
-      "the shared fixture executor must drive a future to its output",
+      (discovered, environment.discovery_bases(), drive(async { 7_u8 })),
+      (
+        Some(PathBuf::from("/workspace/taplo.toml")),
+        vec![PathBuf::from("/workspace")],
+        7_u8,
+      ),
+      "discovery must select a supported name, record its base, and preserve the driven future's output",
     )
+    .map(drop)
+    .map_err(Box::new)
   }
 }

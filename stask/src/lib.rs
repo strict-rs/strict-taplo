@@ -15,23 +15,31 @@ pub fn run() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_ok;
+  use strict_test_support::PredicateFailure;
+  use strict_test_support::ensure_that;
   use template_core::cli::command::CommandSurface;
+  use template_stask::ExtensionCommandSet;
 
   use super::extensions;
 
+  /// Complete extension registration retaining repository-owned command failures.
+  type Registration = template_stask::Result<ExtensionCommandSet<(), extensions::StaskError>>;
+
   #[test]
-  fn extension_registry_exposes_only_the_local_x_router() -> Result<(), TestFailure> {
-    let command_set = ensure_ok(extensions::commands(), "the local extension registry must build")?;
-    let descriptors = command_set.descriptors();
-    ensure(
-      descriptors.len() == 1
-        && descriptors
-          .first()
-          .is_some_and(|descriptor| descriptor.name() == "x" && descriptor.surface() == CommandSurface::StaskExtension),
-      "the consumer runner must expose only the local x extension surface",
+  fn extension_registry_exposes_only_the_local_x_router() -> Result<(), PredicateFailure<Registration>> {
+    ensure_that(
+      extensions::commands(),
+      "the local extension registry must build and expose only the local x extension surface",
+      |registration| {
+        registration.as_ref().is_ok_and(|command_set| {
+          let descriptors = command_set.descriptors();
+          descriptors.len() == 1
+            && descriptors
+              .first()
+              .is_some_and(|descriptor| descriptor.name() == "x" && descriptor.surface() == CommandSurface::StaskExtension)
+        })
+      },
     )
+    .map(drop)
   }
 }

@@ -151,8 +151,8 @@ allowed-duplicate-crates = [
     "getrandom",
     "r-efi",
     "syn",
-    "windows-link",
-    "windows-sys",
     "tracing",
     "tracing-core",
+    "windows-link",
+    "windows-sys",
 ]

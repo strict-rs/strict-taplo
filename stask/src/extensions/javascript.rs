@@ -2,6 +2,7 @@
 
 use std::path::Path;
 
+use strict_standard::Workspace;
 use template_core::cli::context::CommandContext;
 use template_core::sys::process::ToolColor;
 
@@ -21,7 +22,7 @@ const JAVASCRIPT_ROOT: &str = "js";
   clippy::single_call_fn,
   reason = "the named handler keeps immutable installation, workspace builds, and boundary checks together"
 )]
-pub(super) fn run(context: &CommandContext) -> template_core::Result<()> {
+pub(super) fn run(context: &CommandContext<impl Workspace>) -> template_core::Result<()> {
   let root = Path::new(JAVASCRIPT_ROOT);
   command::run(
     context,
@@ -51,19 +52,19 @@ mod tests {
   use std::path::PathBuf;
 
   use strict_test_support::EffectEvent;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_ok;
+  use strict_test_support::ensure_that;
   use template_core::sys::process::ToolColor;
 
   use super::run;
   use crate::extensions::command;
+  use crate::extensions::test_support::Execution;
+  use crate::extensions::test_support::ExtensionTestFailure;
   use crate::extensions::test_support::recording_context;
 
   #[test]
-  fn javascript_build_executes_immutable_install_build_and_boundary_checks_in_order() -> Result<(), TestFailure> {
+  fn javascript_build_executes_immutable_install_build_and_boundary_checks_in_order() -> Result<(), ExtensionTestFailure<Execution>> {
     let (context, effects) = recording_context(&[0, 0, 0])?;
-    ensure_ok(run(&context), "the complete JavaScript extension command stream must succeed")?;
+    let result = run(&context);
     let expected = [
       command::arguments([".yarn/releases/yarn-4.0.2.cjs", "install", "--immutable"]),
       command::arguments([".yarn/releases/yarn-4.0.2.cjs", "build"]),
@@ -83,29 +84,32 @@ mod tests {
       EffectEvent::Process(request)
     })
     .collect::<Vec<_>>();
-    ensure(
-      effects.events() == expected,
-      "the JavaScript extension must retain its immutable install, workspace build, and boundary-test sequence",
+    ensure_that(
+      (result, effects),
+      "the JavaScript extension must succeed with its immutable install, workspace build, and boundary-test sequence",
+      |observed| observed.0.is_ok() && observed.1.events() == expected,
     )
+    .map(drop)
+    .map_err(Into::into)
   }
 
   #[test]
-  fn javascript_build_stops_after_the_first_failed_phase() -> Result<(), TestFailure> {
+  fn javascript_build_stops_after_the_first_failed_phase() -> Result<(), ExtensionTestFailure<Execution>> {
     let (context, effects) = recording_context(&[0, 12])?;
-    ensure(run(&context).is_err(), "a failed JavaScript build phase must fail the extension")?;
-    let events = effects.events();
-    ensure(
-      (
-        events.len(),
-        events.get(1).map(|event| {
-          matches!(
-            event,
-            EffectEvent::Process(request)
-              if request.arguments.iter().any(|argument| argument == "build")
-          )
-        }),
-      ) == (2, Some(true)),
+    let result = run(&context);
+    ensure_that(
+      (result, effects),
       "a failed build must record install and build without running the boundary suite",
+      |observed| {
+        let events = observed.1.events();
+        observed.0.is_err()
+          && events.len() == 2
+          && events.get(1).is_some_and(
+            |event| matches!(event, EffectEvent::Process(request) if request.arguments.iter().any(|argument| argument == "build")),
+          )
+      },
     )
+    .map(drop)
+    .map_err(Into::into)
   }
 }

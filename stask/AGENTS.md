@@ -60,7 +60,7 @@ Write user-visible output through `CommandContext::output()` and semantic roles 
 
 ## Testing Expectations
 
-Local tests return `Result<(), TestFailure>` and validate observable extension behavior:
+Local tests retain native command sets, registration errors, parse reports, and execution outcomes through the shared typed assertions. Return the concrete assertion failure or a test-owned error enum and validate observable extension behavior:
 
 - the exact top-level `x` surface and empty-registry outcome;
 - successful typed argument parsing and handler dispatch;

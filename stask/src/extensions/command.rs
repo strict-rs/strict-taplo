@@ -2,6 +2,7 @@
 
 use std::path::Path;
 
+use strict_standard::Workspace;
 use template_core::cli::context::CommandContext;
 use template_core::sys::process::ToolColor;
 use template_core::sys::process::require_success;
@@ -13,7 +14,7 @@ use template_core::sys::process::require_success;
 /// Returns a typed process failure when the command cannot execute or exits
 /// unsuccessfully.
 pub(super) fn run(
-  context: &CommandContext,
+  context: &CommandContext<impl Workspace>,
   program: &str,
   arguments: &[String],
   color: ToolColor,
@@ -38,32 +39,24 @@ mod tests {
   use std::path::PathBuf;
 
   use strict_test_support::EffectEvent;
-  use strict_test_support::TestFailure;
-  use strict_test_support::ensure;
-  use strict_test_support::ensure_contains;
-  use strict_test_support::ensure_eq;
-  use strict_test_support::ensure_ok;
-  use strict_test_support::ensure_some;
+  use strict_test_support::ensure_that;
   use template_core::sys::process::ToolColor;
 
   use super::arguments;
   use super::run;
+  use crate::extensions::test_support::Execution;
+  use crate::extensions::test_support::ExtensionTestFailure;
   use crate::extensions::test_support::recording_context;
 
-  #[test]
-  fn owned_arguments_and_child_execution_preserve_complete_request_policy() -> Result<(), TestFailure> {
-    let owned = arguments(["first", "second"]);
-    ensure(
-      owned == ["first", "second"].map(str::to_owned),
-      "borrowed extension arguments must retain their order and exact text",
-    )?;
-    ensure(arguments::<0>([]).is_empty(), "an empty extension argument list must remain empty")?;
+  /// Both argument vectors and the complete child-command observation.
+  type ArgumentExecution = (Vec<String>, Vec<String>, Execution);
 
+  #[test]
+  fn owned_arguments_and_child_execution_preserve_complete_request_policy() -> Result<(), ExtensionTestFailure<ArgumentExecution>> {
+    let owned = arguments(["first", "second"]);
+    let empty = arguments::<0>([]);
     let (context, effects) = recording_context(&[0])?;
-    ensure_ok(
-      run(&context, "fixture", &owned, ToolColor::CapturedPlain, Some(Path::new("js"))),
-      "a successful child process must satisfy the extension boundary",
-    )?;
+    let result = run(&context, "fixture", &owned, ToolColor::CapturedPlain, Some(Path::new("js")));
     let mut expected = context.process_request(
       "fixture",
       &owned,
@@ -73,25 +66,30 @@ mod tests {
       &[],
     );
     expected.current_dir = Some(PathBuf::from("js"));
-    ensure(
-      effects.events() == [EffectEvent::Process(expected)],
-      "child execution must preserve the exact process request and working directory",
+    ensure_that(
+      (owned, empty, (result, effects)),
+      "argument conversion and successful execution must preserve exact text, order, request policy, and working directory",
+      |observed| {
+        observed.0 == ["first", "second"].map(str::to_owned)
+          && observed.1.is_empty()
+          && observed.2.0.is_ok()
+          && observed.2.1.events() == [EffectEvent::Process(expected)]
+      },
     )
+    .map(drop)
+    .map_err(Into::into)
   }
 
   #[test]
-  fn child_execution_rejects_nonzero_status_without_erasing_the_request() -> Result<(), TestFailure> {
+  fn child_execution_rejects_nonzero_status_without_erasing_the_request() -> Result<(), ExtensionTestFailure<Execution>> {
     let (context, effects) = recording_context(&[17])?;
     let result = run(&context, "fixture", &arguments(["check"]), ToolColor::EnvOnly, None);
-    let message = ensure_some(
-      result.err().map(|error| error.to_string()),
-      "a nonzero child status must return a typed process failure",
-    )?;
-    ensure_contains(&message, "fixture", "the child-process failure must retain the attempted program")?;
-    ensure_eq(
-      &effects.events().len(),
-      &1_usize,
-      "a failed child process must still record its complete request exactly once",
+    ensure_that(
+      (result, effects),
+      "a rejected child must retain its native failure naming the program and record the complete request exactly once",
+      |observed| observed.0.as_ref().is_err_and(|error| error.to_string().contains("fixture")) && observed.1.events().len() == 1,
     )
+    .map(drop)
+    .map_err(Into::into)
   }
 }
